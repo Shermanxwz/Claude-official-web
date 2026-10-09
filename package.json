@@ -1,0 +1,48 @@
+{
+  "name": "claude-official-web",
+  "version": "1.0.0",
+  "description": "Self-hosted graphical Web host for the official Claude Agent SDK and Claude Code runtime",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "demo": "CAW_ENGINE=mock CAW_REQUIRE_AUTH=0 node src/server.mjs",
+    "dev": "CAW_ENGINE=mock CAW_REQUIRE_AUTH=0 node --watch src/server.mjs",
+    "test": "node --test --test-concurrency=1 test/unit/*.test.mjs test/integration/*.test.mjs",
+    "test:unit": "node --test test/unit/*.test.mjs",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.mjs",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.mjs",
+    "typecheck": "tsc -p jsconfig.json",
+    "check": "node scripts/check.mjs",
+    "manifest": "node scripts/source-manifest.mjs",
+    "manifest:verify": "node scripts/source-manifest.mjs --verify",
+    "seal": "node scripts/seal.mjs",
+    "smoke:runtime": "node scripts/runtime-smoke.mjs",
+    "smoke:gateway": "node scripts/gateway-smoke.mjs",
+    "maintenance:prune": "node scripts/prune-state.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.295",
+    "@anthropic-ai/sdk": "0.132.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "dompurify": "3.4.16",
+    "marked": "18.1.0",
+    "ws": "8.22.0",
+    "zod": "4.6.5"
+  },
+  "optionalDependencies": {
+    "node-pty": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/ws": "8.18.2",
+    "playwright-core": "1.56.1",
+    "typescript": "5.9.3"
+  }
+}

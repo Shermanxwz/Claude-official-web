@@ -1,0 +1,9 @@
+node_modules/
+.caw-uploads/
+.state/
+test/e2e/artifacts/
+*.log
+.DS_Store
+.env
+.env.*
+coverage/
