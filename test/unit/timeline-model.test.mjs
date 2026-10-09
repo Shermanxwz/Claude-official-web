@@ -778,3 +778,107 @@ test('fuzz: 500 random and garbage messages never throw and always yield rendera
   assert.doesNotThrow(() => model.getUserMessages());
   assert.doesNotThrow(() => model.getRunState());
 });
+
+/** Entries grouped by the user message that starts each turn. */
+const turnGroups = (model) => {
+  const groups = [];
+  for (const entry of model.getEntries()) {
+    if (entry.kind === 'user' || groups.length === 0) groups.push([]);
+    groups[groups.length - 1].push(entry);
+  }
+  return groups;
+};
+
+test('a result names its turn, so results of earlier turns stay in their turns after a reload', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('user', 101, { role: 'user', content: 'hook run' }),
+    tx('assistant', 102, { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'Checked.' }] }),
+    tx('user', 103, { role: 'user', content: 'error please' }),
+    tx('assistant', 104, { id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'Trying.' }] }),
+    tx('user', 105, { role: 'user', content: 'slow stream' }),
+    tx('assistant', 106, { id: 'm3', role: 'assistant', content: [{ type: 'text', text: 'Streaming.' }] }),
+  ]);
+  // A reload's snapshot holds the results, which the transcript never has, after the transcript has been applied.
+  model.applyLiveEvent(live.result(201, { user_message_uuid: uuid(101), user_message_uuids: [uuid(101)] }));
+  model.applyLiveEvent(live.result(202, {
+    user_message_uuid: uuid(103),
+    user_message_uuids: [uuid(103)],
+    subtype: 'error_during_execution',
+    is_error: true,
+    errors: ['boom'],
+  }));
+  const [first, second, third] = turnGroups(model);
+  assert.deepEqual(first.map((entry) => entry.kind), ['user', 'assistant', 'result']);
+  assert.equal(first[2].isError, false);
+  assert.deepEqual(second.map((entry) => entry.kind), ['user', 'assistant', 'result']);
+  assert.equal(second[2].isError, true);
+  assert.deepEqual(third.map((entry) => entry.kind), ['user', 'assistant']);
+});
+
+test('a result without a user message uuid never joins a turn that already has its result', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('user', 101, { role: 'user', content: 'first' }),
+    tx('user', 103, { role: 'user', content: 'second' }),
+  ]);
+  model.applyLiveEvent(live.result(201));
+  model.applyLiveEvent(live.result(202));
+  assert.equal(find(model, 'result').length, 1);
+});
+
+test('a live copy of a transcript message moves the cursor to its turn, so a result without a name lands there', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('user', 101, { role: 'user', content: 'first' }),
+    tx('assistant', 102, { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'One.' }] }),
+    tx('user', 103, { role: 'user', content: 'second' }),
+    tx('assistant', 104, { id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'Two.' }] }),
+  ]);
+  model.applyLiveEvent(live.assistant(102, 'm1', [{ type: 'text', text: 'One.' }]));
+  model.applyLiveEvent(live.result(201));
+  const [first, second] = turnGroups(model);
+  assert.deepEqual(first.map((entry) => entry.kind), ['user', 'assistant', 'result']);
+  assert.deepEqual(second.map((entry) => entry.kind), ['user', 'assistant']);
+});
+
+test('a message that names an earlier turn lands there, and the messages after it without a name follow it', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('user', 101, { role: 'user', content: 'first' }),
+    tx('user', 103, { role: 'user', content: 'second' }),
+  ]);
+  model.applyLiveEvent(live.assistant(202, 'late', [{ type: 'text', text: 'Late reply.' }], { user_message_uuid: uuid(101) }));
+  model.applyLiveEvent(live.system(203, 'informational', { content: 'Note.', level: 'info' }));
+  const [first, second] = turnGroups(model);
+  assert.deepEqual(first.map((entry) => entry.kind), ['user', 'assistant', 'notice']);
+  assert.deepEqual(second.map((entry) => entry.kind), ['user']);
+});
+
+test('a message that follows a finished turn joins the next turn of the timeline, not a new turn at the end', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('user', 101, { role: 'user', content: 'first' }),
+    tx('user', 103, { role: 'user', content: 'second' }),
+    tx('user', 105, { role: 'user', content: 'third' }),
+  ]);
+  model.applyLiveEvent(live.result(201, { user_message_uuid: uuid(101), user_message_uuids: [uuid(101)] }));
+  model.applyLiveEvent(live.system(202, 'informational', { content: 'Note.', level: 'info' }));
+  assert.deepEqual(kinds(model), ['user', 'result', 'user', 'notice', 'user']);
+});
+
+test('progress rows without tool steps form a group with no step count, and empty groups are never listed', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'run'));
+  model.applyLiveEvent(live.system(2, 'hook_started', { hook_id: 'h1', hook_name: 'Policy', hook_event: 'PreToolUse' }));
+  model.applyLiveEvent(live.system(3, 'hook_response', {
+    hook_id: 'h1', hook_name: 'Policy', hook_event: 'PreToolUse', outcome: 'success', output: 'ok',
+  }));
+  const [group] = find(model, 'work');
+  assert.equal(group.count, 0, 'progress rows are not tool steps');
+  assert.equal(toolsIn(group).length, 0);
+  assert.equal(group.items.length, 1, 'the start and the response of one hook share one row');
+  assert.equal(group.items[0].rowKind, 'hook');
+  assert.equal(group.items[0].status, 'success');
+  assert.ok(model.getEntries().every((entry) => entry.kind !== 'work' || entry.items.length > 0));
+});

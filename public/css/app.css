@@ -54,6 +54,7 @@
   --space-5: 24px;
   --space-6: 32px;
   --header-h: 52px;
+  --control-h: 40px;
   --sidebar-w: 288px;
   --content-max: 880px;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
@@ -436,22 +437,41 @@ button {
 }
 
 /* ---- Form controls ------------------------------------------------------ */
+/* Every text field, select and multi-line text shares one border, radius, surface and type. Bare elements are matched
+   with :where() (zero specificity), so a feature's own class always takes precedence over these defaults. */
+.input,
+.select,
+.textarea,
+.sidebar-search-input,
+:where(input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"],
+  input[type="password"], input[type="number"], input[type="date"], select) {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  outline: none;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+
+/* Single-line controls are exactly --control-h tall (44 px on coarse pointers) with identical horizontal padding. */
+.input,
+.select,
+.sidebar-search-input,
+:where(input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"],
+  input[type="password"], input[type="number"], input[type="date"], select) {
+  height: var(--control-h);
+  padding: 0 12px;
+  line-height: 1.25;
+}
+
 .input,
 .select,
 .textarea,
 .sidebar-search-input {
   display: block;
   width: 100%;
-  min-height: 36px;
-  padding: 7px 12px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-elev);
-  color: var(--fg);
-  font-size: var(--fs-sm);
-  line-height: 1.4;
-  outline: none;
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 
 .input::placeholder,
@@ -476,18 +496,22 @@ button {
   cursor: not-allowed;
 }
 
-.select {
+.select,
+:where(select) {
   padding-right: 32px;
   cursor: pointer;
 }
 
 .textarea {
   min-height: 80px;
+  padding: 8px 12px;
+  line-height: 1.45;
   resize: vertical;
 }
 
 .field {
   display: grid;
+  align-content: start;
   gap: 6px;
   min-width: 0;
 }
@@ -1130,9 +1154,7 @@ kbd {
 }
 
 .sidebar-search-input {
-  min-height: 34px;
-  padding: 6px 10px 6px 34px;
-  font-size: var(--fs-sm);
+  padding-left: 34px;
 }
 
 .sidebar-list {
@@ -1936,6 +1958,7 @@ kbd {
   display: inline-flex;
   flex-wrap: wrap;
   max-width: 100%;
+  min-height: var(--control-h);
   gap: 2px;
   padding: 3px;
   border: 1px solid var(--border);
@@ -1944,7 +1967,7 @@ kbd {
 }
 
 .seg-btn {
-  min-height: 30px;
+  min-height: calc(var(--control-h) - 8px);
   padding: 4px 10px;
   border: 0;
   border-radius: var(--radius-sm);
@@ -2007,6 +2030,7 @@ kbd {
 
 .newsession-grid {
   display: grid;
+  align-items: start;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-4);
 }
@@ -2245,10 +2269,6 @@ kbd {
     height: 18px;
   }
 
-  .sidebar-search-input {
-    min-height: 44px;
-  }
-
   .group-head {
     min-height: 40px;
   }
@@ -2269,10 +2289,6 @@ kbd {
 
   .dir-row {
     min-height: 44px;
-  }
-
-  .seg-btn {
-    min-height: 40px;
   }
 
   .newsession-grid {
@@ -2312,6 +2328,22 @@ kbd {
 
   .sheet-header {
     padding-top: var(--space-2);
+  }
+}
+
+/* ---- Touch sizing: form controls and segmented buttons grow to 44 px ----- */
+@media (pointer: coarse) {
+  :root {
+    --control-h: 44px;
+  }
+
+  .seg {
+    padding: 0;
+    border-width: 0;
+  }
+
+  .seg-btn {
+    min-height: var(--control-h);
   }
 }
 

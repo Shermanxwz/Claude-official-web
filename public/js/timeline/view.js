@@ -74,6 +74,21 @@ export function createTimeline({ container, api, store, t, actions }) {
     });
   };
 
+  /** The newest request card sticks above the composer on phones; the jump pill sits above that card (--tl-dock). */
+  /** @type {Element|null} */
+  let dockSlot = null;
+  /** @type {ResizeObserver|null} */
+  const dockSize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => syncDock()) : null;
+  const syncDock = () => {
+    const slot = refs.list.querySelector(':scope > .request-slot.is-latest');
+    if (slot !== dockSlot) {
+      if (dockSlot) dockSize?.unobserve(dockSlot);
+      dockSlot = slot;
+      if (slot) dockSize?.observe(slot);
+    }
+    refs.root.style.setProperty('--tl-dock', `${slot ? slot.offsetHeight : 0}px`);
+  };
+
   const render = () => {
     if (state.destroyed) return;
     const stick = state.forceStick || isNearBottom(refs.scroller);
@@ -81,6 +96,7 @@ export function createTimeline({ container, api, store, t, actions }) {
     const items = entries.map((entry) => ({ key: entry.key, version: entry.version ?? 0, value: entry }));
     reconcile(refs.list, items, listStore, (entry, previous) => buildEntry(ui, entry, previous));
     markLatestRequest(refs.list);
+    syncDock();
     renderSlots(refs, state, ui, entries.length);
     if (stick) {
       scrollToBottom(refs.scroller);
@@ -265,6 +281,7 @@ export function createTimeline({ container, api, store, t, actions }) {
     refs.scroller.removeEventListener('scroll', onScroll);
     refs.jump.removeEventListener('click', onJump);
     window.removeEventListener(TIMELINE_RELOAD_EVENT, onReload);
+    dockSize?.disconnect();
     clear(container);
   };
 
@@ -703,10 +720,28 @@ function blockEl(ui, block) {
   }
 }
 
+/**
+ * A run of progress rows with no tool step: the rows themselves, without a collapsible header.
+ * @param {any} ui
+ * @param {Record<string, any>} entry
+ * @param {HTMLElement|null} previous
+ */
+function rowsEl(ui, entry, previous) {
+  const box = previous && previous.tagName === 'DIV' && previous.dataset.kind === 'work'
+    ? previous
+    : h('div', { class: 'work-rows', dataset: { kind: 'work' } });
+  box.dataset.key = entry.key;
+  reconcile(box, entry.items.map((item) => ({ key: item.key, version: item.version ?? 0, value: item })),
+    subStore(box, 'items'), (item) => itemEl(ui, item));
+  return box;
+}
+
 /** @param {any} ui @param {Record<string, any>} entry @param {HTMLElement|null} previous */
 function workEl(ui, entry, previous) {
   const { t } = ui.env;
-  const details = previous && previous.dataset.kind === 'work'
+  // Progress rows with no tool step (a hook, a task) show as rows: a group header would read "0 steps".
+  if (!entry.items.some((item) => item.kind === 'tool')) return rowsEl(ui, entry, previous);
+  const details = previous && previous.tagName === 'DETAILS' && previous.dataset.kind === 'work'
     ? previous
     : h('details', { class: 'work', dataset: { kind: 'work' } });
   details.dataset.key = entry.key;

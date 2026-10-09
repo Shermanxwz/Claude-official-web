@@ -5,7 +5,17 @@
 
 import { h } from '../../dom.js';
 import { formatDuration, formatTokens } from '../format.js';
-import { chip, copyButton, errorBlock, markdownBlock, mutedNote, section, statusOf, toolShell } from './shell.js';
+import {
+  chip,
+  copyButton,
+  errorBlock,
+  linkAction,
+  markdownBlock,
+  mutedNote,
+  section,
+  statusOf,
+  toolShell,
+} from './shell.js';
 import { finiteNumber, firstLine, isRecord, resultText, str, summarizeTool, truncate } from './summaries.js';
 
 const SUBTITLE_MAX = 240;
@@ -27,6 +37,8 @@ export function render(card, ctx) {
   if (finalText && !card.result?.isError) {
     actions.push(copyButton({ text: finalText, t, label: t('tools.agent.copyResult') }));
   }
+  const session = remoteSessionLink(structured, t);
+  if (session) actions.push(session);
   return toolShell({
     iconName: 'bot',
     title: card.name,
@@ -78,8 +90,6 @@ function agentBody(card, input, structured, finalText, ctx) {
   } else if (structured.status === 'async_launched') {
     parts.push(mutedNote(t('tools.agent.asyncLaunched')));
   }
-  const session = remoteSessionLink(structured, t);
-  if (session) parts.push(session);
   return h('div', { class: 'tool-agent' }, parts);
 }
 
@@ -118,9 +128,7 @@ function remoteSessionLink(structured, t) {
   try {
     const url = new URL(str(structured.sessionUrl));
     if (url.protocol !== 'https:') return null;
-    return h('a', { class: 'tool-external', attrs: { href: url.href, target: '_blank', rel: 'noopener noreferrer' } }, [
-      h('span', { text: t('tools.agent.openSession') }),
-    ]);
+    return linkAction(url.href, t('tools.agent.openSession'));
   } catch {
     return null;
   }

@@ -156,37 +156,50 @@
   display: none;
 }
 
+/* One action row per card: copy, open, wrap and expand controls share it, right-aligned, wrapping only when narrow. */
 .tool-actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: var(--space-1);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
+/* Small ghost buttons: no fill or border at rest, so the toolbar reads as plain text until hovered or focused. */
 .tool-action {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  min-height: 28px;
-  padding: 2px 10px;
-  border: 1px solid var(--border);
+  gap: 4px;
+  min-height: 26px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  background: var(--bg);
+  background: transparent;
   color: var(--fg-muted);
   font: inherit;
   font-size: var(--fs-xs);
+  line-height: 1.2;
+  white-space: nowrap;
+  text-decoration: none;
   cursor: pointer;
 }
 
+@media (pointer: coarse) {
+  .tool-action {
+    min-height: 36px;
+  }
+}
+
 .tool-action:hover {
+  border-color: var(--border);
   background: var(--bg-hover);
   color: var(--fg);
 }
 
 .tool-action:focus-visible,
 .tool-more:focus-visible,
-.tool-link:focus-visible,
-.tool-external:focus-visible {
+.tool-link:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
@@ -471,13 +484,6 @@
   min-width: 0;
 }
 
-.tool-diff-bar {
-  display: flex;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-}
-
 .tool-diff {
   max-width: 100%;
   max-height: 420px;
@@ -750,21 +756,6 @@
   flex: none;
 }
 
-.tool-external {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 28px;
-  color: var(--accent);
-  font-size: var(--fs-xs);
-  text-decoration: none;
-}
-
-.tool-external .icon {
-  width: 12px;
-  height: 12px;
-}
-
 .tool-markdown {
   min-width: 0;
   font-size: var(--fs-sm);
@@ -859,10 +850,8 @@
 @media (max-width: 767px) {
   .tool-head,
   .tool-section-head,
-  .tool-action,
   .tool-more,
-  .tool-link,
-  .tool-external {
+  .tool-link {
     min-height: 44px;
   }
 

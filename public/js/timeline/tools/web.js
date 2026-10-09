@@ -5,7 +5,17 @@
 
 import { h, icon } from '../../dom.js';
 import { formatBytes, formatDuration } from '../format.js';
-import { cappedList, chip, copyButton, errorBlock, markdownBlock, section, statusOf, toolShell } from './shell.js';
+import {
+  cappedList,
+  chip,
+  copyButton,
+  errorBlock,
+  linkAction,
+  markdownBlock,
+  section,
+  statusOf,
+  toolShell,
+} from './shell.js';
 import { domainOf, finiteNumber, isRecord, resultText, str, truncate } from './summaries.js';
 
 const LINK_LIMIT = 20;
@@ -110,13 +120,16 @@ function renderFetch(card, ctx) {
   const domain = domainOf(url);
   const text = typeof structured.result === 'string' ? structured.result : resultText(card.result);
   const actions = [];
-  if (href) actions.push(copyButton({ text: href, t, label: t('tools.web.copyUrl') }));
+  if (href) {
+    actions.push(linkAction(href, t('tools.web.openPage')));
+    actions.push(copyButton({ text: href, t, label: t('tools.web.copyUrl') }));
+  }
   return toolShell({
     iconName: 'globe',
     title: 'WebFetch',
     subtitle: truncate(url, SUBTITLE_MAX),
     status: statusOf(card),
-    body: () => fetchBody(card, input, structured, href, text, ctx),
+    body: () => fetchBody(card, input, structured, text, ctx),
     open: Boolean(ctx.open || card.pendingRequestId),
     actions,
     extras: domain ? [chip(domain, { mono: true })] : [],
@@ -129,23 +142,14 @@ function renderFetch(card, ctx) {
  * @param {import('./index.js').ToolCard} card
  * @param {Record<string, unknown>} input
  * @param {Record<string, unknown>} structured
- * @param {string | null} href
  * @param {string} text
  * @param {import('./index.js').ToolContext} ctx
  * @returns {HTMLElement}
  */
-function fetchBody(card, input, structured, href, text, ctx) {
+function fetchBody(card, input, structured, text, ctx) {
   const { t } = ctx;
   const parts = [];
   const meta = [];
-  if (href) {
-    meta.push(
-      h('a', { class: 'tool-external', attrs: { href, target: '_blank', rel: 'noopener noreferrer' } }, [
-        icon('external'),
-        h('span', { text: t('tools.web.openPage') }),
-      ]),
-    );
-  }
   const code = finiteNumber(structured.code);
   if (code != null) {
     const codeText = str(structured.codeText);

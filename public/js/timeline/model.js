@@ -104,6 +104,8 @@ export function createModel() {
   let turns = [];
   /** @type {Flow|null} */
   let current = null;
+  /** @type {Flow|null} the turn the SDK message being applied names through its user message uuid(s), else null */
+  let named = null;
   /** @type {{messageId: string, blocks: Array<Record<string, any>|undefined>, finalized: number, stopped: boolean, version: number}|null} */
   let draft = null;
   /** @type {Map<string, Record<string, any>>} */
@@ -279,11 +281,43 @@ export function createModel() {
     return flow;
   };
 
-  /** @returns {Flow} the current turn, starting one when none exists */
-  const baseFlow = () => current ?? newTurn();
+  /** @returns {Flow} the turn the message being applied names, else the current turn, starting one when none exists */
+  const baseFlow = () => named ?? current ?? newTurn();
 
-  /** @returns {Flow} the current turn for live activity; a closed turn means the activity starts a new one */
-  const liveFlow = () => (current && !current.state.closed ? current : newTurn());
+  /**
+   * The turn live activity goes to: the turn the message names, else the current turn while it is open. A closed turn
+   * hands over to the next open turn of the timeline (a snapshot can hold turns the transcript already has), and only
+   * when there is none does a new turn start.
+   * @returns {Flow}
+   */
+  const liveFlow = () => {
+    if (named) return named;
+    if (current && !current.state.closed) return current;
+    const index = current ? turns.indexOf(current) : -1;
+    const next = index < 0 ? undefined : turns.slice(index + 1).find((flow) => !flow.state.closed);
+    if (next) {
+      current = next;
+      return next;
+    }
+    return newTurn();
+  };
+
+  /**
+   * The turn an SDK message names through its user message uuids. The list comes first, in consumption order: a batch
+   * of messages merged into one turn lists all of them, and user_message_uuid names the last one. Null when none of
+   * the named user messages is in the timeline yet.
+   * @param {Record<string, any>} raw
+   * @returns {Flow|null}
+   */
+  const namedTurn = (raw) => {
+    const listed = Array.isArray(raw.user_message_uuids) ? raw.user_message_uuids : [];
+    for (const id of [...listed, raw.user_message_uuid]) {
+      const entry = typeof id === 'string' ? userEntries.get(id) : undefined;
+      const flow = entry ? containerOf.get(entry) : undefined;
+      if (flow) return flow.state.main ?? flow;
+    }
+    return null;
+  };
 
   /** @param {Flow} flow @returns {boolean} */
   const flowOpen = (flow) => {
@@ -854,6 +888,8 @@ export function createModel() {
   /** @param {Record<string, any>} raw @returns {Flow} */
   const onResult = (raw) => {
     const flow = baseFlow();
+    // A result that names no turn may only fill a turn that has no result yet, so it cannot be placed twice.
+    if (!named && flow.entries.some((entry) => entry.kind === 'result')) return null;
     const uuid = typeof raw.uuid === 'string' ? raw.uuid : null;
     const terminal = typeof raw.terminal_reason === 'string' ? raw.terminal_reason : null;
     const subtype = typeof raw.subtype === 'string' ? raw.subtype : 'success';
@@ -1022,27 +1058,45 @@ export function createModel() {
       }
       return;
     }
+    // A message that names its user message is placed in that turn, and the cursor moves there so the messages after it
+    // without a name follow it.
+    const outer = named;
+    named = namedTurn(raw);
+    if (named) current = named;
     /** @type {Flow|null} */
-    let flow;
+    let flow = null;
+    try {
+      flow = route(raw, live);
+    } finally {
+      named = outer;
+    }
+    if (uuid && flow && !flowOfUuid.has(uuid)) flowOfUuid.set(uuid, flow);
+  }
+
+  /**
+   * Hands a message to its handler. Returns the flow it wrote to, or null when it wrote nothing.
+   * @param {any} raw
+   * @param {boolean} live
+   * @returns {Flow|null}
+   */
+  function route(raw, live) {
     switch (raw.type) {
-      case 'user': flow = onUser(raw, live); break;
-      case 'assistant': flow = onAssistant(raw, live); break;
-      case 'system': flow = onSystem(raw, live); break;
-      case 'result': flow = live ? onResult(raw) : null; break;
-      case 'stream_event': flow = live ? onStream(raw) : null; break;
-      case 'tool_progress': flow = live ? onToolProgress(raw) : null; break;
-      case 'tool_use_summary': flow = live ? onSummary(raw) : null; break;
-      case 'conversation_reset': flow = onReset(raw); break;
+      case 'user': return onUser(raw, live);
+      case 'assistant': return onAssistant(raw, live);
+      case 'system': return onSystem(raw, live);
+      case 'result': return live ? onResult(raw) : null;
+      case 'stream_event': return live ? onStream(raw) : null;
+      case 'tool_progress': return live ? onToolProgress(raw) : null;
+      case 'tool_use_summary': return live ? onSummary(raw) : null;
+      case 'conversation_reset': return onReset(raw);
       case 'keep_alive':
       case 'rate_limit_event':
       case 'prompt_suggestion':
       case 'auth_status':
-        flow = null;
-        break;
+        return null;
       default:
-        flow = addGeneric(raw, live, null);
+        return addGeneric(raw, live, null);
     }
-    if (uuid && flow && !flowOfUuid.has(uuid)) flowOfUuid.set(uuid, flow);
   }
 
   /** @param {any} raw @param {boolean} live */
@@ -1434,7 +1488,13 @@ export function createModel() {
     getEntries() {
       /** @type {Array<Record<string, any>>} */
       const out = [];
-      for (const turn of turns) out.push(...turn.entries);
+      for (const turn of turns) {
+        for (const entry of turn.entries) {
+          // A work group with nothing in it has nothing to show.
+          if (entry.kind === 'work' && entry.items.length === 0) continue;
+          out.push(entry);
+        }
+      }
       if (draft) {
         const visible = draft.blocks.slice(draft.finalized).filter(Boolean);
         if (visible.length > 0) {

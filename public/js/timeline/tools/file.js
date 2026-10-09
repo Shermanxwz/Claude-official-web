@@ -175,13 +175,13 @@ function renderWrite(card, ctx) {
     title: 'Write',
     subtitle: displayPath(input.file_path, ctx.cwd),
     status: statusOf(card),
-    body: () => {
+    body: (toolbar) => {
       const meta = [chip(t(structured.type === 'update' ? 'tools.file.updated' : 'tools.file.created'))];
       if (structured.staged === true) meta.push(chip(t('tools.file.staged'), { kind: 'warning' }));
       if (structured.userModified === true) meta.push(chip(t('tools.file.userModified'), { kind: 'accent' }));
       const parts = [h('div', { class: 'tool-meta' }, meta)];
       if (groups.length > 0) {
-        parts.push(diffView(groups, t));
+        parts.push(diffView(groups, t, toolbar));
       } else if (lines.length > 0) {
         const rows = lines.map((text, index) => ({ no: index + 1, text }));
         parts.push(numberedView(rows, t, WRITE_PREVIEW_LINES));
@@ -216,7 +216,7 @@ function renderEdit(card, ctx) {
     title: card.name === 'MultiEdit' ? 'MultiEdit' : 'Edit',
     subtitle: displayPath(input.file_path, ctx.cwd),
     status: statusOf(card),
-    body: () => editBody(card, input, structured, groups, t),
+    body: (toolbar) => editBody(card, input, structured, groups, t, toolbar),
     open: Boolean(ctx.open || card.pendingRequestId),
     actions: filePath ? [copyButton({ text: filePath, t, label: t('tools.file.copyPath') })] : [],
     extras: counts.added + counts.removed > 0 ? diffStat(counts, t) : [],
@@ -231,9 +231,10 @@ function renderEdit(card, ctx) {
  * @param {Record<string, unknown>} structured
  * @param {DiffGroup[]} groups
  * @param {import('./index.js').Translate} t
+ * @param {HTMLElement} toolbar the card's action toolbar, which receives the diff controls
  * @returns {HTMLElement}
  */
-function editBody(card, input, structured, groups, t) {
+function editBody(card, input, structured, groups, t, toolbar) {
   const meta = [];
   if (input.replace_all === true || structured.replaceAll === true) meta.push(chip(t('tools.file.replaceAll')));
   if (structured.userModified === true) meta.push(chip(t('tools.file.userModified'), { kind: 'accent' }));
@@ -242,7 +243,7 @@ function editBody(card, input, structured, groups, t) {
   if (meta.length > 0) parts.push(h('div', { class: 'tool-meta' }, meta));
   if (card.result?.isError) parts.push(errorBlock(resultText(card.result), t));
   if (groups.some((group) => group.hunks.length > 0)) {
-    parts.push(diffView(groups, t));
+    parts.push(diffView(groups, t, toolbar));
   } else if (!card.result?.isError) {
     parts.push(note(t('tools.file.noChanges'), t));
   }
@@ -297,7 +298,7 @@ function renderNotebook(card, ctx) {
     title: 'NotebookEdit',
     subtitle: displayPath(notebookPath, ctx.cwd),
     status: statusOf(card),
-    body: () => {
+    body: (toolbar) => {
       const meta = [chip(t(`tools.notebook.mode.${editMode}`), { kind: 'accent' })];
       if (cellType) meta.push(chip(cellType));
       if (cellId) meta.push(chip(cellId, { mono: true }));
@@ -307,7 +308,7 @@ function renderNotebook(card, ctx) {
       if (editMode === 'delete') {
         parts.push(note(t('tools.notebook.deleted'), t));
       } else if (oldSource !== null && oldSource !== newSource) {
-        parts.push(diffView([{ label: null, hunks: diffLines(oldSource, newSource) }], t));
+        parts.push(diffView([{ label: null, hunks: diffLines(oldSource, newSource) }], t, toolbar));
       } else if (newSource) {
         parts.push(codeBlock(newSource, { label: t('tools.notebook.source') }));
       } else {
@@ -346,12 +347,14 @@ function numberedView(rows, t, limit) {
 }
 
 /**
- * Unified diff with old and new line-number gutters, hunk headers and add/delete row backgrounds.
+ * Unified diff with old and new line-number gutters, hunk headers and add/delete row backgrounds. When a toolbar is
+ * given, the wrap and expand controls are appended to it, so they share the card's action row.
  * @param {DiffGroup[]} groups
  * @param {import('./index.js').Translate} t
+ * @param {HTMLElement} [toolbar]
  * @returns {HTMLElement}
  */
-function diffView(groups, t) {
+function diffView(groups, t, toolbar) {
   const scroller = h('div', { class: 'tool-diff' });
   let rowCount = 0;
   for (const group of groups) {
@@ -364,7 +367,10 @@ function diffView(groups, t) {
       }
     }
   }
-  return h('div', { class: 'tool-diff-view' }, [diffBar(scroller, rowCount, t), scroller]);
+  if (toolbar) {
+    for (const control of diffControls(scroller, rowCount, t)) toolbar.appendChild(control);
+  }
+  return h('div', { class: 'tool-diff-view' }, [scroller]);
 }
 
 /**
@@ -382,13 +388,14 @@ function diffRow(row) {
 }
 
 /**
- * Word-wrap toggle and, for long diffs, an expand toggle that lifts the 420 px height limit.
+ * Word-wrap toggle and, for long diffs, an expand toggle that lifts the 420 px height limit. The caller places both in
+ * the card's action toolbar.
  * @param {HTMLElement} scroller
  * @param {number} rowCount
  * @param {import('./index.js').Translate} t
- * @returns {HTMLElement}
+ * @returns {HTMLElement[]}
  */
-function diffBar(scroller, rowCount, t) {
+function diffControls(scroller, rowCount, t) {
   const wrap = h('button', {
     class: 'tool-action',
     attrs: { type: 'button', 'aria-pressed': 'false' },
@@ -414,7 +421,7 @@ function diffBar(scroller, rowCount, t) {
     });
     controls.push(expand);
   }
-  return h('div', { class: 'tool-diff-bar' }, controls);
+  return controls;
 }
 
 /**

@@ -207,6 +207,14 @@ class InputQueue {
     for (const taker of this.takers.splice(0)) taker({ done: true, value: undefined });
   }
 
+  /**
+   * Removes and returns every prompt that is already waiting, without waiting for more.
+   * @returns {SDKUserMessage[]}
+   */
+  drainWaiting() {
+    return this.items.splice(0);
+  }
+
   /** @returns {Promise<IteratorResult<SDKUserMessage, void>>} */
   take() {
     if (this.failure !== undefined) return Promise.reject(this.failure);
@@ -694,6 +702,13 @@ function userBlocks(message) {
  * @property {OnElicitation|undefined} onElicitation
  * @property {SDKPermissionDenial[]} denials                  denied tool calls of this turn
  * @property {number} startedAt
+ * @property {string} userMessageUuid                         uuid of the last prompt of the turn's batch, as the SDK reports it
+ * @property {string[]} userMessageUuids                      uuids of every prompt the turn answers, in consumption order
+ */
+
+/**
+ * A prompt that has a uuid: the gateway sets it to the client message id, and the mock assigns one when it is missing.
+ * @typedef {SDKUserMessage & {uuid: string}} LinkedPrompt
  */
 
 /** Context rows that do not change while a session runs, in tokens. */
@@ -830,16 +845,16 @@ export async function* elicitationOf(core, turn, request) {
 
 /**
  * The context one scenario reads for one turn.
- * @param {{core: SessionCore, turn: TurnState, prompt: SDKUserMessage, streamPartials: boolean}} args
+ * @param {{core: SessionCore, turn: TurnState, userText: string, streamPartials: boolean}} args
  * @returns {TurnContext}
  */
-export function turnContextOf({ core, turn, prompt, streamPartials }) {
+export function turnContextOf({ core, turn, userText, streamPartials }) {
   return {
     sessionId: core.sessionId,
     cwd: core.cwd,
     model: core.model,
-    userText: promptText(prompt),
-    userMessageUuid: typeof prompt.uuid === 'string' ? prompt.uuid : envelopeOf(core).uuid,
+    userText,
+    userMessageUuid: turn.userMessageUuid,
     delayMs: core.delayMs,
     streamPartials,
     turnIndex: core.turnIndex,
@@ -862,9 +877,10 @@ export function turnContextOf({ core, turn, prompt, streamPartials }) {
  * Starts a turn: its own controller, linked to the session so that closing the session also stops the turn.
  * @param {SessionCore} core
  * @param {SdkOptions} options
+ * @param {string[]} userMessageUuids uuids of the prompts the turn answers, in consumption order (never empty)
  * @returns {TurnState}
  */
-export function beginTurn(core, options) {
+export function beginTurn(core, options, userMessageUuids) {
   const controller = new AbortController();
   core.turnAbort = controller;
   return {
@@ -874,6 +890,8 @@ export function beginTurn(core, options) {
     onElicitation: options.onElicitation,
     denials: [],
     startedAt: Date.now(),
+    userMessageUuid: userMessageUuids[userMessageUuids.length - 1],
+    userMessageUuids: [...userMessageUuids],
   };
 }
 
@@ -986,10 +1004,9 @@ export function turnUsageOf(observer) {
  * @param {TurnState} turn
  * @param {TurnObserver} observer
  * @param {{error: string|null, terminalReason: 'aborted_streaming'|'aborted_tools'|'model_error'|null}} outcome
- * @param {string|undefined} userMessageUuid
  * @returns {SDKResultMessage}
  */
-export function resultOf(core, turn, observer, outcome, userMessageUuid) {
+export function resultOf(core, turn, observer, outcome) {
   const durationMs = Math.max(0, Date.now() - turn.startedAt);
   const common = {
     duration_ms: durationMs,
@@ -1001,7 +1018,8 @@ export function resultOf(core, turn, observer, outcome, userMessageUuid) {
     permission_denials: [...turn.denials],
     uuid: envelopeOf(core).uuid,
     session_id: core.sessionId,
-    ...(userMessageUuid === undefined ? {} : { user_message_uuid: userMessageUuid }),
+    user_message_uuid: turn.userMessageUuid,
+    user_message_uuids: [...turn.userMessageUuids],
   };
   if (outcome.error === null) {
     return {
@@ -1036,11 +1054,10 @@ const INTERRUPTED_TOOL_TEXT = '[Request interrupted by user for tool use]';
  * @param {TurnState} turn
  * @param {TurnObserver} observer
  * @param {TurnStop} stop
- * @param {string|undefined} userMessageUuid
  * @param {(message: SDKMessage) => SDKMessage} seen
  * @returns {Generator<SDKMessage, void, unknown>}
  */
-export function* closeInterruptedTurn(core, ctx, turn, observer, stop, userMessageUuid, seen) {
+export function* closeInterruptedTurn(core, ctx, turn, observer, stop, seen) {
   for (const draft of observer.openDrafts()) {
     yield seen(interruptedMessage(ctx, { id: draft.id, text: draft.text, parentToolUseId: draft.parentToolUseId,
       agentId: draft.agentId }));
@@ -1068,8 +1085,7 @@ export function* closeInterruptedTurn(core, ctx, turn, observer, stop, userMessa
     }));
   }
   yield seen(syntheticUser(ctx, '[Request interrupted by user]'));
-  yield seen(resultOf(core, turn, observer, { error: 'Interrupted', terminalReason: stop.terminalReason },
-    userMessageUuid));
+  yield seen(resultOf(core, turn, observer, { error: 'Interrupted', terminalReason: stop.terminalReason }));
 }
 
 /**
@@ -1077,17 +1093,16 @@ export function* closeInterruptedTurn(core, ctx, turn, observer, stop, userMessa
  * A session that closes mid-turn ends silently, as the SDK does after close().
  * @param {SessionCore} core
  * @param {SdkOptions} options
- * @param {SDKUserMessage} prompt
+ * @param {LinkedPrompt[]} prompts the prompts the turn answers, in consumption order (never empty)
  * @param {boolean} streamPartials
  * @returns {AsyncGenerator<SDKMessage, void, unknown>}
  */
-export async function* runTurn(core, options, prompt, streamPartials) {
-  const turn = beginTurn(core, options);
+export async function* runTurn(core, options, prompts, streamPartials) {
+  const turn = beginTurn(core, options, prompts.map((prompt) => prompt.uuid));
   const observer = new TurnObserver();
-  const userMessageUuid = typeof prompt.uuid === 'string' ? prompt.uuid : undefined;
-  const text = promptText(prompt);
+  const text = prompts.map((prompt) => promptText(prompt)).join('\n\n');
   const scenario = selectScenario(text);
-  const ctx = turnContextOf({ core, turn, prompt, streamPartials });
+  const ctx = turnContextOf({ core, turn, userText: text, streamPartials });
   /** @param {SDKMessage} message */
   const seen = (message) => {
     observer.see(message);
@@ -1111,19 +1126,18 @@ export async function* runTurn(core, options, prompt, streamPartials) {
     }
     addUsage(core, observer);
     core.turnIndex += 1;
-    yield seen(resultOf(core, turn, observer, { error: null, terminalReason: null }, userMessageUuid));
+    yield seen(resultOf(core, turn, observer, { error: null, terminalReason: null }));
     yield seen(promptSuggestion(ctx, SUGGESTIONS[core.turnIndex % SUGGESTIONS.length]));
   } catch (error) {
     if (error instanceof SessionClosed || core.sessionAbort.signal.aborted) return;
     if (error instanceof TurnStop) {
       addUsage(core, observer);
       core.turnIndex += 1;
-      yield* closeInterruptedTurn(core, ctx, turn, observer, error, userMessageUuid, seen);
+      yield* closeInterruptedTurn(core, ctx, turn, observer, error, seen);
     } else if (error instanceof ScenarioFailure) {
       addUsage(core, observer);
       core.turnIndex += 1;
-      yield seen(resultOf(core, turn, observer, { error: error.message, terminalReason: 'model_error' },
-        userMessageUuid));
+      yield seen(resultOf(core, turn, observer, { error: error.message, terminalReason: 'model_error' }));
     } else {
       throw error;
     }
@@ -1248,8 +1262,21 @@ export function persistPrompt(core, prompt) {
 }
 
 /**
- * The session generator: init first, then one turn per prompt, until the prompts end or the session closes. Control
- * messages are yielded while the session waits for its next prompt.
+ * A prompt with a uuid: the one the host sent (the gateway sets it to the client message id), or a new one when it sent
+ * none.
+ * @param {SessionCore} core
+ * @param {SDKUserMessage} prompt
+ * @returns {LinkedPrompt}
+ */
+function linkedPrompt(core, prompt) {
+  const uuid = typeof prompt.uuid === 'string' ? prompt.uuid : envelopeOf(core).uuid;
+  return { ...prompt, uuid };
+}
+
+/**
+ * The session generator: init first, then one turn per batch of prompts, until the prompts end or the session closes.
+ * A batch is the prompt that was taken plus every prompt already waiting behind it, so prompts sent close together are
+ * answered by one turn. Control messages are yielded while the session waits for its next prompt.
  * @param {SessionCore} core
  * @param {InputQueue} queue
  * @param {SdkOptions} options
@@ -1261,10 +1288,17 @@ export async function* sessionLoop(core, queue, options) {
     for (;;) {
       const next = yield* waitFor(core, queue.take(), core.sessionAbort.signal);
       if (next.done === true) break;
-      const prompt = next.value;
-      persistPrompt(core, prompt);
-      if (prompt.shouldQuery === false) continue;
-      yield* runTurn(core, options, prompt, options.includePartialMessages === true);
+      // One macrotask lets the pump deliver the prompts the host already pushed.
+      yield* waitFor(core, new Promise((resolveTick) => setImmediate(resolveTick)), core.sessionAbort.signal);
+      const batch = [next.value, ...queue.drainWaiting()].map((prompt) => linkedPrompt(core, prompt));
+      /** @type {LinkedPrompt[]} */
+      const answered = [];
+      for (const prompt of batch) {
+        persistPrompt(core, prompt);
+        if (prompt.shouldQuery !== false) answered.push(prompt);
+      }
+      if (answered.length === 0) continue;
+      yield* runTurn(core, options, answered, options.includePartialMessages === true);
     }
   } catch (error) {
     if (!(error instanceof SessionClosed)) throw error;

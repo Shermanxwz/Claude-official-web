@@ -114,7 +114,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
 
   const modelOptions = collectModelOptions(store.get().capabilities, meta?.defaults?.model);
   const modelInput = h('input', {
-    class: 'input mono',
+    class: 'input',
     attrs: {
       type: 'text',
       list: 'new-session-models',

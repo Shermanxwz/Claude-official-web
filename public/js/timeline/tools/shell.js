@@ -24,14 +24,14 @@ export function statusOf(card) {
 }
 
 /**
- * Collapsible tool card. `body` is either a Node or a function returning one; a function is called on the first open
- * (immediately when the card starts open).
+ * Collapsible tool card. `body` is either a Node or a function returning one. A function is called on the first open
+ * (immediately when the card starts open) with the action toolbar, to which it may append controls.
  * @param {{
  *   iconName: string,
  *   title: string,
  *   subtitle?: string,
  *   status?: ToolStatus | null,
- *   body?: Node | (() => Node | null | undefined) | null,
+ *   body?: Node | ((toolbar: HTMLElement) => Node | null | undefined) | null,
  *   open?: boolean,
  *   actions?: HTMLElement[],
  *   extras?: HTMLElement[],
@@ -102,6 +102,22 @@ export function copyButton({ text, t: translate = defaultT, label }) {
 }
 
 /**
+ * Link styled as a toolbar action. It opens in a new tab without a referrer or opener; callers pass only http or https
+ * URLs.
+ * @param {string} href
+ * @param {string} label
+ * @returns {HTMLAnchorElement}
+ */
+export function linkAction(href, label) {
+  return h(
+    'a',
+    { class: 'tool-action', attrs: { href, target: '_blank', rel: 'noopener noreferrer' } },
+    icon('external'),
+    h('span', { text: label }),
+  );
+}
+
+/**
  * Small pill used for flags, counts and identifiers.
  * @param {string} text
  * @param {{ kind?: 'neutral' | 'accent' | 'success' | 'warning' | 'danger', title?: string, mono?: boolean }} [options]
@@ -120,7 +136,7 @@ export function chip(text, options = {}) {
  * toolShell. `subtitle` is a one-line muted hint shown in the header, such as the latest activity of a subagent.
  * @param {{
  *   title: string,
- *   body?: Node | (() => Node | null | undefined) | null,
+ *   body?: Node | ((toolbar: HTMLElement) => Node | null | undefined) | null,
  *   open?: boolean,
  *   count?: string | number | null,
  *   subtitle?: string,
@@ -298,11 +314,12 @@ export function prettyJson(value) {
 }
 
 /**
- * Rendering of a card body: function bodies are built on demand, and action buttons go above the content. A body that
- * throws leaves a short note in place of its content, so one unexpected result never breaks the timeline.
+ * Rendering of a card body: function bodies are built on demand. The action toolbar is one row above the content: the
+ * `actions`, then any controls the body adds to the toolbar it receives. A body that throws leaves a short note in place
+ * of its content, so one unexpected result never breaks the timeline.
  * @param {HTMLDetailsElement} details
  * @param {HTMLElement} host
- * @param {Node | (() => Node | null | undefined) | null | undefined} body
+ * @param {Node | ((toolbar: HTMLElement) => Node | null | undefined) | null | undefined} body
  * @param {boolean} eager build now instead of on first open
  * @param {HTMLElement[]} actions
  * @param {Translate} translate
@@ -312,12 +329,14 @@ function attachBody(details, host, body, eager, actions, translate) {
   const build = () => {
     if (built) return;
     built = true;
+    const toolbar = h('div', { class: 'tool-actions' }, actions);
     try {
-      if (actions.length > 0) host.appendChild(h('div', { class: 'tool-actions' }, actions));
-      const node = typeof body === 'function' ? body() : body;
+      const node = typeof body === 'function' ? body(toolbar) : body;
+      appendToolbar(host, toolbar);
       if (node instanceof Node) host.appendChild(node);
     } catch (error) {
       console.error('tool card body failed', error);
+      appendToolbar(host, toolbar);
       host.appendChild(mutedNote(translate('tools.bodyFailed')));
     }
   };
@@ -325,6 +344,15 @@ function attachBody(details, host, body, eager, actions, translate) {
   details.addEventListener('toggle', () => {
     if (details.open) build();
   });
+}
+
+/**
+ * Appends the action toolbar above the card content when it has any controls.
+ * @param {HTMLElement} host
+ * @param {HTMLElement} toolbar
+ */
+function appendToolbar(host, toolbar) {
+  if (toolbar.childNodes.length > 0) host.appendChild(toolbar);
 }
 
 /**

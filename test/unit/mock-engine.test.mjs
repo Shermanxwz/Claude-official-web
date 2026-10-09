@@ -120,10 +120,11 @@ async function collect(query, until) {
  * @param {string} cwd
  * @param {string} text
  * @param {Record<string, unknown>} [options]
+ * @param {string} [uuid] the uuid of the prompt message
  */
-async function runSingle(adapter, cwd, text, options = {}) {
+async function runSingle(adapter, cwd, text, options = {}, uuid = randomUUID()) {
   const channel = promptChannel();
-  channel.push(userPrompt(text));
+  channel.push(userPrompt(text, uuid));
   channel.end();
   const query = adapter.query({ prompt: channel.stream, options: { cwd, includePartialMessages: true, ...options } });
   return collect(query);
@@ -163,6 +164,24 @@ function assertWellFormed(messages) {
   for (const id of streamed) assert.ok(finished.has(id), `streamed message ${id} has a final assistant message`);
   for (const id of toolUses) assert.ok(toolResults.has(id), `tool_use ${id} has a tool_result`);
   return messages.filter((message) => message.type === 'result');
+}
+
+/**
+ * Checks the turn linkage: every assistant message, stream event and result carries the uuid of the prompt that
+ * started the turn (the last of the batch), and every result lists every prompt the turn answers, in order.
+ * @param {any[]} messages
+ * @param {string[]} uuids the answered prompts, in consumption order
+ */
+function assertLinked(messages, uuids) {
+  const turnUuid = uuids[uuids.length - 1];
+  const linked = messages.filter((m) => m.type === 'assistant' || m.type === 'stream_event' || m.type === 'result');
+  assert.ok(linked.length > 0, 'the turn has linked messages');
+  for (const message of linked) {
+    assert.equal(message.user_message_uuid, turnUuid, `${message.type} carries the uuid of its prompt`);
+  }
+  const results = messages.filter((m) => m.type === 'result');
+  assert.equal(results.length, 1, 'one result per turn');
+  assert.deepEqual(results[0].user_message_uuids, uuids, 'the result lists every prompt the turn answers');
 }
 
 /** Text of the assistant messages of the top level, in order. */
@@ -516,7 +535,8 @@ describe('questions, plans and elicitation', () => {
 describe('interrupt, abort and close', () => {
   test('interrupt during streaming keeps the streamed text as an aborted message and ends the turn', async (t) => {
     const channel = promptChannel();
-    channel.push(userPrompt('answer slowly'));
+    const uuid = randomUUID();
+    channel.push(userPrompt('answer slowly', uuid));
     channel.end();
     const query = adapterAt(tempDir(t), 5).query({
       prompt: channel.stream,
@@ -547,6 +567,7 @@ describe('interrupt, abort and close', () => {
     assert.ok(messages.some((m) => m.type === 'user' && m.isSynthetic === true), 'the interruption marker is written');
     assert.equal(messages.at(-1).subtype, 'session_state_changed');
     assert.equal(messages.at(-1).state, 'idle');
+    assertLinked(messages, [uuid]);
   });
 
   test('interrupt with no turn running resolves without effect', async (t) => {
@@ -1203,5 +1224,100 @@ describe('query option checks', () => {
     }));
     assertWellFormed(messages);
     assert.equal(messages.at(-1).subtype, 'session_state_changed');
+  });
+});
+
+describe('turn linkage', () => {
+  test('every assistant message, stream event and result carries the uuid of the prompt that started its turn', async (t) => {
+    const cases = [
+      ['Tell me something', {}],
+      ['run the tool', {}],
+      ['run the tool', { canUseTool: allowAll }],
+      ['run the tool', { canUseTool: async () => ({ behavior: 'deny', message: 'Stop now', interrupt: true }) }],
+      ['use an agent for this', { canUseTool: allowAll }],
+      ['ask me a question', { canUseTool: pickFirstAnswers }],
+      ['make a plan', { canUseTool: allowAll }],
+      ['produce an error', {}],
+    ];
+    for (const [text, options] of cases) {
+      const uuid = randomUUID();
+      const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), text, options, uuid);
+      assertWellFormed(messages);
+      assertLinked(messages, [uuid]);
+    }
+  });
+
+  test('two turns of one session each link to the prompt that started them', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t), { includePartialMessages: true });
+    const first = randomUUID();
+    channel.push(userPrompt('Tell me something', first));
+    assertLinked(await pullUntil(query, (message) => message.type === 'result'), [first]);
+    const second = randomUUID();
+    channel.push(userPrompt('Tell me more', second));
+    assertLinked(await pullUntil(query, (message) => message.type === 'result'), [second]);
+  });
+
+  test('prompts already waiting when a turn starts are answered by that turn, in arrival order', async (t) => {
+    const stateDir = tempDir(t);
+    const cwd = projectDir(t);
+    const channel = promptChannel();
+    const [first, second, third] = [randomUUID(), randomUUID(), randomUUID()];
+    channel.push(userPrompt('Tell me something', first));
+    channel.push(userPrompt('Tell me more', second));
+    channel.push(userPrompt('And one more thing', third));
+    const adapter = adapterAt(stateDir);
+    const query = adapter.query({ prompt: channel.stream, options: { cwd, includePartialMessages: true } });
+    t.after(() => {
+      channel.end();
+      query.close();
+    });
+    const batch = await pullUntil(query, (message) => message.type === 'result');
+    assertLinked(batch, [first, second, third]);
+    const [result] = batch.filter((message) => message.type === 'result');
+    assert.equal(result.user_message_uuid, third, 'the batch is keyed by its last prompt, as the SDK reports it');
+    const stored = await adapter.getSessionMessages(batch[0].session_id, { dir: cwd });
+    assert.deepEqual(stored.map((entry) => entry.type), ['user', 'user', 'user', 'assistant']);
+    assert.deepEqual(stored.slice(0, 3).map((entry) => entry.uuid), [first, second, third]);
+
+    const fourth = randomUUID();
+    channel.push(userPrompt('Tell me something else', fourth));
+    assertLinked(await pullUntil(query, (message) => message.type === 'result'), [fourth]);
+  });
+
+  test('a prompt that does not query is stored, starts no turn and is not listed as answered', async (t) => {
+    const stateDir = tempDir(t);
+    const cwd = projectDir(t);
+    const channel = promptChannel();
+    const [first, note, second] = [randomUUID(), randomUUID(), randomUUID()];
+    channel.push(userPrompt('Tell me something', first));
+    channel.push({ ...userPrompt('Keep this note', note), shouldQuery: false });
+    channel.push(userPrompt('Tell me more', second));
+    const adapter = adapterAt(stateDir);
+    const query = adapter.query({ prompt: channel.stream, options: { cwd, includePartialMessages: true } });
+    t.after(() => {
+      channel.end();
+      query.close();
+    });
+    const turn = await pullUntil(query, (message) => message.type === 'result');
+    assertLinked(turn, [first, second]);
+    const stored = await adapter.getSessionMessages(turn[0].session_id, { dir: cwd });
+    assert.deepEqual(stored.map((entry) => entry.type), ['user', 'user', 'user', 'assistant']);
+    assert.deepEqual(stored.slice(0, 3).map((entry) => entry.uuid), [first, note, second]);
+  });
+
+  test('a prompt sent without a uuid gets one, and its turn is linked to it', async (t) => {
+    const stateDir = tempDir(t);
+    const cwd = projectDir(t);
+    const channel = promptChannel();
+    channel.push({ type: 'user', message: { role: 'user', content: 'Tell me something' }, parent_tool_use_id: null });
+    channel.end();
+    const adapter = adapterAt(stateDir);
+    const messages = await collect(adapter.query({ prompt: channel.stream, options: { cwd, includePartialMessages: true } }));
+    assertWellFormed(messages);
+    const [result] = messages.filter((message) => message.type === 'result');
+    assert.equal(typeof result.user_message_uuid, 'string');
+    assertLinked(messages, [result.user_message_uuid]);
+    const stored = await adapter.getSessionMessages(messages[0].session_id, { dir: cwd });
+    assert.equal(stored[0].uuid, result.user_message_uuid);
   });
 });

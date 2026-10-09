@@ -559,12 +559,19 @@ function messageShell(ctx, id, usage, stopReason = null) {
  * @returns {SDKPartialAssistantMessage}
  */
 function streamEvent(ctx, event) {
-  return { type: 'stream_event', event, parent_tool_use_id: null, ...ctx.envelope() };
+  return {
+    type: 'stream_event',
+    event,
+    parent_tool_use_id: null,
+    user_message_uuid: ctx.userMessageUuid,
+    ...ctx.envelope(),
+  };
 }
 
 /**
- * One completed content block group as an assistant message. Blocks of one response share the message id.
- * @param {SessionView} ctx
+ * One completed content block group as an assistant message. Blocks of one response share the message id. The message
+ * carries the uuid of the prompt its turn answers.
+ * @param {TurnContext} ctx
  * @param {{id: string, content: BetaMessage['content'], usage: NonNullableUsage,
  *   stopReason?: BetaMessage['stop_reason'], parentToolUseId: string|null, agentId: string|null,
  *   aborted?: boolean}} args
@@ -577,6 +584,7 @@ export function assistantMessage(ctx, { id, content, usage, stopReason = null, p
     message: { ...messageShell(ctx, id, usage, stopReason), content },
     parent_tool_use_id: parentToolUseId,
     ...(agentId ? { agent_id: agentId } : {}),
+    user_message_uuid: ctx.userMessageUuid,
     ...ctx.envelope(),
   };
   if (aborted) message.aborted = true;
@@ -701,7 +709,7 @@ export async function* modelResponse(ctx, blocks, options = {}) {
 /**
  * The partial assistant message of a response that an interrupt cut short. It keeps the text streamed so far and
  * carries `aborted: true`, as the runtime does. It has no content when nothing was streamed yet.
- * @param {SessionView} ctx
+ * @param {TurnContext} ctx
  * @param {{id: string, text: string, parentToolUseId: string|null, agentId: string|null}} partial
  * @returns {SDKAssistantMessage}
  */

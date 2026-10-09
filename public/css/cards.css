@@ -897,6 +897,14 @@
   white-space: nowrap;
 }
 
+/* Progress rows that have no tool step (a hook, a task): listed as they are, with no group header. */
+.work-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
 .work-body {
   display: flex;
   flex-direction: column;
@@ -1676,8 +1684,9 @@
     --turn-gap: 20px;
   }
 
+  /* The pill sits above the pinned request card, whose height the view measures into --tl-dock. */
   .tl-jump {
-    bottom: var(--space-2);
+    bottom: calc(var(--space-2) + var(--tl-dock, 0px));
   }
 
   .msg-user .msg-bubble {
