@@ -119,8 +119,10 @@ Authorization:
 - The terminal is disabled unless `CAW_TERMINAL=1` and the profile is `full`.
 - `bypassPermissions` is disabled unless `CAW_ALLOW_BYPASS=1` and the profile is `full`. The same rule applies when
   `CAW_DEFAULT_PERMISSION_MODE=bypassPermissions`, and the gateway refuses to start otherwise.
-- "Always allow" saves only the allow rules that Claude Code proposes (`addRules` and `replaceRules` with behavior
-  `allow`) unless the operator ticks more. Directory grants, mode changes, deny and ask rules are saved only when ticked.
+- "Always allow" saves the ticked suggestions. The UI pre-ticks allow rules (`addRules` and `replaceRules` with behavior
+  `allow`) and session-only mode switches; directory grants, other mode changes, deny and ask rules are saved only when
+  ticked. Without explicit indexes the API saves allow rules only, and a suggestion that switches to
+  `bypassPermissions` is refused unless `CAW_ALLOW_BYPASS=1`.
 - When Claude Code reports rejected credentials, the gateway publishes a notice with the code `ENGINE_UNAVAILABLE` and
   sets that error on the session, so the operator sees the failure.
 

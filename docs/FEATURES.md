@@ -34,7 +34,7 @@ Terms used in the tables:
 | Capability | Web surface | Mechanism |
 |---|---|---|
 | Tool approvals | Permission card with allow once, allow always and deny (with an optional reason) | `canUseTool` callback creates a pending request; decision sent to `POST /api/sessions/:id/requests/:rid` |
-| Permission suggestions | "Allow always" saves the allow rules that Claude Code proposes, which start ticked. Directory grants, mode changes, deny and ask rules start unticked and are saved only when ticked | `PermissionUpdate` suggestions and `suggestionIndexes` in the decision; when it is absent, only `addRules` and `replaceRules` with behavior `allow` are saved |
+| Permission suggestions | "Allow always" saves the ticked suggestions. Allow rules and session-only mode switches start ticked; directory grants, other mode changes, deny and ask rules start unticked | `PermissionUpdate` suggestions and `suggestionIndexes` in the decision; when it is absent, only `addRules` and `replaceRules` with behavior `allow` are saved |
 | Questions | A question card with the offered options and free text (`AskUserQuestion`) | `canUseTool` for the `AskUserQuestion` tool; answers returned as `updatedInput.answers` |
 | Plan mode | A plan card to approve (choosing the next permission mode) or reject with feedback | `ExitPlanMode` through `canUseTool`; `setPermissionMode(nextMode)` after approval |
 | MCP elicitation | A form or link card asking an MCP server for input | `onElicitation` callback; accept, decline or cancel with content |

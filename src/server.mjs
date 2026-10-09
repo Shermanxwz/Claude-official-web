@@ -199,7 +199,8 @@ async function main() {
   log.info('listening', { url: running.url });
   if (!config.requireAuth) log.warn('authentication is disabled; every client that can reach the listener has access');
   if (!config.publicOrigin && !isLoopbackHost(config.host)) {
-    log.warn('CAW_PUBLIC_ORIGIN is not set and the listener is not on loopback; origin checks trust the Host header');
+    log.warn('CAW_PUBLIC_ORIGIN is not set and the listener is not on loopback; requests whose Host is not a loopback '
+      + 'name are rejected with 421 — set CAW_PUBLIC_ORIGIN to the public origin');
   }
 
   let stopping = false;

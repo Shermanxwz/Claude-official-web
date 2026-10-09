@@ -121,11 +121,23 @@ function optionalSuggestionIndexes(body, count) {
 }
 
 /**
+ * A suggestion that switches the session into bypassPermissions, which skips every later permission check.
+ * @param {unknown} suggestion
+ * @returns {boolean}
+ */
+function switchesToBypass(suggestion) {
+  if (!suggestion || typeof suggestion !== 'object') return false;
+  const { type, mode } = /** @type {{type?: unknown, mode?: unknown}} */ (suggestion);
+  return type === 'setMode' && mode === 'bypassPermissions';
+}
+
+/**
  * @param {PendingRequest} request
  * @param {Record<string, unknown>} body
+ * @param {boolean} allowBypass whether this server offers the bypassPermissions mode at all
  * @returns {{body: RequestBody, outcome: ResolutionOutcome}}
  */
-function normalizePermission(request, body) {
+function normalizePermission(request, body, allowBypass) {
   assertKeys(body, PERMISSION_KEYS);
   const decision = body.decision;
   if (decision !== 'allow' && decision !== 'allow_always' && decision !== 'deny') {
@@ -142,7 +154,12 @@ function normalizePermission(request, body) {
   const updatedInput = optionalPlainObject(body, 'updatedInput');
   if (updatedInput !== undefined) normalized.updatedInput = updatedInput;
   const suggestionIndexes = optionalSuggestionIndexes(body, suggestions.length);
-  if (suggestionIndexes !== undefined) normalized.suggestionIndexes = suggestionIndexes;
+  if (suggestionIndexes !== undefined) {
+    if (!allowBypass && suggestionIndexes.some((index) => switchesToBypass(suggestions[index]))) {
+      throw badRequest('The bypassPermissions mode is not enabled on this server.');
+    }
+    normalized.suggestionIndexes = suggestionIndexes;
+  }
   const interrupt = optionalBoolean(body, 'interrupt');
   if (interrupt !== undefined) normalized.interrupt = interrupt;
   return { body: normalized, outcome: decision === 'deny' ? 'denied' : 'allowed' };
@@ -236,13 +253,14 @@ function normalizeElicitation(body) {
  * Validates a response body against the kind of the pending request.
  * @param {PendingRequest} request
  * @param {unknown} body
+ * @param {boolean} allowBypass
  * @returns {{body: RequestBody, outcome: ResolutionOutcome}}
  */
-function normalizeRequestBody(request, body) {
+function normalizeRequestBody(request, body, allowBypass) {
   if (!isPlainObject(body)) throw badRequest('The request body must be a JSON object.');
   switch (request.kind) {
     case 'permission':
-      return normalizePermission(request, body);
+      return normalizePermission(request, body, allowBypass);
     case 'question':
       return normalizeQuestion(body);
     case 'plan':
@@ -265,13 +283,16 @@ export class RequestRegistry {
   #now;
   /** @type {Map<string, Map<string, RegistryEntry>>} */
   #sessions = new Map();
+  /** @type {boolean} whether a permission answer may switch the session into bypassPermissions */
+  #allowBypass;
 
   /**
-   * @param {{publish: Publish, now?: () => number}} options
+   * @param {{publish: Publish, now?: () => number, allowBypass?: boolean}} options
    */
-  constructor({ publish, now = Date.now }) {
+  constructor({ publish, now = Date.now, allowBypass = false }) {
     this.#publish = publish;
     this.#now = now;
+    this.#allowBypass = allowBypass === true;
   }
 
   /**
@@ -318,7 +339,7 @@ export class RequestRegistry {
   respond(sessionId, id, body) {
     const entry = this.#sessions.get(sessionId)?.get(id);
     if (!entry) throw new AppError(404, 'REQUEST_NOT_FOUND', 'The request is no longer pending.');
-    const { body: normalized, outcome } = normalizeRequestBody(entry.request, body);
+    const { body: normalized, outcome } = normalizeRequestBody(entry.request, body, this.#allowBypass);
     this.#settle(sessionId, id, { body: normalized }, outcome);
   }
 

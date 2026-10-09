@@ -163,11 +163,16 @@ export function isAllowedHost(hostHeader, publicOrigin = '') {
   return port >= 1 && port <= 65535;
 }
 
+/** Sentinel for "no cutoff"; issue times are never negative. */
+const NO_CUTOFF = -1;
+
 /**
  * Issues and verifies HMAC-SHA256 signed session tokens of the form `v1.<issuedAt>.<random>.<signature>`.
- * Tokens are stateless: they survive a restart as long as the signing secret is unchanged. Revocations are keyed by
- * the SHA-256 of the cookie value, bounded by `maxRevoked` and forgotten once the token would have expired anyway.
- * The owner persists them with `revocations()` and loads them again with `restore()`.
+ * Tokens are stateless: they survive a restart as long as the signing secret is unchanged. A logout is remembered as
+ * the SHA-256 of the cookie value and the token's issue time, in a list of at most `maxRevoked` entries. When the list
+ * is full, its earliest-issued entry is dropped and `revokedBefore` moves up to that issue time, so every token issued
+ * at or before the cutoff stays rejected. That also ends sessions that were never logged out; the alternative would
+ * revive a logged-out cookie. The owner persists the state with `exportState()` and loads it with `importState()`.
  */
 export class SessionStore {
   /** @type {Buffer} */
@@ -178,7 +183,9 @@ export class SessionStore {
   #now;
   /** @type {number} */
   #maxRevoked;
-  /** @type {Map<string, number>} sha256(token) -> expiry timestamp (ms) */
+  /** @type {number} tokens issued at or before this time are rejected; NO_CUTOFF when there is none */
+  #revokedBefore = NO_CUTOFF;
+  /** @type {Map<string, number>} sha256(token) -> issue time (ms) of revoked tokens newer than the cutoff */
   #revoked = new Map();
 
   /**
@@ -189,6 +196,9 @@ export class SessionStore {
     if (key.length === 0) throw new TypeError('SessionStore requires a non-empty secret');
     if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
       throw new TypeError('SessionStore ttlMs must be a positive integer');
+    }
+    if (!Number.isSafeInteger(maxRevoked) || maxRevoked < 1) {
+      throw new TypeError('SessionStore maxRevoked must be a positive integer');
     }
     this.#secret = key;
     this.#ttlMs = ttlMs;
@@ -232,65 +242,110 @@ export class SessionStore {
 
   /**
    * @param {unknown} token
-   * @returns {boolean} true when the token is correctly signed, unexpired and not revoked
+   * @returns {boolean} true when the token is correctly signed, unexpired, newer than the cutoff and not revoked
    */
   has(token) {
     const issuedAt = this.#verify(token);
     if (issuedAt === null) return false;
     const now = this.#now();
     if (issuedAt > now || issuedAt + this.#ttlMs <= now) return false;
+    if (issuedAt <= this.#revokedBefore) return false;
     return !this.#revoked.has(sha256Hex(/** @type {string} */ (token)));
   }
 
   /**
-   * Revokes a token until it would have expired. Tokens that are not correctly signed are ignored. When the list is
-   * full, the revocation that expires first is dropped to make room.
+   * Revokes a token until it would have expired. Tokens that are not correctly signed or have already expired are
+   * ignored.
    * @param {unknown} token
    */
   revoke(token) {
     const issuedAt = this.#verify(token);
     if (issuedAt === null) return;
-    this.#pruneRevoked(this.#now());
-    const key = sha256Hex(/** @type {string} */ (token));
-    if (!this.#revoked.has(key) && this.#revoked.size >= this.#maxRevoked) this.#dropEarliest();
-    this.#revoked.set(key, issuedAt + this.#ttlMs);
+    const now = this.#now();
+    if (issuedAt + this.#ttlMs <= now) return;
+    this.#prune(now);
+    this.#remember(sha256Hex(/** @type {string} */ (token)), issuedAt);
   }
 
   /**
-   * Loads revocations persisted by `revocations()`. Malformed and already expired entries are ignored; when more than
-   * `maxRevoked` remain, the ones that expire first are dropped.
-   * @param {unknown} entries `{<sha256 hex of the cookie value>: expiresAt}`
+   * Records one revocation by digest. When the list is full, the earliest-issued entry, or this one when it is older,
+   * gives way to the cutoff: the cutoff moves up to its issue time, which keeps that token rejected.
+   * @param {string} key sha256 hex of the cookie value
+   * @param {number} issuedAt
    */
-  restore(entries) {
-    if (typeof entries !== 'object' || entries === null || Array.isArray(entries)) return;
-    const now = this.#now();
-    const live = Object.entries(entries)
-      .filter(([key, expiresAt]) => SHA256_HEX_RE.test(key) && Number.isSafeInteger(expiresAt) && expiresAt > now)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, this.#maxRevoked);
-    for (const [key, expiresAt] of live) this.#revoked.set(key, expiresAt);
+  #remember(key, issuedAt) {
+    if (issuedAt <= this.#revokedBefore || this.#revoked.has(key)) return;
+    if (this.#revoked.size < this.#maxRevoked) {
+      this.#revoked.set(key, issuedAt);
+      return;
+    }
+    const earliest = this.#earliestIssuedAt();
+    if (issuedAt <= earliest) {
+      this.#raiseCutoff(issuedAt);
+    } else {
+      this.#raiseCutoff(earliest);
+      this.#revoked.set(key, issuedAt);
+    }
   }
 
-  /** @returns {Record<string, number>} unexpired revocations keyed by the SHA-256 of the cookie value */
-  revocations() {
-    this.#pruneRevoked(this.#now());
-    return Object.fromEntries(this.#revoked);
+  /** @returns {number} the smallest issue time in the list (Infinity when the list is empty) */
+  #earliestIssuedAt() {
+    let earliest = Infinity;
+    for (const issuedAt of this.#revoked.values()) earliest = Math.min(earliest, issuedAt);
+    return earliest;
+  }
+
+  /**
+   * Moves the cutoff up, never down, and forgets the revocations it now covers.
+   * @param {number} issuedAt
+   */
+  #raiseCutoff(issuedAt) {
+    this.#revokedBefore = Math.max(this.#revokedBefore, issuedAt);
+    for (const [key, revokedAt] of this.#revoked) {
+      if (revokedAt <= this.#revokedBefore) this.#revoked.delete(key);
+    }
   }
 
   /** @param {number} now */
-  #pruneRevoked(now) {
-    for (const [key, expiresAt] of this.#revoked) {
-      if (expiresAt <= now) this.#revoked.delete(key);
+  #prune(now) {
+    for (const [key, issuedAt] of this.#revoked) {
+      if (issuedAt + this.#ttlMs <= now) this.#revoked.delete(key);
     }
   }
 
-  #dropEarliest() {
-    /** @type {[string, number]|undefined} */
-    let earliest;
-    for (const entry of this.#revoked) {
-      if (earliest === undefined || entry[1] < earliest[1]) earliest = entry;
+  /**
+   * @returns {{entries: Record<string, number>, revokedBefore: number|null}} revocations as SHA-256 digests of the
+   *   cookie values with their issue times, and the cutoff (null when there is none). Expired entries are left out.
+   */
+  exportState() {
+    this.#prune(this.#now());
+    return {
+      entries: Object.fromEntries(this.#revoked),
+      revokedBefore: this.#revokedBefore === NO_CUTOFF ? null : this.#revokedBefore,
+    };
+  }
+
+  /**
+   * Loads a snapshot written by `exportState()`. Malformed values, expired entries and entries the cutoff covers are
+   * dropped, and expiry is recomputed with this store's TTL. When more entries remain than `maxRevoked`, the
+   * earliest-issued ones move under the cutoff, as they would at runtime.
+   * @param {unknown} state
+   */
+  importState(state) {
+    if (typeof state !== 'object' || state === null || Array.isArray(state)) return;
+    const { entries, revokedBefore } = /** @type {{entries?: unknown, revokedBefore?: unknown}} */ (state);
+    if (typeof revokedBefore === 'number' && Number.isSafeInteger(revokedBefore) && revokedBefore >= 0) {
+      this.#raiseCutoff(revokedBefore);
     }
-    if (earliest !== undefined) this.#revoked.delete(earliest[0]);
+    if (typeof entries !== 'object' || entries === null || Array.isArray(entries)) return;
+    const now = this.#now();
+    const live = Object.entries(entries)
+      .filter(([key, issuedAt]) => SHA256_HEX_RE.test(key) && Number.isSafeInteger(issuedAt)
+        && issuedAt > this.#revokedBefore && issuedAt + this.#ttlMs > now)
+      .sort((a, b) => a[1] - b[1]);
+    const overflow = Math.max(0, live.length - this.#maxRevoked);
+    if (overflow > 0) this.#raiseCutoff(live[overflow - 1][1]);
+    for (const [key, issuedAt] of live.slice(overflow)) this.#remember(key, issuedAt);
   }
 
   /** @returns {number} number of tokens currently held in the revocation list */

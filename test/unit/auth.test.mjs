@@ -190,6 +190,14 @@ function valueOf(pair) {
 }
 
 /**
+ * @param {string} pair caw_session=<value>
+ * @returns {number} the issue time embedded in the session token
+ */
+function issuedAtOf(pair) {
+  return Number(valueOf(pair).split('.')[1]);
+}
+
+/**
  * Logs in through the HTTP surface and returns the name=value pair of the issued cookie.
  * @param {number} port
  */
@@ -529,6 +537,7 @@ describe('logout and session validity', () => {
     assert.ok(persisted, 'the revocation list is written on logout');
     assert.equal(persisted.includes(valueOf(cookie)), false, 'the cookie value itself must not be stored');
     assert.deepEqual(Object.keys(JSON.parse(persisted).entries), [sha256Hex(valueOf(cookie))]);
+    assert.equal(JSON.parse(persisted).revokedBefore, null, 'no eviction, so no cutoff');
 
     const restarted = await createAuth(configFor(), {
       log: LOGGER, bootId: 'boot-b', now: time.now, stateStore: store,
@@ -550,13 +559,14 @@ describe('logout and session validity', () => {
     const live = await loginCookie(server.port);
     await server.close();
 
+    const { sessionTtlMs } = configFor();
     const store = memoryStore();
     store.files.set(REVOCATIONS, JSON.stringify({ entries: {
-      [sha256Hex(valueOf(revoked))]: time.now() + 60000,
-      [sha256Hex(valueOf(expired))]: time.now() - 1,
-      'not-a-digest': time.now() + 60000,
-      [sha256Hex(valueOf(live)).toUpperCase()]: time.now() + 60000,
-    } }));
+      [sha256Hex(valueOf(revoked))]: issuedAtOf(revoked),
+      [sha256Hex(valueOf(expired))]: time.now() - sessionTtlMs,
+      'not-a-digest': time.now(),
+      [sha256Hex(valueOf(live)).toUpperCase()]: issuedAtOf(live),
+    }, revokedBefore: null }));
     const restored = await createAuth(configFor(), { log: LOGGER, bootId: 'boot-r', now: time.now, stateStore: store });
     const restoredServer = await startAuthServer(restored);
     try {
@@ -568,6 +578,45 @@ describe('logout and session validity', () => {
       assert.equal((await check(live)).status, 200);
     } finally {
       await restoredServer.close();
+    }
+  });
+
+  it('keeps an evicted logout dead across a restart and ends sessions issued at or before the cutoff', async () => {
+    const time = clock();
+    const store = memoryStore();
+    const deps = { log: LOGGER, bootId: BOOT, now: time.now, stateStore: store, maxRevoked: 2 };
+    const server = await startAuthServer(await createAuth(configFor(), deps));
+    /** @type {string[]} */
+    const cookies = [];
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        cookies.push(await loginCookie(server.port));
+        time.advance(10);
+      }
+      for (const cookie of cookies.slice(1, 4)) {
+        const logout = await call(server.port, 'POST', '/api/logout', { headers: { ...ORIGIN, Cookie: cookie } });
+        assert.equal(logout.status, 200);
+      }
+    } finally {
+      await server.close();
+    }
+    const [early, oldest, middle, newest, current] = cookies;
+    assert.equal(JSON.parse(String(store.files.get(REVOCATIONS))).revokedBefore, issuedAtOf(oldest));
+
+    const restartedServer = await startAuthServer(await createAuth(configFor(), { ...deps, bootId: 'boot-b' }));
+    try {
+      /** @param {string} cookie */
+      const statusOf = async (cookie) => {
+        const response = await call(restartedServer.port, 'GET', '/whoami', { headers: { Cookie: cookie } });
+        return response.status;
+      };
+      assert.equal(await statusOf(oldest), 401, 'the evicted logout stays in force after a restart');
+      assert.equal(await statusOf(middle), 401);
+      assert.equal(await statusOf(newest), 401);
+      assert.equal(await statusOf(early), 401, 'a session issued before the cutoff ends with it');
+      assert.equal(await statusOf(current), 200, 'a session issued after the cutoff is unaffected');
+    } finally {
+      await restartedServer.close();
     }
   });
 

@@ -359,24 +359,47 @@ start_service() {
   if [[ "$was_active" -eq 1 ]]; then systemctl --user restart "$UNIT_NAME"; fi
 }
 
-probe_address() {
+# The address the health check connects to: the address the gateway listens on, except that a wildcard listener is
+# reached on loopback.
+probe_host() {
   local host
   host="$(env_value CAW_HOST)"
-  local port
+  case "$host" in
+    '' | 0.0.0.0) printf '%s' "127.0.0.1" ;;
+    :: | ::0) printf '%s' "::1" ;;
+    *) printf '%s' "$host" ;;
+  esac
+}
+
+probe_address() {
+  local host port
+  host="$(probe_host)"
   port="$(env_value CAW_PORT)"
   case "$host" in
-    '' | 0.0.0.0) host="127.0.0.1" ;;
-    :: | ::0) host="[::1]" ;;
     *:*) host="[${host}]" ;;
   esac
   LOCAL_URL="http://${host}:${port:-4180}/"
 }
 
+# Requests /healthz at the probe address with a loopback Host header. The gateway accepts only loopback names and the
+# host of CAW_PUBLIC_ORIGIN, so a Host header that names the LAN address would be refused with 421 HOST_REJECTED.
 wait_for_health() {
-  local attempt
+  local attempt host port
+  host="$(probe_host)"
+  port="$(env_value CAW_PORT)"
   for ((attempt = 0; attempt < 40; attempt++)); do
-    if "$NODE_BIN" -e 'fetch(process.argv[1]).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))' \
-      "${LOCAL_URL}healthz" >/dev/null 2>&1; then
+    if "$NODE_BIN" -e '
+      const http = require("node:http");
+      const [address, port] = process.argv.slice(1);
+      const request = http.get({
+        host: address, port, path: "/healthz", headers: { host: `127.0.0.1:${port}` }, timeout: 2000,
+      }, (response) => {
+        response.resume();
+        process.exit(response.statusCode >= 200 && response.statusCode < 300 ? 0 : 1);
+      });
+      request.on("timeout", () => request.destroy());
+      request.on("error", () => process.exit(1));
+    ' "$host" "${port:-4180}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5

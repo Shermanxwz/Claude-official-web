@@ -43,8 +43,8 @@ This is an overview. The complete map, with the SDK call or message behind each 
   for edits), subagents nested in their parent card, background tasks, interrupts, queued messages, compaction and
   context usage.
 - **Approvals:** permission cards (allow once, allow always, or deny with a reason), answers to AskUserQuestion, plan
-  approval, MCP elicitation, permission modes, and model and effort switching. Allow always saves the allow rules that
-  Claude Code proposes; other suggestions are saved only when you tick them.
+  approval, MCP elicitation, permission modes, and model and effort switching. Allow always saves the ticked suggestions:
+  allow rules and session-only mode switches start ticked, directory grants and other changes only when you tick them.
 - **Sessions:** start, resume, rename, tag, fork, rewind code or conversation, delete, paged history, and a session list
   grouped by project.
 - **Input:** slash commands from Claude Code (skills, custom commands and MCP prompts, plus the built-in commands that work

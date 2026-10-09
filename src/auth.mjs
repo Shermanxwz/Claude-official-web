@@ -59,7 +59,8 @@ function sessionSigningSecret(digest) {
  * Session-signing secret for this process. With a plaintext CAW_TOKEN the secret is derived from the token so sessions
  * survive restarts. With CAW_TOKEN_SHA256 the digest sits in the service's environment file, which the agent's OS user
  * can read; deriving the secret from it would let anyone holding that file forge sessions without knowing the token.
- * Hash mode therefore signs with a random secret that exists only in memory, and sessions end when the gateway restarts.
+ * Hash mode therefore signs with a random secret that exists only in memory, so sessions end when the gateway
+ * restarts.
  * @param {Config} config
  * @returns {Buffer}
  */
@@ -86,22 +87,20 @@ function sessionCookieValues(req) {
 
 /**
  * @param {Config} config
- * @param {{log: Logger, bootId: string, now?: () => number, stateStore?: StateStore}} deps `stateStore` persists the
- *   session revocations across restarts; without it they are kept in memory only.
+ * @param {{log: Logger, bootId: string, now?: () => number, stateStore?: StateStore, maxRevoked?: number}} deps
+ *   `stateStore` persists the session revocations across restarts; without it they are kept in memory only.
+ *   `maxRevoked` bounds the revocation list; the default suits production.
  * @returns {Promise<AuthApi>}
  */
-export async function createAuth(config, { log, bootId, now = Date.now, stateStore }) {
+export async function createAuth(config, { log, bootId, now = Date.now, stateStore, maxRevoked }) {
   const secure = config.publicOrigin.startsWith('https://');
   const maxAgeSeconds = Math.floor(config.sessionTtlMs / 1000);
   const failures = new SlidingWindowCounter({ max: LOGIN_MAX_FAILURES, windowMs: LOGIN_WINDOW_MS, now });
   /** Null when authentication is disabled: no cookie is issued or checked then. */
   const sessions = config.requireAuth
-    ? new SessionStore({ secret: sessionSecretFor(config), ttlMs: config.sessionTtlMs, now })
+    ? new SessionStore({ secret: sessionSecretFor(config), ttlMs: config.sessionTtlMs, now, maxRevoked })
     : null;
-  if (sessions && stateStore) {
-    const stored = /** @type {{entries?: unknown}|null} */ (await stateStore.read(REVOCATION_STATE, null));
-    sessions.restore(stored?.entries);
-  }
+  if (sessions && stateStore) sessions.importState(await stateStore.read(REVOCATION_STATE, null));
   /** Writes are chained so that the newest snapshot always lands last. */
   let persisted = Promise.resolve();
 
@@ -110,7 +109,7 @@ export async function createAuth(config, { log, bootId, now = Date.now, stateSto
     if (!sessions || !stateStore) return Promise.resolve();
     persisted = persisted.then(async () => {
       try {
-        await stateStore.write(REVOCATION_STATE, { entries: sessions.revocations() });
+        await stateStore.write(REVOCATION_STATE, sessions.exportState());
       } catch (error) {
         log.error('could not persist session revocations', {
           error: error instanceof Error ? error.message : String(error),

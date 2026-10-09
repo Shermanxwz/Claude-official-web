@@ -201,7 +201,8 @@ function buildPermission(view, request) {
     },
   });
   const suggestions = Array.isArray(request.suggestions) ? request.suggestions : [];
-  // "Always allow" applies the suggestions the user has checked. Rules that allow start checked; the rest start unchecked.
+  // "Always allow" applies the checked suggestions: allow rules and session-only mode switches start checked; directory
+  // grants, other mode changes and deny or ask rules start unchecked.
   const always = suggestions.length > 0 && request.suppressAlwaysAllowRule !== true ? suggestionList(view, suggestions) : null;
   if (always) details.push(always.element);
   details.push(h('label', { class: 'field request-deny-field' },

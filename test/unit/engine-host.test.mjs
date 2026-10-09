@@ -262,13 +262,17 @@ function makeConfig(over = {}) {
 /** Folder trust of the harness by default: the workspace root and the folders below it are trusted. */
 const TRUSTED = async (p) => p === CWD || p.startsWith(`${CWD}/`);
 
+/** The workspace roots of the harness by default: the folder of the tests and the folders below it. */
+const INSIDE_ROOTS = async (p) => p === CWD || p.startsWith(`${CWD}/`);
+
 /**
  * A host wired to the fake engine, a recording publisher, a recording logger and a manual clock.
- * `trusted` is the isTrustedCwd option; `null` leaves the option out so the host's default applies.
+ * `trusted` is the isTrustedCwd option; `null` leaves the option out so the host's default applies. `allowed` answers
+ * the workspace roots check.
  * @param {{config?: Record<string, unknown>, clock?: number,
- *   trusted?: ((p: string) => Promise<boolean>)|null}} [options]
+ *   trusted?: ((p: string) => Promise<boolean>)|null, allowed?: (p: string) => Promise<boolean>}} [options]
  */
-function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED } = {}) {
+function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED, allowed = INSIDE_ROOTS } = {}) {
   const events = [];
   const logs = [];
   const engine = createEngine();
@@ -286,7 +290,7 @@ function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED } = {}) {
       return seq;
     },
     getSeq: () => seq,
-    isAllowedCwd: async (p) => p === CWD || p.startsWith(`${CWD}/`),
+    isAllowedCwd: allowed,
     now: () => time.now,
   };
   if (trusted !== null) options.isTrustedCwd = trusted;
@@ -2615,5 +2619,130 @@ describe('EngineHost session titles', () => {
     assert.equal(h.host.liveInfo(S1).title, 'Resumed title');
     const announced = ofType(h.events, 'sessions_changed').filter((event) => event.data.reason === 'title');
     assert.deepEqual(announced.map((event) => event.data), [{ reason: 'title', sessionId: S1 }]);
+  });
+});
+
+const CLOSE_WAIT_MS_IN_TESTS = 3000;
+
+/**
+ * Workspace roots that stop admitting the test folder once `swapped.out` is set, the way a symlink swapped in after
+ * the query started would.
+ */
+function swappableRoots() {
+  const swapped = { out: false };
+  const allowed = async (p) => !swapped.out && (p === CWD || p.startsWith(`${CWD}/`));
+  return { swapped, allowed };
+}
+
+describe('EngineHost live sessions whose folder left the roots', () => {
+  test('every live-only route closes the query and answers 404 SESSION_NOT_FOUND', async () => {
+    const { swapped, allowed } = swappableRoots();
+    const h = harness({ allowed });
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    const before = query.calls.length;
+    swapped.out = true;
+    await expectError(h.host.interrupt(S1), 404, 'SESSION_NOT_FOUND');
+    assert.deepEqual(query.calls.slice(before), [['close']]);
+    assert.equal(h.host.liveInfo(S1), null);
+    assert.deepEqual(ofType(h.events, 'session_state').at(-1).data, { sessionId: S1, live: null });
+    await expectError(h.host.getContextUsage(S1), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.updateSettings(S1, { model: 'haiku' }), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.reload(S1, 'skills'), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.stopTask(S1, 'task-1'), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.mcpAction(S1, 'docs', { action: 'toggle', enabled: false }), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.respond(S1, 'req-1', { decision: 'allow' }), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.sendMessage(S1, { clientMessageId: randomUUID(), text: 'hello' }), 404,
+      'SESSION_NOT_FOUND');
+    await expectError(h.host.openSession(S1), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.closeSession(S1), 404, 'SESSION_NOT_FOUND');
+    assert.equal(h.engine.queries.length, 1);
+    assert.deepEqual(query.calls.slice(before), [['close']]);
+  });
+
+  test('while it closes the query publishes nothing more, and the call answers 404 once it has stopped', async () => {
+    const { swapped, allowed } = swappableRoots();
+    const h = harness({ allowed });
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    query.ignoreClose = true;
+    swapped.out = true;
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const outcome = h.host.interrupt(S1).then(() => null, (error) => error);
+      await flush();
+      const before = h.events.length;
+      query.emit(assistantMessage(S1, 'a-late', 'still talking'));
+      await flush();
+      assert.deepEqual(ofType(h.events.slice(before), 'sdk'), []);
+      mock.timers.tick(CLOSE_WAIT_MS_IN_TESTS);
+      const error = await outcome;
+      assert.ok(error instanceof AppError, `answered ${String(error)}`);
+      assert.equal(error.status, 404);
+      assert.equal(error.code, 'SESSION_NOT_FOUND');
+    } finally {
+      mock.timers.reset();
+      query.finish();
+    }
+  });
+
+  test('sweepIdle closes a running query whose folder left the roots, even when nothing touches it', async () => {
+    const { swapped, allowed } = swappableRoots();
+    const h = harness({ allowed });
+    const { sessionId, query } = await startLive(h);
+    await h.host.sendMessage(sessionId, { clientMessageId: randomUUID(), text: 'working' });
+    assert.equal(h.host.liveInfo(sessionId).state, 'running');
+    swapped.out = true;
+    assert.equal(await h.host.sweepIdle(), 1);
+    assert.equal(query.closed, true);
+    assert.equal(h.host.liveInfo(sessionId), null);
+    assert.deepEqual(ofType(h.events, 'session_state').at(-1).data, { sessionId, live: null });
+    assert.equal(await h.host.sweepIdle(), 0);
+  });
+
+  test('a session that is not open answers 404 once its file lies outside the roots', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { cwd: OUTSIDE, messages: turns(S1) });
+    await expectError(h.host.interrupt(S1), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.getContextUsage(S1), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.respond(S1, 'req-1', { decision: 'allow' }), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.closeSession(S1), 404, 'SESSION_NOT_FOUND');
+    assert.equal(h.engine.queries.length, 0);
+  });
+
+  test('routes on a session that does not exist keep their own answers', async () => {
+    const h = harness();
+    await h.host.interrupt(UNKNOWN);
+    await h.host.closeSession(UNKNOWN);
+    await expectError(h.host.getContextUsage(UNKNOWN), 409, 'SESSION_NOT_LIVE');
+    await expectError(h.host.respond(UNKNOWN, 'req-1', { decision: 'allow' }), 404, 'REQUEST_NOT_FOUND');
+    assert.equal(h.engine.queries.length, 0);
+  });
+});
+
+describe('EngineHost bypassPermissions suggestions', () => {
+  const bypass = { type: 'setMode', mode: 'bypassPermissions', destination: 'session' };
+
+  test('a permission answer cannot select the mode change while bypass is off', async () => {
+    const h = harness({ config: { allowBypass: false } });
+    const { sessionId, query } = await startLive(h);
+    const { pending } = callTool(query, 'Bash', { command: 'ls' }, { requestId: 'b-1', suggestions: [bypass] });
+    await flush();
+    await expectError(h.host.respond(sessionId, 'b-1', { decision: 'allow_always', suggestionIndexes: [0] }),
+      400, 'BAD_REQUEST');
+    assert.equal(ofType(h.events, 'request_resolved').length, 0);
+    await h.host.respond(sessionId, 'b-1', { decision: 'allow' });
+    assert.deepEqual(await pending, { behavior: 'allow', updatedInput: { command: 'ls' } });
+  });
+
+  test('with bypass enabled the mode change is persisted through the permission result', async () => {
+    const h = harness({ config: { allowBypass: true } });
+    const { sessionId, query } = await startLive(h);
+    const { pending } = callTool(query, 'Bash', { command: 'ls' }, { requestId: 'b-2', suggestions: [bypass] });
+    await flush();
+    await h.host.respond(sessionId, 'b-2', { decision: 'allow_always', suggestionIndexes: [0] });
+    assert.deepEqual(await pending, {
+      behavior: 'allow', updatedInput: { command: 'ls' }, updatedPermissions: [bypass],
+    });
   });
 });

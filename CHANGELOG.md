@@ -59,6 +59,8 @@ First release of claude-official-web, a self-hosted graphical Web host for the o
   stops arriving for 30 seconds is closed, and control calls to Claude Code time out after 10 seconds.
 - `CAW_TRUST_PROXY` takes the client address from `CF-Connecting-IP`, then `X-Real-IP`, then the last `X-Forwarded-For`
   entry.
-- "Always allow" saves only allow rules by default. Directory grants and mode changes need an explicit tick.
+- "Always allow" pre-selects allow rules and session-only mode switches (as Claude Code's "allow all edits during this
+  session"); directory grants and other changes need an explicit tick. Without explicit indexes the API saves allow
+  rules only.
 - Rejected Claude Code credentials are reported to the session with the `ENGINE_UNAVAILABLE` code.
 - `bypassPermissions`, including as the default permission mode, requires `CAW_ALLOW_BYPASS=1` and the `full` profile.

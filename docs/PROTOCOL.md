@@ -15,7 +15,9 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 - `Host` must be a loopback name (`127.0.0.1`, `localhost`, `[::1]`, any port) or the host of `CAW_PUBLIC_ORIGIN`;
   otherwise `421 HOST_REJECTED`. This blocks DNS-rebinding attacks, notably against demo mode without auth.
 - Request bodies must arrive within 30 s of inactivity between chunks, otherwise `408` is not sent; the connection is
-  closed. Session routes for sessions whose `cwd` lies outside the workspace roots answer `404 SESSION_NOT_FOUND`.
+  closed. Session routes for sessions whose `cwd` lies outside the workspace roots answer `404 SESSION_NOT_FOUND`; a
+  live session whose folder stops resolving inside the roots (for example a swapped symlink) is closed and stops
+  publishing events. Selecting a suggestion that switches to `bypassPermissions` needs `CAW_ALLOW_BYPASS=1`.
 - Body limit: 1 MiB for JSON (`413 PAYLOAD_TOO_LARGE`). Uploads have their own limit.
 
 ### Error codes

@@ -13,6 +13,7 @@ import {
   createLive,
   eventNamed,
   isUuid,
+  openEvents,
   runTurn,
   sdkMessagesOf,
   seqOf,
@@ -474,6 +475,31 @@ describe('sessions: version reporting', { timeout: 60000 }, () => {
       assert.equal((await api.post(`/api/sessions/${live.sessionId}/close`)).status, 200);
       const meta = await api.get('/api/meta');
       assert.equal(meta.json.claudeCodeVersion, CLAUDE_CODE_VERSION);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+describe('sessions: list freshness', { timeout: 60000 }, () => {
+  it('announces sessions_changed after every finished turn so lists pick up new summaries', async () => {
+    const server = await startTestServer();
+    try {
+      const api = client(server.url);
+      await api.login();
+      const live = await createLive(api, { cwd: server.proj });
+      const events = await openEvents(api, { watch: live.sessionId });
+      try {
+        await events.next(eventNamed('hello'));
+        await runTurn(api, events, live.sessionId, 'Summarize the project please');
+        const changed = await events.next(eventNamed('sessions_changed', { reason: 'activity' }));
+        assert.equal(changed.data.sessionId, live.sessionId);
+        const listed = (await api.get('/api/sessions')).json.sessions.find((s) => s.sessionId === live.sessionId);
+        assert.ok(listed, 'the session is listed after its first turn');
+        assert.match(String(listed.firstPrompt ?? listed.summary ?? ''), /Summarize the project/);
+      } finally {
+        events.close();
+      }
     } finally {
       await server.close();
     }

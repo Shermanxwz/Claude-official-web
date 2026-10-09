@@ -32,6 +32,14 @@ function clock(start = 1000000) {
   };
 }
 
+/**
+ * @param {string} token
+ * @returns {number} the issue time embedded in a v1 session token
+ */
+function issuedAtOf(token) {
+  return Number(token.split('.')[1]);
+}
+
 describe('secureHeaders', () => {
   it('sends the exact content security policy and the fixed hardening headers', () => {
     const headers = secureHeaders();
@@ -224,66 +232,178 @@ describe('SessionStore', () => {
     assert.equal(store.revokedCount, 0);
   });
 
-  it('bounds the revocation list and forgets revocations once their tokens would have expired', () => {
+  it('forgets revocations once their tokens would have expired', () => {
     const time = clock();
     const store = new SessionStore({ secret, ttlMs: 1000, now: time.now, maxRevoked: 2 });
-    const tokens = [store.create(), store.create(), store.create()];
-    for (const token of tokens) store.revoke(token);
-    assert.equal(store.revokedCount, 2);
-
-    time.advance(1000);
     store.revoke(store.create());
+    time.advance(1000);
+    const later = store.create();
+    store.revoke(later);
     assert.equal(store.revokedCount, 1);
+    assert.deepEqual(Object.keys(store.exportState().entries), [sha256Hex(later)]);
   });
 
-  it('drops the revocation that expires first when the bound is reached', () => {
+  it('ignores revocations of tokens that have already expired', () => {
     const time = clock();
-    const store = new SessionStore({ secret, ttlMs: 1000, now: time.now, maxRevoked: 2 });
-    const first = store.create();
-    time.advance(10);
-    const second = store.create();
-    time.advance(10);
-    const third = store.create();
+    const store = new SessionStore({ secret, ttlMs: 1000, now: time.now });
+    const token = store.create();
+    time.advance(1000);
+    store.revoke(token);
+    assert.equal(store.revokedCount, 0);
+  });
+
+  it('keeps an evicted revocation rejected by raising the cutoff to its issue time', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 60000, now: time.now, maxRevoked: 2 });
+    /** @type {string[]} */
+    const tokens = [];
+    for (let index = 0; index < 4; index += 1) {
+      tokens.push(store.create());
+      time.advance(10);
+    }
+    const [first, second, third, fourth] = tokens;
     store.revoke(first);
     store.revoke(second);
     store.revoke(third);
-    assert.deepEqual(Object.keys(store.revocations()).sort(), [sha256Hex(second), sha256Hex(third)].sort());
-    assert.equal(store.has(first), true, 'the earliest revocation was dropped; that token lives until it expires');
+    assert.equal(store.has(first), false, 'the evicted revocation stays in force');
+    assert.equal(store.has(second), false);
+    assert.equal(store.has(third), false);
+    assert.equal(store.has(fourth), true, 'a token issued after the cutoff is unaffected');
+    assert.equal(store.revokedCount, 2);
+    assert.equal(store.exportState().revokedBefore, issuedAtOf(first));
   });
 
-  it('exports revocations as digests that restore into another store, dropping expired and malformed entries', () => {
+  it('rejects every token issued at or before the cutoff, including ones that were never revoked', () => {
+    const time = clock();
+    const earlier = new SessionStore({ secret, ttlMs: 60000, now: clock(time.now() - 5).now }).create();
+    const store = new SessionStore({ secret, ttlMs: 60000, now: time.now, maxRevoked: 1 });
+    const first = store.create();
+    time.advance(10);
+    const second = store.create();
+    store.revoke(first);
+    assert.equal(store.has(earlier), true, 'nothing has been evicted yet');
+    store.revoke(second);
+    assert.equal(store.has(earlier), false, 'issued before the evicted revocation, so it ends with it');
+    assert.equal(store.has(first), false);
+    assert.equal(store.has(second), false);
+  });
+
+  it('covers tokens issued in the same millisecond as the evicted one', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 60000, now: time.now, maxRevoked: 1 });
+    const first = store.create();
+    const sibling = store.create();
+    store.revoke(first);
+    store.revoke(sibling);
+    assert.equal(store.has(first), false);
+    assert.equal(store.has(sibling), false);
+    assert.equal(store.revokedCount, 0, 'the cutoff covers both, so neither needs an entry');
+  });
+
+  it('does not let an older revocation displace a newer one', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 60000, now: time.now, maxRevoked: 1 });
+    const older = store.create();
+    time.advance(10);
+    const newer = store.create();
+    store.revoke(newer);
+    store.revoke(older);
+    assert.equal(store.has(newer), false);
+    assert.equal(store.has(older), false);
+    assert.equal(store.revokedCount, 1);
+    assert.equal(store.exportState().revokedBefore, issuedAtOf(older));
+  });
+
+  it('exports digests with issue times and the cutoff, never the cookie value', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 10000, now: time.now });
+    const token = store.create();
+    store.revoke(token);
+    const state = store.exportState();
+    assert.deepEqual(state, { entries: { [sha256Hex(token)]: issuedAtOf(token) }, revokedBefore: null });
+    assert.equal(JSON.stringify(state).includes(token), false, 'the cookie value itself is never exported');
+  });
+
+  it('restores revocations and the cutoff into a new store with the same secret', () => {
+    const time = clock();
+    const issuer = new SessionStore({ secret, ttlMs: 60000, now: time.now, maxRevoked: 1 });
+    const older = issuer.create();
+    time.advance(10);
+    const newer = issuer.create();
+    issuer.revoke(older);
+    issuer.revoke(newer);
+    const restored = new SessionStore({ secret, ttlMs: 60000, now: time.now, maxRevoked: 1 });
+    restored.importState(JSON.parse(JSON.stringify(issuer.exportState())));
+    assert.equal(restored.has(older), false, 'the cutoff survives the restart');
+    assert.equal(restored.has(newer), false, 'the stored revocation survives the restart');
+    assert.deepEqual(restored.exportState(), issuer.exportState());
+  });
+
+  it('recomputes expiry from the issue time with the TTL of the restoring store', () => {
     const time = clock();
     const issuer = new SessionStore({ secret, ttlMs: 10000, now: time.now });
-    const revoked = issuer.create();
-    const expired = issuer.create();
-    issuer.revoke(revoked);
-    const snapshot = issuer.revocations();
-    assert.deepEqual(Object.keys(snapshot), [sha256Hex(revoked)]);
-    assert.equal(JSON.stringify(snapshot).includes(revoked), false, 'the cookie value itself is never exported');
-
-    const restored = new SessionStore({ secret, ttlMs: 10000, now: time.now });
-    restored.restore({ ...snapshot, 'not-a-digest': time.now() + 5000, [sha256Hex(expired)]: time.now() - 1 });
-    assert.equal(restored.has(revoked), false);
-    assert.equal(restored.revokedCount, 1);
-    restored.restore('garbage');
-    restored.restore(null);
-    restored.restore([]);
-    assert.equal(restored.revokedCount, 1);
+    issuer.revoke(issuer.create());
+    const state = issuer.exportState();
+    time.advance(500);
+    const shorter = new SessionStore({ secret, ttlMs: 1000, now: time.now });
+    shorter.importState(state);
+    assert.equal(shorter.revokedCount, 1, 'still inside the shorter TTL');
+    time.advance(500);
+    const expired = new SessionStore({ secret, ttlMs: 1000, now: time.now });
+    expired.importState(state);
+    assert.equal(expired.revokedCount, 0, 'expired under the shorter TTL');
   });
 
-  it('keeps the latest-expiring revocations when restoring more than the bound', () => {
+  it('drops expired, malformed and cutoff-covered entries when importing', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 10000, now: time.now });
+    const now = time.now();
+    store.importState({
+      entries: {
+        [sha256Hex('live')]: now - 5000,
+        [sha256Hex('expired')]: now - 10000,
+        [sha256Hex('covered')]: now - 6000,
+        'not-a-digest': now,
+        [sha256Hex('upper').toUpperCase()]: now,
+        [sha256Hex('text')]: String(now),
+      },
+      revokedBefore: now - 6000,
+    });
+    assert.deepEqual(Object.keys(store.exportState().entries), [sha256Hex('live')]);
+    assert.equal(store.exportState().revokedBefore, now - 6000);
+  });
+
+  it('moves the earliest-issued entries under the cutoff when importing more than maxRevoked', () => {
     const time = clock();
     const store = new SessionStore({ secret, ttlMs: 100000, now: time.now, maxRevoked: 2 });
-    store.restore({
-      [sha256Hex('a')]: time.now() + 10, [sha256Hex('b')]: time.now() + 30, [sha256Hex('c')]: time.now() + 20,
+    const now = time.now();
+    store.importState({
+      entries: { [sha256Hex('a')]: now - 30, [sha256Hex('b')]: now - 10, [sha256Hex('c')]: now - 20 },
+      revokedBefore: null,
     });
-    assert.deepEqual(Object.keys(store.revocations()).sort(), [sha256Hex('b'), sha256Hex('c')].sort());
+    const state = store.exportState();
+    assert.deepEqual(Object.keys(state.entries).sort(), [sha256Hex('b'), sha256Hex('c')].sort());
+    assert.equal(state.revokedBefore, now - 30);
+  });
+
+  it('ignores malformed state without failing', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 10000, now: time.now });
+    const token = store.create();
+    for (const state of ['garbage', null, [], { entries: 'x' }, { entries: [], revokedBefore: 'soon' },
+      { entries: {}, revokedBefore: -2 }, { entries: {}, revokedBefore: 1.5 }]) {
+      store.importState(state);
+    }
+    assert.equal(store.has(token), true);
+    assert.equal(store.exportState().revokedBefore, null);
   });
 
   it('validates its constructor arguments', () => {
     assert.throws(() => new SessionStore({ secret: '', ttlMs: 1000 }), TypeError);
     assert.throws(() => new SessionStore({ secret, ttlMs: 0 }), TypeError);
     assert.throws(() => new SessionStore({ secret, ttlMs: 1.5 }), TypeError);
+    assert.throws(() => new SessionStore({ secret, ttlMs: 1000, maxRevoked: 0 }), TypeError);
+    assert.throws(() => new SessionStore({ secret, ttlMs: 1000, maxRevoked: 1.5 }), TypeError);
   });
 });
 

@@ -7,8 +7,11 @@ const S1 = '11111111-1111-4111-8111-111111111111';
 const S2 = '22222222-2222-4222-8222-222222222222';
 const NOW = 1_700_000_000_000;
 
-/** Registry wired to an event log; publish returns a running sequence number like the real hub. */
-function harness() {
+/**
+ * Registry wired to an event log; publish returns a running sequence number like the real hub.
+ * @param {{allowBypass?: boolean}} [options]
+ */
+function harness(options = {}) {
   const events = [];
   const registry = new RequestRegistry({
     publish: (event) => {
@@ -16,6 +19,7 @@ function harness() {
       return events.length;
     },
     now: () => NOW,
+    ...options,
   });
   return { registry, events };
 }
@@ -36,6 +40,11 @@ function permissionRequest(overrides = {}) {
       },
       {
         type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'pwd' }], behavior: 'allow', destination: 'session',
+      },
+      { type: 'addDirectories', directories: ['/srv/shared'], destination: 'session' },
+      {
+        type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'rm:*' }], behavior: 'deny',
+        destination: 'localSettings',
       },
     ],
     ...overrides,
@@ -244,7 +253,7 @@ describe('RequestRegistry permission bodies', () => {
     { decision: 'allow', updatedInput: 'command' },
     { decision: 'allow', updatedInput: null },
     { decision: 'allow', interrupt: 'yes' },
-    { decision: 'allow_always', suggestionIndexes: [2] },
+    { decision: 'allow_always', suggestionIndexes: [4] },
     { decision: 'allow_always', suggestionIndexes: [0, 0] },
     { decision: 'allow_always', suggestionIndexes: [-1] },
     { decision: 'allow_always', suggestionIndexes: [0.5] },
@@ -436,6 +445,40 @@ describe('RequestRegistry elicitation bodies', () => {
   });
 });
 
+describe('RequestRegistry bypassPermissions suggestions', () => {
+  const bypass = { type: 'setMode', mode: 'bypassPermissions', destination: 'session' };
+  const offered = [permissionRequest().suggestions[0], bypass];
+
+  test('selecting the mode change is refused with 400 while bypass is off, and the request stays pending', () => {
+    const { registry } = harness();
+    registry.create(permissionRequest({ suggestions: offered }));
+    assertAppError(() => registry.respond(S1, 'req-1', { decision: 'allow_always', suggestionIndexes: [1] }),
+      400, 'BAD_REQUEST');
+    assertAppError(() => registry.respond(S1, 'req-1', { decision: 'allow_always', suggestionIndexes: [0, 1] }),
+      400, 'BAD_REQUEST');
+    assertAppError(() => registry.respond(S1, 'req-1', { decision: 'allow', suggestionIndexes: [1] }),
+      400, 'BAD_REQUEST');
+    assert.equal(registry.count(S1), 1);
+  });
+
+  test('the mode change can be selected once bypass is enabled, and then it is persisted', async () => {
+    const { registry } = harness({ allowBypass: true });
+    const request = permissionRequest({ suggestions: offered });
+    const pending = registry.create(request);
+    registry.respond(S1, 'req-1', { decision: 'allow_always', suggestionIndexes: [1] });
+    const outcome = await pending;
+    assert.deepEqual(toPermissionResult(request, outcome), {
+      behavior: 'allow', updatedInput: { command: 'ls' }, updatedPermissions: [bypass],
+    });
+  });
+
+  test('without indexes the mode change is never persisted, even when bypass is enabled', () => {
+    const request = permissionRequest({ suggestions: offered });
+    assert.deepEqual(toPermissionResult(request, { body: { decision: 'allow_always' } }),
+      { behavior: 'allow', updatedInput: { command: 'ls' }, updatedPermissions: [offered[0]] });
+  });
+});
+
 describe('toPermissionResult', () => {
   const request = permissionRequest();
   const suggestions = request.suggestions;
@@ -449,9 +492,14 @@ describe('toPermissionResult', () => {
       { behavior: 'allow', updatedInput: {} });
   });
 
-  test('allow_always persists all suggestions by default', () => {
+  test('allow_always without indexes persists the allow rules only, not directory grants or deny rules', () => {
     assert.deepEqual(toPermissionResult(request, { body: { decision: 'allow_always' } }),
-      { behavior: 'allow', updatedInput: { command: 'ls' }, updatedPermissions: suggestions });
+      { behavior: 'allow', updatedInput: { command: 'ls' }, updatedPermissions: [suggestions[0], suggestions[1]] });
+  });
+
+  test('an explicit selection can still persist a directory grant or a deny rule', () => {
+    const result = toPermissionResult(request, { body: { decision: 'allow_always', suggestionIndexes: [2, 3] } });
+    assert.deepEqual(result.updatedPermissions, [suggestions[2], suggestions[3]]);
   });
 
   test('allow_always persists only the selected suggestions in the order given', () => {

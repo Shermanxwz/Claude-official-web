@@ -556,6 +556,7 @@ export class EngineHost {
         return seq;
       },
       now,
+      allowBypass: config.allowBypass === true,
     });
     this.#sweepTimer = setInterval(() => {
       this.sweepIdle().catch((error) => this.#log.warn('idle sweep failed', { reason: errorName(error) }));
@@ -947,6 +948,33 @@ export class EngineHost {
   }
 
   /**
+   * A live query whose folder no longer lies inside the workspace roots (a symlink swapped in after it started, for
+   * example) is closed, and its session answers as not found from then on. Never waits for the lifecycle queue.
+   * @param {LiveRecord} live
+   * @returns {Promise<LiveRecord>}
+   */
+  async #liveInRoots(live) {
+    if (await this.#withinRoots(live.cwd)) return live;
+    await this.#detach(live, { publish: true });
+    throw sessionNotFound();
+  }
+
+  /**
+   * The open query of a session, or undefined when it is not open, for the routes that act on open sessions. A
+   * query outside the roots is closed, and a session whose file lies outside them answers as not found. Any other
+   * session that is not open keeps the answer of its route.
+   * @param {string} sessionId
+   * @returns {Promise<LiveRecord|undefined>}
+   */
+  async #openLive(sessionId) {
+    const live = this.#live.get(sessionId);
+    if (live) return this.#liveInRoots(live);
+    const info = await this.#readInfoOrNull(sessionId);
+    if (info && !(await this.#withinRoots(info.cwd))) throw sessionNotFound();
+    return undefined;
+  }
+
+  /**
    * Whether the folder is trusted. Fails closed: an error from the trust check means untrusted.
    * @param {string} cwd
    * @returns {Promise<boolean>}
@@ -960,8 +988,9 @@ export class EngineHost {
   }
 
   /**
-   * The file and the live query of a session, each withheld when its folder is outside the workspace roots. Throws
-   * SESSION_NOT_FOUND when neither is visible. With `lenient`, a file that cannot be read counts as no file.
+   * The file and the live query of a session, each withheld when its folder is outside the workspace roots. A live
+   * query outside the roots is closed first (see #liveInRoots). Throws SESSION_NOT_FOUND when neither is visible.
+   * With `lenient`, a file that cannot be read counts as no file.
    * @param {string} sessionId
    * @param {boolean} [lenient]
    * @returns {Promise<{info: SDKSessionInfo|null, live: LiveRecord|null}>}
@@ -970,7 +999,7 @@ export class EngineHost {
     const found = lenient ? await this.#readInfoOrNull(sessionId) : await this.#readInfo(sessionId);
     const info = found && (await this.#withinRoots(found.cwd)) ? found : null;
     const current = this.#live.get(sessionId) ?? null;
-    const live = current && (await this.#withinRoots(current.cwd)) ? current : null;
+    const live = current ? await this.#liveInRoots(current) : null;
     if (!info && !live) throw sessionNotFound();
     return { info, live };
   }
@@ -1133,16 +1162,18 @@ export class EngineHost {
   }
 
   /**
-   * Returns the live query of a session, starting it when needed. Concurrent callers share one start.
+   * Returns the live query of a session, starting it when needed. Concurrent callers share one start. A query outside
+   * the roots is closed and answered as not found (see #openLive).
    * @param {string} sessionId
    * @param {SessionSettings} [settings]
    * @returns {Promise<LiveRecord>}
    */
   #ensureLive(sessionId, settings = {}) {
     const live = this.#live.get(sessionId);
-    if (live && !this.#opening.has(sessionId)) return Promise.resolve(live);
+    if (live && !this.#opening.has(sessionId)) return this.#liveInRoots(live);
     return this.#exclusive(sessionId, async () => {
-      return this.#live.get(sessionId) ?? this.#resumeLive(sessionId, settings);
+      const current = await this.#openLive(sessionId);
+      return current ?? this.#resumeLive(sessionId, settings);
     });
   }
 
@@ -1179,11 +1210,12 @@ export class EngineHost {
   }
 
   /**
+   * The open query of a session, inside the roots (see #openLive). Not open answers SESSION_NOT_LIVE.
    * @param {string} sessionId
-   * @returns {LiveRecord}
+   * @returns {Promise<LiveRecord>}
    */
-  #requireLive(sessionId) {
-    const live = this.#live.get(sessionId);
+  async #requireLive(sessionId) {
+    const live = await this.#openLive(sessionId);
     if (!live) throw sessionNotLive();
     return live;
   }
@@ -1211,6 +1243,8 @@ export class EngineHost {
    * @param {SDKMessage} msg
    */
   #onMessage(live, msg) {
+    // A query that is being closed publishes nothing more, not even what it sends while it stops.
+    if (live.closing) return;
     this.#applyMessage(live, msg);
     const seq = this.#publish({ type: 'sdk', sessionId: live.sessionId, data: { sessionId: live.sessionId, msg } });
     live.events.push(seq, msg);
@@ -1248,6 +1282,9 @@ export class EngineHost {
         return;
       case 'result':
         if (!live.closing && this.#requests.count(live.sessionId) === 0) live.state = 'idle';
+        // A finished turn changes the session file (first prompt, summary, modification time); let every client
+        // refresh its session list, which is how a brand-new untitled session gets its summary in the sidebar.
+        this.#publish({ type: 'sessions_changed', data: { reason: 'activity', sessionId: live.sessionId } });
         return;
       case 'assistant':
       case 'stream_event':
@@ -1637,7 +1674,7 @@ export class EngineHost {
     this.#assertNotLocked(sessionId);
     // Registered at once, so a close or lock that is requested after this open waits for it.
     const live = await this.#exclusive(sessionId, async () => {
-      const current = this.#live.get(sessionId);
+      const current = await this.#openLive(sessionId);
       if (!current) return this.#resumeLive(sessionId, parsed);
       await this.#applySettings(current, parsed);
       return current;
@@ -1646,13 +1683,14 @@ export class EngineHost {
   }
 
   /**
-   * Closes the live query of a session. Pending requests are cancelled. Closing a session that is not open is a no-op.
+   * Closes the live query of a session. Pending requests are cancelled. Closing a session that is not open is a no-op,
+   * unless its file lies outside the roots, which answers as not found.
    * @param {string} sessionId
    */
   async closeSession(sessionId) {
     requireSessionId(sessionId);
     await this.#exclusive(sessionId, async () => {
-      const live = this.#live.get(sessionId);
+      const live = await this.#openLive(sessionId);
       if (live) await this.#detach(live, { publish: true });
     });
   }
@@ -1691,7 +1729,7 @@ export class EngineHost {
    */
   async interrupt(sessionId) {
     requireSessionId(sessionId);
-    const live = this.#live.get(sessionId);
+    const live = await this.#openLive(sessionId);
     if (!live) return;
     await this.#control(sessionId, () => live.query.interrupt(), 'The turn could not be interrupted.');
   }
@@ -1708,7 +1746,7 @@ export class EngineHost {
     const parsed = parseSettings(settings);
     if (parsed.permissionMode !== undefined) this.#assertBypassAllowed(parsed.permissionMode);
     await this.#settled(sessionId);
-    const live = this.#live.get(sessionId);
+    const live = await this.#openLive(sessionId);
     if (!live) {
       await this.#scopeOf(sessionId, true);
       this.#remember(sessionId, parsed);
@@ -1753,14 +1791,17 @@ export class EngineHost {
   }
 
   /**
-   * Answers a pending request. Validation happens in the registry; an invalid answer leaves the request pending.
+   * Answers a pending request. Validation happens in the registry; an invalid answer leaves the request pending. A
+   * session outside the roots answers as not found.
    * @param {string} sessionId
    * @param {string} requestId
    * @param {Record<string, unknown>} body
    */
   async respond(sessionId, requestId, body) {
     requireSessionId(sessionId);
-    this.#requests.respond(sessionId, parseToken(requestId, 'The request id'), body);
+    const id = parseToken(requestId, 'The request id');
+    await this.#openLive(sessionId);
+    this.#requests.respond(sessionId, id, body);
   }
 
   /**
@@ -1769,7 +1810,7 @@ export class EngineHost {
    */
   async getContextUsage(sessionId) {
     requireSessionId(sessionId);
-    const live = this.#requireLive(sessionId);
+    const live = await this.#requireLive(sessionId);
     return this.#control(sessionId, () => live.query.getContextUsage({ detail: 'summary' }),
       'The context usage could not be read.');
   }
@@ -1785,7 +1826,7 @@ export class EngineHost {
     requireSessionId(sessionId);
     const name = parseToken(server, 'The server name');
     const { kind, enabled } = parseMcpAction(action);
-    const live = this.#requireLive(sessionId);
+    const live = await this.#requireLive(sessionId);
     await this.#control(sessionId, () => (kind === 'toggle'
       ? live.query.toggleMcpServer(name, enabled)
       : live.query.reconnectMcpServer(name)), 'The MCP server could not be updated.');
@@ -1802,7 +1843,7 @@ export class EngineHost {
   async reload(sessionId, what) {
     requireSessionId(sessionId);
     if (what !== 'plugins' && what !== 'skills') throw invalid('The reload target must be plugins or skills.');
-    const live = this.#requireLive(sessionId);
+    const live = await this.#requireLive(sessionId);
     /** @type {() => Promise<unknown>} */
     const reload = () => (what === 'plugins' ? live.query.reloadPlugins() : live.query.reloadSkills());
     await this.#control(sessionId, reload, 'The session could not be reloaded.');
@@ -1862,7 +1903,7 @@ export class EngineHost {
     /** @type {{files?: RewindFilesResult, conversation?: {resumeAt: string}}} */
     const result = {};
     if (mode !== 'conversation') {
-      const live = this.#live.get(sessionId) ?? await this.#resumeLive(sessionId, {});
+      const live = (await this.#openLive(sessionId)) ?? (await this.#resumeLive(sessionId, {}));
       result.files = await this.#rewindFiles(live, messageId, false);
     }
     if (mode !== 'code') {
@@ -1911,7 +1952,7 @@ export class EngineHost {
    * @param {string} resumeAt
    */
   async #restartNow(sessionId, resumeAt) {
-    const previous = this.#live.get(sessionId);
+    const previous = await this.#openLive(sessionId);
     /** @type {string} */
     let cwd;
     /** @type {SessionSettings} */
@@ -2016,7 +2057,7 @@ export class EngineHost {
   async stopTask(sessionId, taskId) {
     requireSessionId(sessionId);
     const id = parseToken(taskId, 'The task id');
-    const live = this.#requireLive(sessionId);
+    const live = await this.#requireLive(sessionId);
     await this.#control(sessionId, () => live.query.stopTask(id), 'The task could not be stopped.');
   }
 
@@ -2070,19 +2111,38 @@ export class EngineHost {
   }
 
   /**
-   * Closes live sessions that have been idle, without pending requests, for longer than the idle timeout.
+   * Closes live sessions that have been idle, without pending requests, for longer than the idle timeout. Live queries
+   * whose folder left the workspace roots are closed too, whether or not anything still touches them.
    * @param {number} [now]
    * @returns {Promise<number>} how many sessions were closed
    */
   async sweepIdle(now = this.#now()) {
     const timeout = this.#config.idleTimeoutMs;
+    const outside = await this.#closeOutsideRoots();
+    if (outside > 0) this.#log.info('closed sessions outside the roots', { count: outside });
     const idle = [...this.#live.values()].filter((live) => live.state === 'idle'
       && this.#requests.count(live.sessionId) === 0
       && !this.#opening.has(live.sessionId)
       && now - live.lastActivity > timeout);
     await Promise.all(idle.map((live) => this.#detach(live, { publish: true })));
     if (idle.length > 0) this.#log.info('closed idle sessions', { count: idle.length });
-    return idle.length;
+    return outside + idle.length;
+  }
+
+  /**
+   * Closes every live query whose folder is outside the workspace roots. Sessions with a lifecycle operation in flight
+   * are left to that operation, which checks the roots itself.
+   * @returns {Promise<number>} how many queries were closed
+   */
+  async #closeOutsideRoots() {
+    const outside = [];
+    for (const live of [...this.#live.values()]) {
+      if (!(await this.#withinRoots(live.cwd))) outside.push(live);
+    }
+    const stale = outside.filter((live) => this.#live.get(live.sessionId) === live
+      && !this.#opening.has(live.sessionId));
+    await Promise.all(stale.map((live) => this.#detach(live, { publish: true })));
+    return stale.length;
   }
 
   /** Stops the sweep, closes every live query and cancels every pending request. Safe to call twice. */
