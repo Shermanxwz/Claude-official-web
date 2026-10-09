@@ -60,8 +60,11 @@ describe('sessions: lifecycle', { timeout: 120000 }, () => {
     const res = await api.post('/api/sessions', { cwd: server.proj, title: 'Integration run' });
     assert.equal(res.status, 200);
     const live = res.json.live;
-    assert.deepEqual(Object.keys(live).sort(), ['claudeCodeVersion', 'cwd', 'effort', 'error', 'lastActivity',
-      'lockedBy', 'model', 'pendingCount', 'permissionMode', 'sessionId', 'state', 'title', 'trusted']);
+    assert.deepEqual(Object.keys(live).sort(), ['backgroundTasks', 'claudeCodeVersion', 'cwd', 'effort', 'error',
+      'fastMode', 'fastModeDisabledReason', 'fastModeState', 'lastActivity', 'lockedBy', 'model', 'pendingCount',
+      'permissionMode', 'sessionId', 'state', 'title', 'trusted']);
+    assert.equal(live.backgroundTasks, 0);
+    assert.equal(live.fastMode, null, 'the settings files decide until the host requests fast mode');
     assert.ok(isUuid(live.sessionId));
     assert.equal(live.cwd, server.proj);
     assert.ok(['starting', 'idle'].includes(live.state), live.state);

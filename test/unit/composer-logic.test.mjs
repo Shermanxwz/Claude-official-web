@@ -7,6 +7,7 @@ import {
   draftKey,
   effortLevelsFor,
   effortModelFor,
+  fastModeView,
   filterCommands,
   findModelInfo,
   formatBytes,
@@ -550,5 +551,51 @@ describe('joinRestoredText', () => {
   test('changes nothing for an empty restored message', () => {
     assert.equal(joinRestoredText('', 'and add tests'), 'and add tests');
     assert.equal(joinRestoredText('', ''), '');
+  });
+});
+
+describe('fastModeView', () => {
+  test('is shown for a model that supports fast mode, whatever the runtime reports', () => {
+    assert.equal(fastModeView({}, true).visible, true);
+    assert.equal(fastModeView({ requested: false, runtime: 'off' }, true).visible, true);
+  });
+
+  test('stays hidden for a model without fast mode while nothing requests or runs it', () => {
+    assert.equal(fastModeView({}, false).visible, false);
+    assert.equal(fastModeView({ requested: false, runtime: 'off', reason: 'free' }, false).visible, false);
+    assert.equal(fastModeView(null, false).visible, false);
+    assert.equal(fastModeView(undefined, undefined).visible, false);
+  });
+
+  test('is shown whenever a request is on, or the runtime is on or cooling down', () => {
+    assert.equal(fastModeView({ requested: true }, false).visible, true);
+    assert.equal(fastModeView({ runtime: 'on' }, false).visible, true);
+    assert.equal(fastModeView({ runtime: 'cooldown' }, false).visible, true);
+    assert.equal(fastModeView({ runtime: 'off' }, false).visible, false);
+  });
+
+  test('is pressed for a request of true and never for a request of false', () => {
+    assert.equal(fastModeView({ requested: true, runtime: 'off' }, true).pressed, true);
+    assert.equal(fastModeView({ requested: false, runtime: 'on' }, true).pressed, false);
+  });
+
+  test('follows the runtime only when nothing is requested', () => {
+    assert.equal(fastModeView({ requested: null, runtime: 'on' }, true).pressed, true);
+    assert.equal(fastModeView({ requested: null, runtime: 'cooldown' }, true).pressed, false);
+    assert.equal(fastModeView({ requested: null, runtime: 'off' }, true).pressed, false);
+    assert.equal(fastModeView({}, true).pressed, false);
+  });
+
+  test('reports the runtime state and the reason, and treats unknown values as not reported', () => {
+    assert.deepEqual(fastModeView({ requested: null, runtime: 'cooldown', reason: null }, true), {
+      visible: true,
+      pressed: false,
+      state: 'cooldown',
+      reason: null,
+    });
+    assert.equal(fastModeView({ runtime: 'warming' }, true).state, null);
+    assert.equal(fastModeView({ reason: 'free' }, true).reason, 'free');
+    assert.equal(fastModeView({ reason: '' }, true).reason, null);
+    assert.equal(fastModeView({ requested: 'yes', runtime: 'on' }, true).pressed, true);
   });
 });

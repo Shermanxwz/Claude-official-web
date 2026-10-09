@@ -11,7 +11,7 @@ import { createHeader } from './header.js';
 import { createComposer } from './composer.js';
 import { createSidebar } from './sidebar.js';
 import { createToasts } from './toasts.js';
-import { closeAllDialogs, hasOpenDialog } from './dialog.js';
+import { closeAllDialogs, confirmDialog, hasOpenDialog } from './dialog.js';
 import { closeMenu } from './menu.js';
 import { closePanel, hasOpenSheet, openPanel, refreshSessionList, renameSessionDialog } from './panels.js';
 import { openNewSessionDialog } from './new-session.js';
@@ -25,6 +25,8 @@ const SESSIONS_DEBOUNCE_MS = 300;
 const CONNECTION_GRACE_MS = 2000;
 const FORWARDED_EVENTS = new Set(['message_accepted', 'sdk', 'request', 'request_resolved', 'session_state',
   'resync', 'notice']);
+/** The session settings the gateway accepts (POST /api/sessions/:id/settings); nothing else is forwarded. */
+const SETTING_FIELDS = ['model', 'permissionMode', 'effort', 'fastMode'];
 
 /**
  * @param {string} hash
@@ -303,12 +305,19 @@ export function createAppShell({ root, api, store, t }) {
     }
   }
 
-  /** @param {{model?: string|null, permissionMode?: string, effort?: string|null}} settings */
+  /**
+   * Sends the settings the user changed: any subset of model, permissionMode, effort and fastMode. Resolves to the live
+   * info when a live session took them, to null when there is no session or it is not live (the settings wait for the
+   * next open), and to false when the request failed; the reason is shown as a toast.
+   * @param {{model?: string|null, permissionMode?: string, effort?: string|null, fastMode?: boolean|null}} settings
+   */
   async function updateSettings(settings) {
     const sessionId = currentSessionId();
     if (!sessionId) return null;
+    const body = {};
+    for (const key of SETTING_FIELDS) if (settings && key in settings) body[key] = settings[key];
     try {
-      const result = await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/settings`, settings);
+      const result = await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/settings`, body);
       if (result?.live) store.set({ live: { ...store.get().live, [sessionId]: result.live } });
       return result?.live ?? null;
     } catch (err) {
@@ -344,7 +353,24 @@ export function createAppShell({ root, api, store, t }) {
     openForkDialog({ api, sessionId, upToMessageId, t, actions });
   }
 
-  function openTerminal() {
+  /**
+   * Asks before an action that ends the session's query (close, terminal, restart, conversation rewind) while it still
+   * has background tasks, because ending the query stops them. Resolves true when there are none.
+   * @param {string} sessionId
+   * @returns {Promise<boolean>}
+   */
+  function confirmEndBackground(sessionId) {
+    const count = Number(store.get().live?.[sessionId]?.backgroundTasks) || 0;
+    if (count <= 0) return Promise.resolve(true);
+    return confirmDialog({
+      title: t('shell.background.endTitle'),
+      message: t('shell.background.endMessage', { count }),
+      danger: true,
+      confirmLabel: t('shell.background.endConfirm'),
+    });
+  }
+
+  async function openTerminal() {
     const state = store.get();
     const profile = state.meta?.profile ?? state.auth?.profile ?? null;
     if (!state.meta?.features?.terminal || profile !== 'full') {
@@ -356,6 +382,7 @@ export function createAppShell({ root, api, store, t }) {
       toast(t('shell.terminal.noSession'), 'warning');
       return;
     }
+    if (!(await confirmEndBackground(sessionId))) return;
     parts.terminal?.open({ sessionId });
   }
 
@@ -382,6 +409,8 @@ export function createAppShell({ root, api, store, t }) {
     openRewind,
     openFork,
     openTerminal,
+    confirmEndBackground,
+    toggleFastMode: () => parts.header?.toggleFast() ?? false,
     openPanel: (name) => openPanel(name, { api, store, t, actions }),
     renameSession: renameCurrent,
     toast,
@@ -687,6 +716,8 @@ export function createAppShell({ root, api, store, t }) {
    * @param {{sessionId: string, path: string}} trust
    */
   async function trustFolder({ sessionId, path }) {
+    if (trustBusy) return;
+    if (!(await confirmEndBackground(sessionId))) return;
     if (trustBusy) return;
     trustBusy = true;
     renderBanners();

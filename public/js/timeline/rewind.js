@@ -150,6 +150,9 @@ export function openRewindDialog({ api, sessionId, userMessageId, t, actions }) 
 
   async function confirm() {
     if (busy || !canRewind()) return;
+    // A conversation rewind restarts the session's query, which stops its background tasks.
+    if (mode !== 'code' && actions.confirmEndBackground && !(await actions.confirmEndBackground(sessionId))) return;
+    if (busy) return;
     busy = true;
     errorEl.hidden = true;
     updateControls();

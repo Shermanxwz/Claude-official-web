@@ -31,31 +31,48 @@ export function delayFromValue(value) {
 }
 
 /**
- * The pacing in effect: an explicit value wins, then CAW_MOCK_DELAY_MS, then the default. A blank environment value
- * counts as unset.
+ * The pacing in effect: the explicit value when there is one, otherwise the default. This module never reads the
+ * environment; startServer reads CAW_MOCK_DELAY_MS from the environment it is given and passes the value on.
  * @param {unknown} explicit
  * @returns {number}
  */
 export function resolveDelay(explicit) {
-  if (explicit !== undefined) return delayFromValue(explicit);
-  const raw = process.env.CAW_MOCK_DELAY_MS;
-  if (raw === undefined || raw.trim() === '') return DEFAULT_DELAY_MS;
-  return delayFromValue(raw.trim());
+  return explicit === undefined ? DEFAULT_DELAY_MS : delayFromValue(explicit);
 }
 
 /**
- * Creates the mock EngineAdapter.
- * @param {{config: Config, log: Logger, delayMs?: number|string}} options
+ * Creates the mock EngineAdapter. `resolvedSettings` stands for the settings the user's files define: resolveSettings
+ * reports them and every query loads them under its flag overlay, so a test can simulate a user who set a key (for
+ * example showThinkingSummaries: false, or fastMode). `backgroundTiming` sets how long a foreground command waits to be
+ * moved to the background and how long a background command runs; the defaults are the scripted ones.
+ * @param {{config: Config, log: Logger, delayMs?: number|string,
+ *   resolvedSettings?: import('@anthropic-ai/claude-agent-sdk').Settings,
+ *   backgroundTiming?: import('./query.mjs').BackgroundTiming}} options
  * @returns {EngineAdapter}
  */
-export function createMockAdapter({ config, log, delayMs }) {
+export function createMockAdapter({ config, log, delayMs, resolvedSettings = {}, backgroundTiming = {} }) {
   const pace = resolveDelay(delayMs);
   const store = createMockStore(join(config.stateDir, 'mock-sessions'));
   log.info('engine adapter ready', { engine: 'mock', sdkVersion: 'mock', delayMs: pace });
   return {
     kind: 'mock',
     sdkVersion: 'mock',
-    query: ({ prompt, options }) => createMockQuery({ prompt, options, store, delayMs: pace, log }),
+    query: ({ prompt, options }) => createMockQuery({
+      prompt,
+      options,
+      store,
+      delayMs: pace,
+      log,
+      fileSettings: { ...resolvedSettings },
+      backgroundDisabled: config.backgroundTasksDisabled === true,
+      backgroundTiming,
+    }),
+    resolveSettings: async (options) => ({
+      // An empty settingSources list disables the filesystem sources, so the files define nothing.
+      effective: options?.settingSources?.length === 0 ? {} : { ...resolvedSettings },
+      provenance: {},
+      sources: [],
+    }),
     listSessions: (options) => store.listSessions(options),
     getSessionMessages: (sessionId, options) => store.getSessionMessages(sessionId, options),
     getSessionInfo: (sessionId, options) => store.getSessionInfo(sessionId, options),

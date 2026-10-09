@@ -14,7 +14,7 @@ The seal runs these gates in order and stops at the first failure:
 | 2 | `check` | Static rules hold across the tree: no `TODO`, `FIXME` or `XXX` markers; no `console.*` in `src/`; every backend module starts with `// @ts-check`; no `eval`, `new Function`, `shell: true` or shell-based `exec` in `src/`; no `innerHTML`, `outerHTML`, `insertAdjacentHTML` or `document.write` in browser code; no inline scripts or inline event handlers in HTML; LF line endings, no trailing whitespace, no tab indentation and a final newline; valid JSON; every module passes `node --check`; relative imports resolve; no file over 300 KiB; no symbolic links. |
 | 3 | `typecheck` | `tsc -p jsconfig.json` passes with JSDoc types checked, including the scripts. |
 | 4 | `test` | Unit and integration tests pass with no network access, temporary directories and random ports. Integration tests use the mock engine. |
-| 5 | `test:e2e` | The 22 browser tests pass in Chromium, driving the real interface against the mock engine. |
+| 5 | `test:e2e` | The 30 browser tests pass in Chromium, driving the real interface against the mock engine. |
 
 The seal uses the deterministic mock engine. It proves the gateway, the wire protocol, the access rules and the browser
 interface behave as specified. It does not prove that a real model answers correctly, and it does not prove that Claude

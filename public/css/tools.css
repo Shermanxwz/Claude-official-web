@@ -216,6 +216,15 @@
   color: var(--accent);
 }
 
+/* A request in flight (Run in background) stays visible, muted and without the hover fill. */
+.tool-action:disabled,
+.tool-action:disabled:hover {
+  border-color: transparent;
+  background: transparent;
+  color: var(--fg-subtle);
+  cursor: progress;
+}
+
 .tool-more {
   align-self: flex-start;
   min-height: 28px;

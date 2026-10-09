@@ -247,7 +247,17 @@ function permissionModeValue(value) {
 }
 
 /**
- * Reads the optional model / permissionMode / effort fields shared by session creation, open and settings.
+ * @param {unknown} value
+ * @returns {boolean|null} true or false to request fast mode, null to let the settings decide
+ */
+function nullableFastMode(value) {
+  if (value === null) return null;
+  if (typeof value !== 'boolean') throw new AppError(422, 'INVALID_ARGUMENT', 'fastMode must be true, false or null');
+  return value;
+}
+
+/**
+ * Reads the optional model / permissionMode / effort / fastMode fields shared by session creation, open and settings.
  * @param {Record<string, unknown>} body
  * @returns {SessionSettings}
  */
@@ -256,6 +266,7 @@ function settingsFrom(body) {
     model: optional(body, 'model', nullableModel),
     permissionMode: optional(body, 'permissionMode', permissionModeValue),
     effort: optional(body, 'effort', nullableEffort),
+    fastMode: optional(body, 'fastMode', nullableFastMode),
   });
 }
 
@@ -332,6 +343,7 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
         terminal: terminal.enabled,
         bypass: config.allowBypass && config.profile === 'full',
         uploads: true,
+        backgroundTasks: !config.backgroundTasksDisabled,
       },
       limits: {
         uploadMaxBytes: config.uploadMaxBytes,
@@ -488,8 +500,20 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   router.add('POST', '/api/sessions/:id/reload', async ({ req, params }) => {
     const id = sessionIdValue(params.id);
     const body = await readJson(req);
-    await engineHost.reload(id, choiceValue(body.what, 'what', ['plugins', 'skills']));
-    return { ok: true };
+    const what = choiceValue(body.what, 'what', ['plugins', 'skills', 'output-styles']);
+    const force = optional(body, 'force', (value) => booleanValue(value, 'force'));
+    return engineHost.reload(id, what, definedOnly({ force }));
+  }, { profile: 'standard' });
+  router.add('POST', '/api/sessions/:id/background', async ({ req, params }) => {
+    const id = sessionIdValue(params.id);
+    const body = await readJson(req);
+    const toolUseId = optional(body, 'toolUseId', (value) => tokenValue(value, 'toolUseId'));
+    return engineHost.backgroundTasks(id, toolUseId);
+  }, { profile: 'standard' });
+  router.add('POST', '/api/sessions/:id/output-style', async ({ req, params }) => {
+    const id = sessionIdValue(params.id);
+    const body = await readJson(req);
+    return engineHost.setOutputStyle(id, requiredString(body.style, 'style', MAX_TEXT));
   }, { profile: 'standard' });
   router.add('POST', '/api/sessions/:id/rewind', async ({ req, params }) => {
     const id = sessionIdValue(params.id);

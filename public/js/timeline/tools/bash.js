@@ -4,7 +4,7 @@
 
 import { h } from '../../dom.js';
 import { formatDuration, stripAnsi } from '../format.js';
-import { chip, codeBlock, copyButton, prettyJson, statusOf, toolShell } from './shell.js';
+import { backgroundAction, chip, codeBlock, copyButton, prettyJson, statusOf, toolShell } from './shell.js';
 import { finiteNumber, firstLine, isRecord, resultText, str, truncate } from './summaries.js';
 
 const TAIL_LINES = 40;
@@ -33,6 +33,9 @@ export function render(card, ctx) {
   const actions = [];
   if (command) actions.push(copyButton({ text: command, t: ctx.t, label: ctx.t('tools.bash.copyCommand') }));
   if (output) actions.push(copyButton({ text: output, t: ctx.t, label: ctx.t('tools.bash.copyOutput') }));
+  // Only a Bash command can move to the background; the other shell tools (output, kill, monitor) only read or stop tasks.
+  const background = card.name === 'Bash' ? backgroundAction(card, ctx) : null;
+  if (background) actions.push(background);
   return toolShell({
     iconName: ICONS[card.name] ?? 'terminal',
     title: card.name,

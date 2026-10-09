@@ -44,12 +44,37 @@ function projectDir(t) {
 }
 
 /**
- * An adapter over a state directory. Two adapters over one directory behave like two server restarts.
+ * The background timing of the tests: a foreground command waits 25 ms to be moved, and a background one runs
+ * 40 ms.
+ */
+const FAST_BACKGROUND = { waitMs: 25, runMs: 40 };
+
+/**
+ * An adapter over a state directory, with the options a test needs. Two adapters over one directory behave like two
+ * server restarts.
+ * @param {string} stateDir
+ * @param {{delayMs?: number, config?: Record<string, unknown>, resolvedSettings?: Record<string, unknown>,
+ *   backgroundTiming?: {waitMs?: number, runMs?: number}}} [options]
+ */
+function adapterWith(stateDir, {
+  delayMs = 0, config = {}, resolvedSettings, backgroundTiming = FAST_BACKGROUND,
+} = {}) {
+  return createMockAdapter({
+    config: { stateDir, ...config },
+    log: silent,
+    delayMs,
+    resolvedSettings,
+    backgroundTiming,
+  });
+}
+
+/**
+ * An adapter over a state directory with the default options.
  * @param {string} stateDir
  * @param {number} [delayMs]
  */
 function adapterAt(stateDir, delayMs = 0) {
-  return createMockAdapter({ config: { stateDir }, log: silent, delayMs });
+  return adapterWith(stateDir, { delayMs });
 }
 
 /**
@@ -237,6 +262,11 @@ const SCENARIO_PROMPTS = {
   auth: 'check the auth token',
   error: 'produce an error',
   slow: 'answer slowly',
+  think: 'think it through first',
+  background: 'start a background build',
+  'refusal-none': 'refusal-none please',
+  refusal: 'trigger a refusal',
+  plugin: 'install the plugin',
   default: 'Tell me something about the project',
 };
 
@@ -322,7 +352,8 @@ describe('approvals', () => {
     assert.deepEqual(calls[0].input, { command: 'ls -la', description: 'List project files' });
     assert.equal(typeof calls[0].options.requestId, 'string');
     assert.equal(calls[0].options.suggestions[0].type, 'addRules');
-    const toolUse = messages.find((m) => m.type === 'assistant' && m.message.content.some((b) => b.type === 'tool_use'));
+    const toolUse = messages.find((m) => m.type === 'assistant'
+      && m.message.content.some((b) => b.type === 'tool_use'));
     const found = toolResultOf(messages, toolUse.message.content.find((b) => b.type === 'tool_use').id);
     assert.equal(found.block.is_error, undefined);
     assert.equal(found.message.tool_use_result.interrupted, false);
@@ -334,7 +365,8 @@ describe('approvals', () => {
     const canUseTool = async () => ({ behavior: 'deny', message: 'Not this time' });
     const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'run the tool', { canUseTool });
     const results = assertWellFormed(messages);
-    const toolUse = messages.find((m) => m.type === 'assistant' && m.message.content.some((b) => b.type === 'tool_use'));
+    const toolUse = messages.find((m) => m.type === 'assistant'
+      && m.message.content.some((b) => b.type === 'tool_use'));
     const found = toolResultOf(messages, toolUse.message.content.find((b) => b.type === 'tool_use').id);
     assert.equal(found.block.is_error, true);
     assert.equal(found.block.content, 'Not this time');
@@ -586,7 +618,7 @@ describe('interrupt, abort and close', () => {
     assert.deepEqual(messages.map((m) => m.subtype ?? m.type), ['init', 'autocompact_state', 'active_goal']);
   });
 
-  test('an abortController aborted mid-turn ends the stream without a result, and the query then rejects calls', async (t) => {
+  test('an aborted controller ends the stream without a result, and later calls reject', async (t) => {
     const controller = new AbortController();
     const channel = promptChannel();
     channel.push(userPrompt('answer slowly'));
@@ -641,7 +673,8 @@ function pause(ms) {
 }
 
 /**
- * Pulls messages from a live query until one satisfies `until`. Unlike for-await, stopping here does not close the query.
+ * Pulls messages from a live query until one satisfies `until`. Unlike for-await, stopping here does not close
+ * the query.
  * @param {any} query
  * @param {(message: any) => boolean} until
  */
@@ -665,8 +698,19 @@ async function pullUntil(query, until) {
  * @param {Record<string, unknown>} [options]
  */
 async function openQuery(t, stateDir, cwd, options = {}) {
+  return openOn(t, adapterAt(stateDir), cwd, options);
+}
+
+/**
+ * The same as openQuery, on the adapter given.
+ * @param {import('node:test').TestContext} t
+ * @param {any} adapter
+ * @param {string} cwd
+ * @param {Record<string, unknown>} [options]
+ */
+async function openOn(t, adapter, cwd, options = {}) {
   const channel = promptChannel();
-  const query = adapterAt(stateDir).query({ prompt: channel.stream, options: { cwd, ...options } });
+  const query = adapter.query({ prompt: channel.stream, options: { cwd, ...options } });
   t.after(() => {
     channel.end();
     query.close();
@@ -902,7 +946,8 @@ describe('subagent transcripts', () => {
     assert.equal((await store.getSubagentMessages(sessionId, agentId, { dir: cwd })).length, 4);
     assert.deepEqual(await store.getSubagentMessages(sessionId, agentId, { dir: join(cwd, 'elsewhere') }), []);
     const top = await adapter.getSessionMessages(sessionId, { dir: cwd });
-    assert.ok(top.every((entry) => entry.parent_tool_use_id === null), 'the main transcript keeps top-level entries only');
+    assert.ok(top.every((entry) => entry.parent_tool_use_id === null),
+      'the main transcript keeps top-level entries only');
   });
 
   test('a fork keeps the subagent transcripts that its cut still references', async (t) => {
@@ -1047,7 +1092,8 @@ describe('control methods', () => {
       if (next.value.type === 'result') break;
     }
     assert.ok(started, 'the Agent task starts');
-    const stopped = seen.find((m) => m.type === 'system' && m.subtype === 'task_notification' && m.status === 'stopped');
+    const stopped = seen.find((m) => m.type === 'system' && m.subtype === 'task_notification'
+      && m.status === 'stopped');
     assert.equal(stopped.task_id, started.task_id);
     const nested = seen.filter((m) => m.parent_tool_use_id === started.tool_use_id);
     assert.equal(nested.length, 0, 'nested messages after the stop are dropped');
@@ -1058,8 +1104,8 @@ describe('control methods', () => {
 
   test('settings, reloads and flag settings reach the next answers', async (t) => {
     const { query } = await openQuery(t, tempDir(t), projectDir(t));
-    await query.updateSettings('localSettings', { outputStyle: 'explanatory' });
-    assert.equal((await query.initializationResult()).output_style, 'explanatory');
+    await query.updateSettings('localSettings', { outputStyle: 'Explanatory' });
+    assert.equal((await query.initializationResult()).output_style, 'Explanatory');
     await assert.rejects(query.updateSettings('projectSettings', {}), /Unknown settings source/);
     await assert.rejects(query.updateSettings('userSettings', { outputStyle: 3 }), /outputStyle must be a string/);
     const reloaded = await query.reloadPlugins();
@@ -1068,7 +1114,7 @@ describe('control methods', () => {
     const skills = await query.reloadSkills();
     assert.ok(skills.skills.some((skill) => skill.name === 'code-review'));
     const styles = await query.reloadOutputStyles();
-    assert.deepEqual(styles.available_output_styles, ['default', 'explanatory', 'learning']);
+    assert.deepEqual(styles.available_output_styles, ['default', 'Proactive', 'Concise', 'Explanatory', 'Learning']);
     await query.applyFlagSettings({ effortLevel: 'high', model: 'claude-haiku-mock' });
     await assert.rejects(query.applyFlagSettings({ effortLevel: 'extreme' }), /Unknown effort level: extreme/);
   });
@@ -1167,7 +1213,8 @@ describe('store files', () => {
     await assert.rejects(store.tagSession(randomUUID(), 'nope'), /Session not found/);
     await assert.rejects(store.forkSession(randomUUID()), /Session not found/);
     await assert.rejects(store.deleteSession('not-a-uuid'), /Session not found/);
-    await assert.rejects(store.getSessionMessages(randomUUID(), { offset: -1 }), /offset must be a non-negative integer/);
+    await assert.rejects(store.getSessionMessages(randomUUID(), { offset: -1 }),
+      /offset must be a non-negative integer/);
     const upper = newRecord({ sessionId: randomUUID().toUpperCase(), cwd: projectDir(t) });
     assert.throws(() => store.create(upper), /Session id must be a lowercase UUID/);
     const record = store.create(newRecord({ sessionId: randomUUID(), cwd: projectDir(t) }));
@@ -1176,23 +1223,13 @@ describe('store files', () => {
 });
 
 describe('pacing and adapter setup', () => {
-  test('the pacing comes from the explicit value, then CAW_MOCK_DELAY_MS, then the default', (t) => {
-    const previous = process.env.CAW_MOCK_DELAY_MS;
-    t.after(() => {
-      if (previous === undefined) delete process.env.CAW_MOCK_DELAY_MS;
-      else process.env.CAW_MOCK_DELAY_MS = previous;
-    });
-    delete process.env.CAW_MOCK_DELAY_MS;
+  test('the pacing is the explicit value, or the default when there is none', () => {
     assert.equal(resolveDelay(undefined), DEFAULT_DELAY_MS);
-    process.env.CAW_MOCK_DELAY_MS = '   ';
-    assert.equal(resolveDelay(undefined), DEFAULT_DELAY_MS);
-    process.env.CAW_MOCK_DELAY_MS = ' 25 ';
-    assert.equal(resolveDelay(undefined), 25);
-    assert.equal(resolveDelay(0), 0, 'an explicit value wins over the environment');
-    process.env.CAW_MOCK_DELAY_MS = 'fast';
-    assert.throws(() => resolveDelay(undefined), RangeError);
-    process.env.CAW_MOCK_DELAY_MS = String(MAX_DELAY_MS + 1);
-    assert.throws(() => resolveDelay(undefined), RangeError);
+    assert.equal(resolveDelay(0), 0);
+    assert.equal(resolveDelay(MAX_DELAY_MS), MAX_DELAY_MS);
+    assert.equal(resolveDelay(' 25 '), 25, 'a string from the environment is trimmed and parsed');
+    assert.throws(() => resolveDelay('fast'), RangeError);
+    assert.throws(() => resolveDelay(MAX_DELAY_MS + 1), RangeError);
     assert.equal(delayFromValue('7'), 7);
     assert.equal(delayFromValue(MAX_DELAY_MS), MAX_DELAY_MS);
     for (const bad of [-1, 1.5, Number.NaN, MAX_DELAY_MS + 1, '', '  ', 'x', null, true]) {
@@ -1201,20 +1238,15 @@ describe('pacing and adapter setup', () => {
   });
 
   test('createMockAdapter describes itself, logs its pacing and rejects a bad pacing', (t) => {
-    const previous = process.env.CAW_MOCK_DELAY_MS;
-    t.after(() => {
-      if (previous === undefined) delete process.env.CAW_MOCK_DELAY_MS;
-      else process.env.CAW_MOCK_DELAY_MS = previous;
-    });
     const stateDir = tempDir(t);
     const logged = [];
     const log = { debug() {}, warn() {}, error() {}, info: (message, fields) => logged.push({ message, fields }) };
     const explicit = createMockAdapter({ config: { stateDir }, log, delayMs: 3 });
     assert.equal(explicit.kind, 'mock');
     assert.equal(explicit.sdkVersion, 'mock');
-    process.env.CAW_MOCK_DELAY_MS = '9';
+    createMockAdapter({ config: { stateDir }, log, delayMs: '9' });
     createMockAdapter({ config: { stateDir }, log });
-    assert.deepEqual(logged.map((entry) => entry.fields.delayMs), [3, 9]);
+    assert.deepEqual(logged.map((entry) => entry.fields.delayMs), [3, 9, DEFAULT_DELAY_MS]);
     assert.equal(logged[0].message, 'engine adapter ready');
     assert.throws(() => createMockAdapter({ config: { stateDir }, log, delayMs: MAX_DELAY_MS + 1 }), RangeError);
     assert.throws(() => createMockAdapter({ config: { stateDir }, log, delayMs: 2.5 }), RangeError);
@@ -1237,6 +1269,10 @@ describe('query option checks', () => {
       [{ model: '  ' }, /model must be a non-empty string/],
       [{ cwd: 'relative/dir' }, /cwd must be an absolute path/],
       [{ title: '' }, /title must be a non-empty string/],
+      [{ settings: 'fast' }, /settings must be an object/],
+      [{ perTaskStopAffordance: 'yes' }, /perTaskStopAffordance must be a boolean/],
+      [{ settingSources: ['user', 'global'] }, /settingSources must only list user, project, local/],
+      [{ settingSources: 'user' }, /settingSources must only list user, project, local/],
     ];
     for (const [options, pattern] of cases) {
       assert.throws(() => adapter.query({ prompt: 'x', options: { cwd: projectDir(t), ...options } }), pattern,
@@ -1247,6 +1283,12 @@ describe('query option checks', () => {
     const store = createMockStore(join(stateDir, 'checked'));
     assert.throws(() => createMockQuery({ prompt: 'x', options: { cwd: projectDir(t) }, store, delayMs: 1.5 }),
       RangeError);
+    for (const backgroundTiming of [{ waitMs: -1 }, { runMs: 1.5 }]) {
+      assert.throws(() => adapterWith(stateDir, { backgroundTiming }).query({
+        prompt: 'x',
+        options: { cwd: projectDir(t) },
+      }), /backgroundTiming\.\w+ must be a non-negative integer/, JSON.stringify(backgroundTiming));
+    }
     assert.deepEqual(readdirSync(join(stateDir, 'mock-sessions')), []);
   });
 
@@ -1261,7 +1303,7 @@ describe('query option checks', () => {
 });
 
 describe('turn linkage', () => {
-  test('every assistant message, stream event and result carries the uuid of the prompt that started its turn', async (t) => {
+  test('every assistant message, stream event and result carries the uuid of its turn prompt', async (t) => {
     const cases = [
       ['Tell me something', {}],
       ['run the tool', {}],
@@ -1271,6 +1313,11 @@ describe('turn linkage', () => {
       ['ask me a question', { canUseTool: pickFirstAnswers }],
       ['make a plan', { canUseTool: allowAll }],
       ['produce an error', {}],
+      ['think it through first', {}],
+      ['start a background build', {}],
+      ['refusal-none please', {}],
+      ['trigger a refusal', {}],
+      ['install the plugin', {}],
     ];
     for (const [text, options] of cases) {
       const uuid = randomUUID();
@@ -1345,7 +1392,8 @@ describe('turn linkage', () => {
     channel.push({ type: 'user', message: { role: 'user', content: 'Tell me something' }, parent_tool_use_id: null });
     channel.end();
     const adapter = adapterAt(stateDir);
-    const messages = await collect(adapter.query({ prompt: channel.stream, options: { cwd, includePartialMessages: true } }));
+    const query = adapter.query({ prompt: channel.stream, options: { cwd, includePartialMessages: true } });
+    const messages = await collect(query);
     assertWellFormed(messages);
     const [result] = messages.filter((message) => message.type === 'result');
     assert.equal(typeof result.user_message_uuid, 'string');
@@ -1419,6 +1467,7 @@ describe('runtime messages around each turn', () => {
         'Fetching https://example.com/docs']],
       ['check mcp issues', { canUseTool: allowAll }, ['Searching GitHub issues']],
       ['run a hook first', {}, ['Running git status --short']],
+      ['start a background build', {}, ['Running npm run build']],
     ];
     for (const [text, options, details] of cases) {
       const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), text, options);
@@ -1565,7 +1614,10 @@ describe('permission suggestions', () => {
     const messages = await runSingle(adapterAt(tempDir(t)), cwd, 'run the tool', { canUseTool });
     assertWellFormed(messages);
     assert.deepEqual(offered[0], [
-      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow', destination: 'localSettings' },
+      {
+        type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow',
+        destination: 'localSettings',
+      },
       { type: 'addDirectories', directories: [join(cwd, '..')], destination: 'session' },
     ]);
     assert.deepEqual(bashResultOf(messages).message.tool_use_result.updatedPermissions, [offered[0][1]]);
@@ -1625,5 +1677,419 @@ describe('model aliases', () => {
     }
     assert.equal(init.model, 'claude-sonnet-mock');
     assert.ok(initRows.some((row) => row.resolvedModel === init.model));
+  });
+});
+
+/** Whether an assistant message calls a tool. */
+function callsTool(message) {
+  return message.type === 'assistant' && message.message.content.some((block) => block.type === 'tool_use');
+}
+
+/** The task_started message of a task, or undefined. */
+function taskStartedOf(messages) {
+  return messages.find((m) => m.type === 'system' && m.subtype === 'task_started');
+}
+
+/** The task_notification messages, in order. */
+function notificationsOf(messages) {
+  return messages.filter((m) => m.type === 'system' && m.subtype === 'task_notification');
+}
+
+/** The background_tasks_changed messages, in order. */
+function listingsOf(messages) {
+  return messages.filter((m) => m.type === 'system' && m.subtype === 'background_tasks_changed');
+}
+
+/** The fast mode state of a message, with the reason it is off (null when there is none). */
+function fastOf(message) {
+  return { state: message.fast_mode_state, reason: message.fast_mode_disabled_reason ?? null };
+}
+
+/**
+ * Runs one turn on an open query and returns its result.
+ * @param {any} query
+ * @param {{push: (message: any) => void}} channel
+ * @param {string} [text]
+ */
+async function turnResult(query, channel, text = 'Tell me something') {
+  channel.push(userPrompt(text));
+  const turn = await pullUntil(query, isTurnEnd);
+  return turn.find((message) => message.type === 'result');
+}
+
+/**
+ * Pulls messages until `done` accepts everything pulled so far, the messages passed in included. Unlike pullUntil, the
+ * check sees the whole list, so an event that arrived earlier than expected does not leave the pull waiting for it.
+ * @param {any} query
+ * @param {(messages: any[]) => boolean} done
+ * @param {any[]} [messages] messages already pulled; the new ones are appended to them
+ */
+async function pullAll(query, done, messages = []) {
+  while (!done(messages)) {
+    const next = await query.next();
+    if (next.done) break;
+    messages.push(next.value);
+  }
+  return messages;
+}
+
+/**
+ * Starts a build and moves it to the background as soon as its call arrives, as Ctrl+B does. The command is still in
+ * the foreground while its call is pending, so the move cannot miss it.
+ * @param {any} query
+ * @param {{push: (message: any) => void}} channel
+ * @returns {Promise<{before: any[], toolUseId: string}>} the messages up to the call, and the call's id
+ */
+async function startBuildInBackground(query, channel) {
+  channel.push(userPrompt('start a background build'));
+  const before = await pullUntil(query, callsTool);
+  const toolUse = before.at(-1).message.content.find((block) => block.type === 'tool_use');
+  assert.equal(await query.backgroundTasks(toolUse.id), true, 'the running command moves to the background');
+  return { before, toolUseId: toolUse.id };
+}
+
+/**
+ * Starts a build, moves it to the background, then interrupts a second turn while it streams. Returns the messages of
+ * the interrupted turn, and what the session delivers once its prompts have ended.
+ * @param {import('node:test').TestContext} t
+ * @param {Record<string, unknown>} options the query options
+ */
+async function interruptWhileBuilding(t, options) {
+  const adapter = adapterWith(tempDir(t), { delayMs: 5, backgroundTiming: { waitMs: 25, runMs: 800 } });
+  const { query, channel } = await openOn(t, adapter, projectDir(t), { includePartialMessages: true, ...options });
+  const { before } = await startBuildInBackground(query, channel);
+  await pullAll(query, (list) => list.some(isTurnEnd), before);
+  channel.push(userPrompt('answer slowly'));
+  await pullUntil(query, (m) => m.type === 'stream_event' && m.event.type === 'content_block_delta');
+  await query.interrupt();
+  const cut = await pullUntil(query, isTurnEnd);
+  channel.end();
+  return { cut, tail: await collect(query) };
+}
+
+describe('thinking summaries', () => {
+  const SUMMARY = 'The request is simple, so I will answer it directly.';
+  const thinkingOf = (/** @type {any[]} */ messages) => messages
+    .filter((m) => m.type === 'assistant')
+    .flatMap((m) => m.message.content)
+    .find((block) => block.type === 'thinking');
+  const thinkingDeltasOf = (/** @type {any[]} */ messages) => messages
+    .filter((m) => m.type === 'stream_event' && m.event.type === 'content_block_delta'
+      && m.event.delta.type === 'thinking_delta');
+
+  test('the thinking text is kept only when the query passes --thinking-display summarized', async (t) => {
+    const cwd = projectDir(t);
+    const hidden = await runSingle(adapterAt(tempDir(t)), cwd, 'think it through first');
+    assertWellFormed(hidden);
+    assert.equal(thinkingOf(hidden).thinking, '');
+    assert.equal(thinkingOf(hidden).signature, 'mock-thinking-signature');
+    const shown = await runSingle(adapterAt(tempDir(t)), cwd, 'think it through first', {
+      extraArgs: { 'thinking-display': 'summarized' },
+    });
+    assert.equal(thinkingOf(shown).thinking, SUMMARY);
+    assert.equal(topLevelText(shown), 'Here is the answer, reached after thinking it through.');
+  });
+
+  test('a streamed thinking block sends its text as one thinking_delta, and only when summaries are on', async (t) => {
+    const cwd = projectDir(t);
+    const shown = await runSingle(adapterAt(tempDir(t)), cwd, 'think it through first', {
+      extraArgs: { 'thinking-display': 'summarized' },
+    });
+    const deltas = thinkingDeltasOf(shown);
+    assert.equal(deltas.length, 1);
+    assert.equal(deltas[0].event.delta.thinking, SUMMARY);
+    assert.equal(deltas[0].event.delta.estimated_tokens, null);
+    const hidden = await runSingle(adapterAt(tempDir(t)), cwd, 'think it through first');
+    assert.equal(thinkingDeltasOf(hidden).length, 0);
+  });
+
+  test('like a non-interactive runtime, only the display flag decides, not showThinkingSummaries', async (t) => {
+    const cwd = projectDir(t);
+    const fromFiles = adapterWith(tempDir(t), { resolvedSettings: { showThinkingSummaries: true } });
+    assert.equal(thinkingOf(await runSingle(fromFiles, cwd, 'think it through first')).thinking, '');
+
+    const flagged = adapterWith(tempDir(t), { resolvedSettings: { showThinkingSummaries: false } });
+    const shown = await runSingle(flagged, cwd, 'think it through first', {
+      settings: { showThinkingSummaries: false },
+      extraArgs: { 'thinking-display': 'summarized' },
+    });
+    assert.equal(thinkingOf(shown).thinking, SUMMARY);
+
+    const omitted = await runSingle(adapterAt(tempDir(t)), cwd, 'think it through first', {
+      extraArgs: { 'thinking-display': 'omitted' },
+    });
+    assert.equal(thinkingOf(omitted).thinking, '');
+  });
+
+  test('extraArgs must map flag names to strings or null', async (t) => {
+    const cwd = projectDir(t);
+    for (const extraArgs of [[], 'thinking-display', { 'thinking-display': 1 }]) {
+      assert.throws(() => adapterAt(tempDir(t)).query({ prompt: 'hi', options: { cwd, extraArgs } }),
+        /extraArgs must map flag names to strings or null/);
+    }
+  });
+
+  test('resolveSettings reports the files, every source by default, and nothing for an empty list', async (t) => {
+    const adapter = adapterWith(tempDir(t), { resolvedSettings: { showThinkingSummaries: true } });
+    const cwd = projectDir(t);
+    assert.deepEqual(await adapter.resolveSettings({ cwd, settingSources: ['user', 'project', 'local'] }), {
+      effective: { showThinkingSummaries: true },
+      provenance: {},
+      sources: [],
+    });
+    assert.deepEqual((await adapter.resolveSettings({ cwd })).effective, { showThinkingSummaries: true });
+    assert.deepEqual((await adapter.resolveSettings({ cwd, settingSources: [] })).effective, {});
+  });
+});
+
+describe('fast mode', () => {
+  test('fast mode stays off, with its reason, until the host opts in and the model supports it', async (t) => {
+    const { query, channel, init } = await openQuery(t, tempDir(t), projectDir(t));
+    assert.deepEqual(fastOf(init), { state: 'off', reason: 'sdk_opt_in_required' });
+
+    await query.applyFlagSettings({ fastMode: true });
+    assert.equal((await query.next()).value.subtype, 'status');
+    assert.deepEqual(fastOf(await turnResult(query, channel)), { state: 'off', reason: 'model_not_allowed' });
+
+    await query.applyFlagSettings({ model: 'claude-opus-mock' });
+    assert.equal((await query.next()).value.subtype, 'status');
+    assert.deepEqual(fastOf(await turnResult(query, channel)), { state: 'on', reason: null });
+
+    await query.applyFlagSettings({ fastMode: false });
+    assert.equal((await query.next()).value.subtype, 'status');
+    assert.deepEqual(fastOf(await turnResult(query, channel)), { state: 'off', reason: null });
+
+    await query.applyFlagSettings({ fastMode: null });
+    assert.equal((await query.next()).value.subtype, 'status');
+    assert.deepEqual(fastOf(await turnResult(query, channel)), { state: 'off', reason: 'sdk_opt_in_required' });
+  });
+
+  test('a fastMode setting in the query options opens fast mode at start', async (t) => {
+    const { init } = await openQuery(t, tempDir(t), projectDir(t), { model: 'opus', settings: { fastMode: true } });
+    assert.deepEqual(fastOf(init), { state: 'on', reason: null });
+  });
+
+  test('fastMode null hands the decision to the settings files', async (t) => {
+    const adapter = adapterWith(tempDir(t), { resolvedSettings: { fastMode: true } });
+    const { query, channel, init } = await openOn(t, adapter, projectDir(t), { model: 'opus' });
+    assert.deepEqual(fastOf(init), { state: 'off', reason: 'sdk_opt_in_required' }, 'the files alone do not opt in');
+    await query.applyFlagSettings({ fastMode: null });
+    assert.equal((await query.next()).value.subtype, 'status');
+    assert.deepEqual(fastOf(await turnResult(query, channel)), { state: 'on', reason: null });
+  });
+
+  test('fastMode accepts only a boolean or null', async (t) => {
+    const { query } = await openQuery(t, tempDir(t), projectDir(t));
+    await assert.rejects(query.applyFlagSettings({ fastMode: 'on' }), /fastMode must be a boolean or null\./);
+  });
+});
+
+describe('background tasks', () => {
+  test('a command nobody moves finishes in the foreground', async (t) => {
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'start a background build');
+    assertWellFormed(messages);
+    assert.equal(taskStartedOf(messages), undefined);
+    assert.equal(listingsOf(messages).length, 0);
+    assert.equal(bashResultOf(messages).block.content, 'Build succeeded');
+    assert.match(topLevelText(messages), /The build finished and succeeded\./);
+  });
+
+  test('Ctrl+B moves a running command: it starts as a background task, and it completes later', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
+    const { before, toolUseId } = await startBuildInBackground(query, channel);
+    // The completion may arrive inside the turn or after it, so the wait covers both: the turn's end, the notice and
+    // the emptied list.
+    const messages = await pullAll(query, (list) => list.some(isTurnEnd)
+      && notificationsOf(list).length === 1 && listingsOf(list).length === 2, before);
+
+    const started = taskStartedOf(messages);
+    assert.equal(started.tool_use_id, toolUseId);
+    assert.equal(started.task_type, 'local_bash');
+    assert.equal(started.is_backgrounded, true);
+    assert.equal(started.description, 'Build the project');
+    const outputFile = `/tmp/mock-tasks/${started.task_id}.output`;
+    assert.equal(bashResultOf(messages).block.content,
+      `Command running in background with ID: ${started.task_id}. Output is being written to: ${outputFile}`);
+    assert.deepEqual(listingsOf(messages).map((m) => m.tasks.map((task) => task.task_id)), [[started.task_id], []]);
+    assert.equal(messages.find((m) => m.type === 'result').subtype, 'success');
+
+    const [notice] = notificationsOf(messages);
+    assert.equal(notice.task_id, started.task_id);
+    assert.equal(notice.tool_use_id, toolUseId);
+    assert.equal(notice.status, 'completed');
+    assert.equal(notice.output_file, outputFile);
+    assert.equal(notice.summary, 'Background command "Build the project" completed');
+    assert.equal(await query.backgroundTasks(), false, 'nothing is left to move');
+  });
+
+  test('stopTask ends a background command early and reports it stopped, so it never completes', async (t) => {
+    const adapter = adapterWith(tempDir(t), { backgroundTiming: { waitMs: 25, runMs: 5000 } });
+    const { query, channel } = await openOn(t, adapter, projectDir(t));
+    const { before } = await startBuildInBackground(query, channel);
+    const started = taskStartedOf(await pullAll(query, (list) => list.some(isTurnEnd), before));
+    await query.stopTask(started.task_id);
+    const [stopped] = notificationsOf(await pullUntil(query, (m) => m.type === 'system'
+      && m.subtype === 'task_notification'));
+    assert.equal(stopped.task_id, started.task_id);
+    assert.equal(stopped.status, 'stopped');
+    assert.equal(stopped.summary, 'Stopped by request');
+    channel.end();
+    const tail = await collect(query);
+    assert.deepEqual(notificationsOf(tail), [], 'the stopped command never completes');
+    assert.deepEqual(listingsOf(tail).map((m) => m.tasks), [[]]);
+  });
+
+  test('an interrupt leaves a background command running when perTaskStopAffordance is set', async (t) => {
+    const { cut, tail } = await interruptWhileBuilding(t, { perTaskStopAffordance: true });
+    assert.equal(cut.find((m) => m.type === 'result').terminal_reason, 'aborted_streaming');
+    assert.deepEqual(notificationsOf(cut), []);
+    assert.deepEqual(listingsOf(cut), []);
+    const [done] = notificationsOf(tail);
+    assert.equal(done.status, 'completed');
+    assert.equal(done.summary, 'Background command "Build the project" completed');
+  });
+
+  test('an interrupt stops a background command when perTaskStopAffordance is not set', async (t) => {
+    const { cut, tail } = await interruptWhileBuilding(t, {});
+    const [stopped] = notificationsOf(cut);
+    assert.equal(stopped.status, 'stopped');
+    assert.equal(stopped.summary, 'Stopped by the interrupt');
+    assert.deepEqual(listingsOf(cut).at(-1).tasks, []);
+    assert.deepEqual(notificationsOf(tail), [], 'nothing completes after the interrupt');
+  });
+
+  test('with background tasks disabled, the move is refused and the command finishes in the foreground', async (t) => {
+    const adapter = adapterWith(tempDir(t), { config: { backgroundTasksDisabled: true } });
+    const { query, channel } = await openOn(t, adapter, projectDir(t));
+    channel.push(userPrompt('start a background build'));
+    const before = await pullUntil(query, callsTool);
+    await assert.rejects(query.backgroundTasks(), /Background tasks are disabled for this session\./);
+    const all = [...before, ...(await pullUntil(query, isTurnEnd))];
+    assert.equal(taskStartedOf(all), undefined);
+    assert.equal(bashResultOf(all).block.content, 'Build succeeded');
+    assert.equal(all.find((m) => m.type === 'result').subtype, 'success');
+  });
+
+  test('backgroundTasks answers false when no command runs, and checks its argument', async (t) => {
+    const { query } = await openQuery(t, tempDir(t), projectDir(t));
+    assert.equal(await query.backgroundTasks(), false);
+    assert.equal(await query.backgroundTasks('toolu_mock_404'), false);
+    await assert.rejects(query.backgroundTasks(7), /toolUseId must be a string/);
+  });
+
+  test('after the prompts end, the session stays open until the background command finishes', async (t) => {
+    const adapter = adapterWith(tempDir(t), { backgroundTiming: { waitMs: 25, runMs: 40 } });
+    const channel = promptChannel();
+    channel.push(userPrompt('start a background build'));
+    channel.end();
+    const query = adapter.query({ prompt: channel.stream, options: { cwd: projectDir(t) } });
+    const messages = [];
+    for await (const message of query) {
+      messages.push(message);
+      if (callsTool(message)) await query.backgroundTasks();
+    }
+    assertWellFormed(messages);
+    const [notice] = notificationsOf(messages);
+    assert.equal(notice.status, 'completed');
+    assert.equal(messages.at(-1).subtype, 'background_tasks_changed', 'the session ends with the emptied list');
+    assert.deepEqual(messages.at(-1).tasks, []);
+  });
+});
+
+describe('refusals', () => {
+  test('a refusal with no fallback model keeps the refused answer and adds the notice', async (t) => {
+    const cwd = projectDir(t);
+    const adapter = adapterAt(tempDir(t));
+    const uuid = randomUUID();
+    const messages = await runSingle(adapter, cwd, 'refusal-none please', {}, uuid);
+    const results = assertWellFormed(messages);
+    assert.equal(results[0].subtype, 'success');
+    assert.equal(results[0].stop_reason, 'refusal');
+    assert.equal(topLevelText(messages), "I can't help with that request.");
+    const notice = messages.find((m) => m.type === 'system' && m.subtype === 'model_refusal_no_fallback');
+    assert.equal(notice.refused_user_message_uuid, uuid);
+    assert.equal(notice.original_model, 'claude-opus-mock');
+    assertLinked(messages, [uuid]);
+    const stored = await adapter.getSessionMessages(messages[0].session_id, { dir: cwd });
+    assert.deepEqual(stored.map((entry) => entry.type), ['user', 'assistant'], 'the notice is not stored');
+    assert.equal(stored[1].message.stop_reason, 'refusal');
+    assert.equal(stored[1].message.content[0].text, "I can't help with that request.");
+  });
+
+  test('a refusal with a fallback model is retried, and the refused answer leaves the transcript', async (t) => {
+    const cwd = projectDir(t);
+    const adapter = adapterAt(tempDir(t));
+    const uuid = randomUUID();
+    const messages = await runSingle(adapter, cwd, 'trigger a refusal', {}, uuid);
+    const results = assertWellFormed(messages);
+    assert.equal(results[0].subtype, 'success');
+    assert.equal(results[0].stop_reason, 'end_turn');
+    const refused = messages.find((m) => m.type === 'assistant' && m.message.stop_reason === 'refusal');
+    const retry = messages.find((m) => m.type === 'assistant' && m.message.stop_reason === 'end_turn');
+    const notice = messages.find((m) => m.type === 'system' && m.subtype === 'model_refusal_fallback');
+    assert.deepEqual(retry.supersedes, [refused.uuid], 'the retry names the refused answer it replaces');
+    assert.ok(messages.indexOf(notice) > messages.indexOf(retry), 'the notice comes at the end of the turn');
+    assert.ok(messages.indexOf(notice) < messages.indexOf(results[0]));
+    assert.deepEqual(notice.retracted_message_uuids, [refused.uuid]);
+    assert.equal(notice.refused_user_message_uuid, uuid);
+    assert.equal(notice.fallback_model, 'claude-sonnet-mock');
+    assert.equal(topLevelText(messages),
+      "I can't help with that request.\nHere is the answer from the fallback model.");
+    assertLinked(messages, [uuid]);
+    const stored = await adapter.getSessionMessages(messages[0].session_id, { dir: cwd });
+    assert.deepEqual(stored.map((entry) => entry.type), ['user', 'assistant']);
+    assert.equal(stored[1].message.content[0].text, 'Here is the answer from the fallback model.');
+  });
+});
+
+describe('plugins and reloads', () => {
+  test('a reload with nothing pending applies at once, and reports held false when asked to hold', async (t) => {
+    const { query } = await openQuery(t, tempDir(t), projectDir(t));
+    const reloaded = await query.reloadPlugins({ holdOnCacheImpact: true });
+    assert.equal(reloaded.held, false);
+    assert.equal(reloaded.cache_impact, undefined);
+    assert.deepEqual(reloaded.plugins, []);
+  });
+
+  test('a plugin installed by a turn is held by a reload that would change the tools, then applied', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
+    assert.equal((await turnResult(query, channel, 'install the plugin')).subtype, 'success');
+
+    const held = await query.reloadPlugins({ holdOnCacheImpact: true });
+    assert.equal(held.held, true);
+    assert.deepEqual(held.cache_impact, {
+      mcp_servers_added: ['plugin:demo-plugin:docs'],
+      mcp_servers_removed: [],
+      lsp_tool_change: null,
+    });
+    assert.deepEqual(held.plugins, []);
+    assert.equal(held.mcpServers.some((server) => server.name === 'plugin:demo-plugin:docs'), false);
+
+    const applied = await query.reloadPlugins();
+    assert.equal(applied.held, undefined);
+    assert.deepEqual(applied.plugins.map((plugin) => plugin.name), ['demo-plugin']);
+    const server = applied.mcpServers.find((item) => item.name === 'plugin:demo-plugin:docs');
+    assert.equal(server.status, 'connected');
+
+    const again = await query.reloadPlugins({ holdOnCacheImpact: true });
+    assert.equal(again.held, false, 'nothing is pending any more');
+  });
+});
+
+describe('output style and local settings', () => {
+  test('the output style follows the local settings, and an unknown style changes nothing', async (t) => {
+    const { query } = await openQuery(t, tempDir(t), projectDir(t));
+    await query.updateSettings('localSettings', { outputStyle: 'Learning' });
+    assert.equal((await query.initializationResult()).output_style, 'Learning');
+    await assert.rejects(query.updateSettings('localSettings', { outputStyle: 'poetic' }),
+      /Unknown output style: poetic/);
+    assert.equal((await query.initializationResult()).output_style, 'Learning');
+  });
+
+  test('local settings are refused when the query leaves the local source out', async (t) => {
+    const { query } = await openQuery(t, tempDir(t), projectDir(t), { settingSources: ['user', 'project'] });
+    await assert.rejects(query.updateSettings('localSettings', { outputStyle: 'Learning' }),
+      /Local settings are not loaded for this session\./);
+    assert.equal((await query.initializationResult()).output_style, 'default');
   });
 });

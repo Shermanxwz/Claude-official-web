@@ -14,6 +14,8 @@ import { mergeLive, sessionTitle } from './sidebar-model.js';
 const PANEL_NAMES = ['session', 'capabilities', 'context', 'tasks', 'settings'];
 const LOCALES = [{ value: 'en', label: 'English' }, { value: 'zh-CN', label: '简体中文' }];
 const SESSION_PAGE = 100;
+/** How a held plugin reload may change the language server tools (cacheImpact.lspToolChange of the reload answer). */
+const LSP_TOOL_CHANGES = ['adds', 'may-add', 'removes', 'may-remove'];
 
 /** @type {{ name: string, close: () => void } | null} */
 let activeSheet = null;
@@ -416,6 +418,7 @@ function sessionPanel({ body, api, store, t, actions, close, reload }) {
         actions.openTerminal();
       }) : null,
       live && canFork ? actionButton(t('shell.session.closeLive'), 'stop', async () => {
+        if (actions.confirmEndBackground && !(await actions.confirmEndBackground(sessionId))) return;
         try {
           await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/close`, {});
         } catch (err) {
@@ -537,6 +540,10 @@ function capabilitiesPanel({ body, api, store, t, actions, reload }) {
   let skills = null;
   let loading = true;
   let failure = '';
+  /** A reload is in flight: the reload buttons wait for it. */
+  let reloading = false;
+  /** An output style change is in flight: the select waits for it. */
+  let styleBusy = false;
   const content = h('div', { class: 'caps' });
   body.appendChild(content);
 
@@ -574,14 +581,159 @@ function capabilitiesPanel({ body, api, store, t, actions, reload }) {
     }
   }
 
-  async function reloadWhat(what) {
+  /**
+   * What the controls depend on: the session's live info (for trust) and whether the viewer may only read.
+   * @param {Record<string, any>} state
+   */
+  function controlsOf(state) {
+    const live = state.live?.[sessionId] ?? null;
+    const profile = state.auth?.profile ?? state.meta?.profile ?? 'full';
+    return { live, readOnly: profile === 'read', trusted: live?.trusted === true };
+  }
+
+  /** @param {Record<string, any>} state */
+  function controlKey(state) {
+    const { live, readOnly, trusted } = controlsOf(state);
+    return `${Boolean(live)}|${trusted}|${readOnly}`;
+  }
+
+  /**
+   * Runs one reload. Skills and output styles apply at once. The runtime holds a plugin reload when applying it would
+   * change the tools the prompt cache depends on: the user is asked first, and confirming repeats the reload with force.
+   * @param {'plugins'|'skills'|'output-styles'} what
+   * @param {boolean} [force]
+   */
+  async function reloadWhat(what, force = false) {
+    reloading = true;
+    render();
     try {
-      await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/reload`, { what });
+      const answer = await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/reload`,
+        force ? { what, force: true } : { what });
+      if (answer?.held === true) {
+        reloading = false;
+        render();
+        const confirmed = await confirmDialog({
+          title: t('shell.caps.heldTitle'),
+          message: heldMessage(answer.cacheImpact),
+          confirmLabel: t('shell.caps.reloadAnyway'),
+          cancelLabel: t('common.cancel'),
+        });
+        if (confirmed) await reloadWhat('plugins', true);
+        return;
+      }
       actions.toast(t('shell.caps.reloaded'), 'success');
       await load();
     } catch (err) {
       actions.toast(errorText(err, t), 'error');
+    } finally {
+      reloading = false;
+      render();
     }
+  }
+
+  /**
+   * What a held plugin reload would change. Names come from plugins, so they are shown as text only.
+   * @param {{mcpServersAdded?: unknown, mcpServersRemoved?: unknown, lspToolChange?: unknown} | null | undefined} impact
+   * @returns {HTMLElement}
+   */
+  function heldMessage(impact) {
+    const names = (value) => (Array.isArray(value) ? value.filter((name) => typeof name === 'string') : []);
+    const added = names(impact?.mcpServersAdded);
+    const removed = names(impact?.mcpServersRemoved);
+    const lsp = typeof impact?.lspToolChange === 'string' && LSP_TOOL_CHANGES.includes(impact.lspToolChange)
+      ? impact.lspToolChange : '';
+    return h('div', { class: 'held-reload' },
+      h('p', { class: 'dialog-text', text: t('shell.caps.heldText') }),
+      added.length > 0 ? heldNames(t('shell.caps.heldAdded'), added) : null,
+      removed.length > 0 ? heldNames(t('shell.caps.heldRemoved'), removed) : null,
+      lsp ? h('p', { class: 'dialog-text', text: t(`shell.caps.lsp.${lsp}`) }) : null);
+  }
+
+  /**
+   * @param {string} label
+   * @param {string[]} items
+   */
+  function heldNames(label, items) {
+    return h('div', null,
+      h('p', { class: 'sheet-note', text: label }),
+      h('ul', { class: 'item-list' }, items.map((item) => h('li', { class: 'item mono', text: item }))));
+  }
+
+  /**
+   * Sets the output style of the live session. The select is disabled while the request runs. A refusal is a toast,
+   * and the select then shows the style still in force.
+   * @param {string} style
+   */
+  async function changeStyle(style) {
+    if (!caps || !style || styleBusy) return;
+    styleBusy = true;
+    render();
+    try {
+      const result = await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/output-style`, { style });
+      const applied = typeof result?.outputStyle === 'string' ? result.outputStyle : style;
+      setCaps({
+        ...caps,
+        outputStyle: applied,
+        availableOutputStyles: Array.isArray(result?.availableOutputStyles)
+          ? result.availableOutputStyles
+          : caps.availableOutputStyles,
+      });
+      actions.toast(t('shell.caps.styleSet', { style: applied }), 'success');
+    } catch (err) {
+      actions.toast(errorText(err, t), 'error');
+    } finally {
+      styleBusy = false;
+      render();
+    }
+  }
+
+  /**
+   * The output style select. Changing the style needs a live session in a trusted folder; otherwise the select is
+   * disabled and a note says what to do.
+   * @param {string[]} styles
+   * @returns {HTMLElement}
+   */
+  function styleControl(styles) {
+    const { live, readOnly, trusted } = controlsOf(store.get());
+    const current = typeof caps?.outputStyle === 'string' ? caps.outputStyle : '';
+    const offered = styles.filter((style) => typeof style === 'string' && style !== '');
+    const options = [];
+    if (current === '') options.push(h('option', { attrs: { value: '' }, text: t('shell.caps.styleUnset') }));
+    else if (!offered.includes(current)) options.push(h('option', { attrs: { value: current }, text: current }));
+    for (const style of offered) options.push(h('option', { attrs: { value: style }, text: style }));
+    const select = h('select', {
+      class: 'select',
+      attrs: { 'aria-label': t('shell.caps.outputStyle') },
+      on: { change: (event) => changeStyle(/** @type {HTMLSelectElement} */ (event.target).value) },
+    }, options);
+    select.value = current;
+    select.disabled = !live || !trusted || readOnly || styleBusy || offered.length === 0;
+    let reason = '';
+    if (readOnly) reason = t('shell.caps.readOnly');
+    else if (!live) reason = t('shell.caps.styleOpen');
+    else if (!trusted) reason = t('shell.caps.styleTrust');
+    else if (offered.length === 0) reason = t('shell.caps.noStyles');
+    return h('div', { class: 'sheet-inline' }, select, reason ? note(reason) : null);
+  }
+
+  /** The reload buttons. They need a live session the viewer may act on, and wait while a reload runs. */
+  function reloadSection() {
+    const { live, readOnly } = controlsOf(store.get());
+    const enabled = Boolean(live) && !readOnly && !reloading;
+    let reason = '';
+    if (readOnly) reason = t('shell.caps.readOnly');
+    else if (!live) reason = t('shell.caps.openToReload');
+    const targets = [['plugins', 'shell.caps.reloadPlugins'], ['skills', 'shell.caps.reloadSkills'],
+      ['output-styles', 'shell.caps.reloadStyles']];
+    const buttons = targets.map(([what, labelKey]) => h('button', {
+      class: 'btn btn-secondary btn-sm',
+      attrs: { type: 'button' },
+      disabled: !enabled,
+      on: { click: () => reloadWhat(what) },
+    }, icon('refresh'), h('span', { text: t(labelKey) })));
+    return section(t('shell.caps.reload'),
+      reason ? note(reason) : null,
+      h('div', { class: 'sheet-inline' }, buttons));
   }
 
   function mcpList(servers) {
@@ -642,9 +794,7 @@ function capabilitiesPanel({ body, api, store, t, actions, reload }) {
     const styles = Array.isArray(caps.availableOutputStyles) ? caps.availableOutputStyles : [];
     content.append(
       section(t('shell.caps.account'), accountRows(caps.account)),
-      section(t('shell.caps.outputStyle'),
-        kvRow(t('shell.caps.current'), caps.outputStyle ?? null),
-        styles.length > 0 ? h('div', { class: 'chip-row' }, styles.map((style) => statusChip(style, 'muted'))) : null),
+      section(t('shell.caps.outputStyle'), styleControl(styles)),
       section(t('shell.caps.mcp'), mcpList(caps.mcpServers ?? [])),
       section(t('shell.caps.agents'), listOrNote(caps.agents ?? [], t('shell.caps.noAgents'), (agent) =>
         h('li', { class: 'item' },
@@ -663,23 +813,19 @@ function capabilitiesPanel({ body, api, store, t, actions, reload }) {
         : skills.length === 0
           ? note(t('shell.caps.noSkills'))
           : h('div', { class: 'chip-row' }, skills.map((skill) => statusChip(String(skill), 'accent')))),
-      section(t('shell.caps.reload'),
-        h('div', { class: 'sheet-inline' },
-          h('button', {
-            class: 'btn btn-secondary btn-sm',
-            attrs: { type: 'button' },
-            on: { click: () => reloadWhat('plugins') },
-          }, icon('refresh'), h('span', { text: t('shell.caps.reloadPlugins') })),
-          h('button', {
-            class: 'btn btn-secondary btn-sm',
-            attrs: { type: 'button' },
-            on: { click: () => reloadWhat('skills') },
-          }, icon('refresh'), h('span', { text: t('shell.caps.reloadSkills') })))),
+      reloadSection(),
     );
   }
 
   const unsubscribe = store.subscribe((state, prev) => {
-    if (state.currentSessionId !== prev.currentSessionId) reload();
+    if (state.currentSessionId !== prev.currentSessionId) {
+      reload();
+      return;
+    }
+    if (controlKey(state) === controlKey(prev)) return;
+    // Going live loads the capabilities of the live session; any other change only moves the controls.
+    if (controlsOf(state).live && !controlsOf(prev).live) load();
+    else render();
   });
 
   render();

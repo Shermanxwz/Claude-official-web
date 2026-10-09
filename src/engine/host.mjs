@@ -21,6 +21,7 @@ import { engineEnv } from './env.mjs';
 /** @typedef {import('../contracts.mjs').LiveEvent} LiveEvent */
 /** @typedef {import('../contracts.mjs').PendingRequest} PendingRequest */
 /** @typedef {import('../contracts.mjs').SessionSettings} SessionSettings */
+/** @typedef {import('../contracts.mjs').ReloadResult} ReloadResult */
 /** @typedef {import('../contracts.mjs').SessionSummary} SessionSummary */
 /** @typedef {import('../contracts.mjs').SessionDetail} SessionDetail */
 /** @typedef {import('../contracts.mjs').Capabilities} Capabilities */
@@ -65,6 +66,15 @@ const MODEL_RE = /^[\x21-\x7e]{1,200}$/;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const ENGINE_UNAVAILABLE_RE = /spawn|ENOENT|not found|Native CLI binary|log ?in|authenticat|api key|credential/i;
 const CONTROL_TIMEOUT_MS = 10_000;
+/** The settings lookup that decides the thinking-summary overlay gives up after this long and adds the overlay. */
+const SETTINGS_LOOKUP_MS = 2000;
+const RELOAD_TARGETS = ['plugins', 'skills', 'output-styles'];
+const LSP_TOOL_CHANGES = ['adds', 'may-add', 'removes', 'may-remove'];
+const FAST_MODE_STATES = ['off', 'cooldown', 'on'];
+const CACHE_IMPACT_MAX = 50;
+const CACHE_IMPACT_NAME_MAX = 200;
+const OUTPUT_STYLE_MAX = 100;
+const BACKGROUND_DISABLED_MESSAGE = 'Background tasks are disabled for this runtime.';
 const TIMEOUT_MESSAGE = 'The Claude Code runtime did not respond in time.';
 const CREDENTIALS_MESSAGE = 'Claude Code credentials were rejected. Log in again on the server: run `claude` and use '
   + '/login.';
@@ -96,6 +106,10 @@ const AUTH_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_
  * @property {string|null} published   last published LiveInfo, without lastActivity
  * @property {boolean} trusted      project settings, hooks and MCP servers of cwd are loaded by this query
  * @property {boolean} credentialsRejected   the runtime rejected its credentials; the notice was published
+ * @property {boolean|null} fastMode   fast mode requested for the session; null = the settings decide
+ * @property {import('../contracts.mjs').FastModeState|null} fastModeState   last state the runtime reported
+ * @property {string|null} fastModeDisabledReason   reason from the same report, null when nothing blocks it
+ * @property {number} backgroundTasks   live non-ambient background tasks of this query
  */
 
 /** @param {unknown} value @returns {value is Record<string, unknown>} */
@@ -210,6 +224,20 @@ function parseToken(value, label) {
 }
 
 /**
+ * An output style name: a string of 1 to OUTPUT_STYLE_MAX characters once trimmed.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function parseOutputStyle(value) {
+  if (typeof value !== 'string') throw badRequest('The output style must be a string.');
+  const text = value.trim();
+  if (text === '' || text.length > OUTPUT_STYLE_MAX) {
+    throw badRequest(`The output style must be 1 to ${OUTPUT_STYLE_MAX} characters.`);
+  }
+  return text;
+}
+
+/**
  * @param {unknown} action
  * @returns {{kind: 'toggle'|'reconnect', enabled: boolean}}
  */
@@ -253,6 +281,16 @@ function parseEffort(value) {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {boolean|null}
+ */
+function parseFastMode(value) {
+  if (value === null) return null;
+  if (typeof value === 'boolean') return value;
+  throw invalid('The fast mode must be true, false or null.');
+}
+
+/**
  * Validates the settings a caller supplied. Only keys that are present in the input are returned.
  * @param {unknown} input
  * @returns {SessionSettings}
@@ -265,6 +303,7 @@ function parseSettings(input) {
   if (input.model !== undefined) settings.model = parseModel(input.model);
   if (input.permissionMode !== undefined) settings.permissionMode = parsePermissionMode(input.permissionMode);
   if (input.effort !== undefined) settings.effort = parseEffort(input.effort);
+  if (input.fastMode !== undefined) settings.fastMode = parseFastMode(input.fastMode);
   return settings;
 }
 
@@ -418,6 +457,58 @@ function isCredentialFailure(msg) {
 function omitUndefined(object) {
   const defined = Object.entries(object).filter(([, value]) => value !== undefined);
   return /** @type {Partial<T>} */ (Object.fromEntries(defined));
+}
+
+/**
+ * Names a runtime reports for a held reload. Plugin-authored, so only strings are kept, at most
+ * CACHE_IMPACT_MAX of them and each cut to CACHE_IMPACT_NAME_MAX characters.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function namesOf(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((name) => typeof name === 'string')
+    .slice(0, CACHE_IMPACT_MAX)
+    .map((name) => name.slice(0, CACHE_IMPACT_NAME_MAX));
+}
+
+/**
+ * What applying a held plugin reload would change in the tool list, in the gateway's shape.
+ * @param {unknown} impact the cache_impact of the runtime answer
+ * @returns {{mcpServersAdded: string[], mcpServersRemoved: string[],
+ *   lspToolChange: 'adds'|'may-add'|'removes'|'may-remove'|null}}
+ */
+function cacheImpactOf(impact) {
+  const source = isPlainObject(impact) ? impact : {};
+  const lsp = source.lsp_tool_change;
+  return {
+    mcpServersAdded: namesOf(source.mcp_servers_added),
+    mcpServersRemoved: namesOf(source.mcp_servers_removed),
+    lspToolChange: includes(LSP_TOOL_CHANGES, lsp)
+      ? /** @type {'adds'|'may-add'|'removes'|'may-remove'} */ (lsp)
+      : null,
+  };
+}
+
+/**
+ * The output style names a runtime reports that a client can also select: non-blank strings within the length that
+ * `POST /output-style` accepts.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function outputStylesOf(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((name) => typeof name === 'string' && name.trim() !== '' && name.length <= OUTPUT_STYLE_MAX);
+}
+
+/**
+ * The filesystem settings sources a query loads: folders the owner trusted load their project and local settings too.
+ * @param {boolean} trusted
+ * @returns {Array<'user'|'project'|'local'>}
+ */
+function settingSourcesOf(trusted) {
+  return trusted ? ['user', 'project', 'local'] : ['user'];
 }
 
 /** @param {Array<{lastModified: number}>} sessions */
@@ -710,7 +801,7 @@ export class EngineHost {
       account: init.account ?? null,
       mcpServers,
       outputStyle: init.output_style ?? null,
-      availableOutputStyles: init.available_output_styles ?? [],
+      availableOutputStyles: outputStylesOf(init.available_output_styles),
     };
     if (this.#live.get(live.sessionId) === live) live.capsCache = { at: this.#now(), value };
     this.#rememberCapabilities(live.cwd, value);
@@ -788,6 +879,10 @@ export class EngineHost {
       claudeCodeVersion: live.claudeCodeVersion,
       error: live.error,
       trusted: live.trusted,
+      fastMode: live.fastMode,
+      fastModeState: live.fastModeState,
+      fastModeDisabledReason: live.fastModeDisabledReason,
+      backgroundTasks: live.backgroundTasks,
     };
   }
 
@@ -1009,13 +1104,16 @@ export class EngineHost {
    * trust. A session that is already open is refused, so two queries never share one id.
    * @param {{mode: 'new'|'resume', sessionId: string|null, cwd: string, trusted: boolean, title?: string,
    *   settings: SessionSettings, resumeSessionAt?: string}} start
-   * @returns {LiveRecord}
+   * @returns {Promise<LiveRecord>}
    */
-  #startQuery({ mode, sessionId, cwd, trusted, title, settings, resumeSessionAt }) {
-    if (this.#stopped) throw new AppError(503, 'ENGINE_UNAVAILABLE', 'The gateway is shutting down.');
+  async #startQuery({ mode, sessionId, cwd, trusted, title, settings, resumeSessionAt }) {
     const id = mode === 'new' ? randomUUID() : /** @type {string} */ (sessionId);
-    if (this.#live.has(id)) throw new AppError(409, 'CONFLICT', 'The session is already open.');
+    this.#assertStartable(id);
     const resolved = this.#resolveSettings(mode === 'new' ? null : id, settings);
+    // The settings the query will load are read before the query exists. Nothing is registered until the answer is in,
+    // and the start is checked again afterwards, because a shutdown or a start of the same id may have run meanwhile.
+    const summaries = await this.#wantsThinkingSummaries(id, cwd, trusted === true);
+    this.#assertStartable(id);
     this.#makeRoom();
     /** @type {LiveRecord} */
     const live = {
@@ -1041,8 +1139,12 @@ export class EngineHost {
       published: null,
       trusted: trusted === true,
       credentialsRejected: false,
+      fastMode: resolved.fastMode,
+      fastModeState: null,
+      fastModeDisabledReason: null,
+      backgroundTasks: 0,
     };
-    const options = this.#queryOptions(live, mode, resumeSessionAt);
+    const options = this.#queryOptions(live, mode, resumeSessionAt, summaries);
     try {
       live.query = this.#engine.query({ prompt: live.input, options });
     } catch (error) {
@@ -1060,13 +1162,50 @@ export class EngineHost {
   }
 
   /**
+   * Refuses a start of a session that is shutting down or already open. Checked before and after every wait.
+   * @param {string} id
+   */
+  #assertStartable(id) {
+    if (this.#stopped) throw new AppError(503, 'ENGINE_UNAVAILABLE', 'The gateway is shutting down.');
+    if (this.#live.has(id)) throw new AppError(409, 'CONFLICT', 'The session is already open.');
+  }
+
+  /**
+   * Whether the query asks for thinking summaries. Claude Code reads the showThinkingSummaries setting only in its
+   * interactive terminal; a non-interactive session (every SDK query) sends thinking without text unless the display is
+   * given explicitly, so the gateway passes `--thinking-display summarized` to show what the terminal shows. A setting
+   * that turns summaries off (`showThinkingSummaries: false` in any file the query loads) is honored. A failed or slow
+   * lookup asks for them; the failure is logged without any content.
+   * @param {string} sessionId
+   * @param {string} cwd
+   * @param {boolean} trusted
+   * @returns {Promise<boolean>}
+   */
+  async #wantsThinkingSummaries(sessionId, cwd, trusted) {
+    try {
+      const resolved = await withTimeout(
+        () => this.#engine.resolveSettings({ cwd, settingSources: settingSourcesOf(trusted) }),
+        SETTINGS_LOOKUP_MS,
+      );
+      return resolved.effective?.showThinkingSummaries !== false;
+    } catch (error) {
+      this.#log.debug('settings lookup failed; thinking summaries requested', {
+        sessionId,
+        reason: errorName(error),
+      });
+      return true;
+    }
+  }
+
+  /**
    * Options of one query. Keys that do not apply are omitted instead of being set to undefined.
    * @param {LiveRecord} live
    * @param {'new'|'resume'} mode
    * @param {string|undefined} resumeSessionAt
+   * @param {boolean} summaries the query asks for thinking summaries (see #wantsThinkingSummaries)
    * @returns {SdkOptions}
    */
-  #queryOptions(live, mode, resumeSessionAt) {
+  #queryOptions(live, mode, resumeSessionAt, summaries) {
     const { claudeBin, allowBypass, version } = this.#config;
     return {
       cwd: live.cwd,
@@ -1080,12 +1219,17 @@ export class EngineHost {
       allowDangerouslySkipPermissions: allowBypass,
       systemPrompt: { type: 'preset', preset: 'claude_code' },
       tools: { type: 'preset', preset: 'claude_code' },
-      settingSources: live.trusted ? ['user', 'project', 'local'] : ['user'],
+      settingSources: settingSourcesOf(live.trusted),
       includePartialMessages: true,
       includeHookEvents: true,
       promptSuggestions: true,
       agentProgressSummaries: true,
       enableFileCheckpointing: true,
+      perTaskStopAffordance: true,
+      // The terminal's --thinking-display flag. The `thinking` option would also force the thinking type, which the
+      // runtime otherwise derives from the model and the user's settings.
+      ...(summaries ? { extraArgs: { 'thinking-display': 'summarized' } } : {}),
+      ...(typeof live.fastMode === 'boolean' ? { settings: { fastMode: live.fastMode } } : {}),
       toolConfig: { askUserQuestion: { previewFormat: 'markdown' } },
       canUseTool: this.#canUseTool(live),
       onElicitation: this.#onElicitation(live),
@@ -1099,12 +1243,12 @@ export class EngineHost {
    * Explicit arguments win over the settings remembered for the session, which win over the configured defaults.
    * @param {string|null} sessionId
    * @param {SessionSettings} args
-   * @returns {{model: string|null, permissionMode: PermissionMode, effort: EffortLevel|null}}
+   * @returns {{model: string|null, permissionMode: PermissionMode, effort: EffortLevel|null, fastMode: boolean|null}}
    */
   #resolveSettings(sessionId, args) {
     const remembered = sessionId === null ? {} : this.#pending.get(sessionId) ?? {};
     const { defaults } = this.#config;
-    /** @param {'model'|'permissionMode'|'effort'} key @param {unknown} fallback */
+    /** @param {'model'|'permissionMode'|'effort'|'fastMode'} key @param {unknown} fallback */
     const pick = (key, fallback) => {
       if (args[key] !== undefined) return args[key];
       if (remembered[key] !== undefined) return remembered[key];
@@ -1114,6 +1258,7 @@ export class EngineHost {
       model: /** @type {string|null} */ (pick('model', defaults.model)),
       permissionMode: /** @type {PermissionMode} */ (pick('permissionMode', defaults.permissionMode)),
       effort: /** @type {EffortLevel|null} */ (pick('effort', defaults.effort)),
+      fastMode: /** @type {boolean|null} */ (pick('fastMode', null)),
     };
     this.#assertBypassAllowed(resolved.permissionMode);
     return resolved;
@@ -1151,7 +1296,7 @@ export class EngineHost {
     let victim = null;
     for (const live of this.#live.values()) {
       if (live.state !== 'idle' || this.#requests.count(live.sessionId) > 0) continue;
-      if (this.#opening.has(live.sessionId)) continue;
+      if (live.backgroundTasks > 0 || this.#opening.has(live.sessionId)) continue;
       if (victim === null || live.lastActivity < victim.lastActivity) victim = live;
     }
     if (victim === null) {
@@ -1282,6 +1427,7 @@ export class EngineHost {
         return;
       case 'result':
         if (!live.closing && this.#requests.count(live.sessionId) === 0) live.state = 'idle';
+        this.#applyFastModeReport(live, msg);
         // A finished turn changes the session file (first prompt, summary, modification time); let every client
         // refresh its session list, which is how a brand-new untitled session gets its summary in the sidebar.
         this.#publish({ type: 'sessions_changed', data: { reason: 'activity', sessionId: live.sessionId } });
@@ -1294,6 +1440,20 @@ export class EngineHost {
       default:
         return;
     }
+  }
+
+  /**
+   * Keeps the fast mode state the runtime reports with an init or a result message. A message without a known state
+   * changes nothing; the reason is taken from the same message and is null when it has none.
+   * @param {LiveRecord} live
+   * @param {{fast_mode_state?: unknown, fast_mode_disabled_reason?: unknown}} msg
+   */
+  #applyFastModeReport(live, msg) {
+    if (!includes(FAST_MODE_STATES, msg.fast_mode_state)) return;
+    live.fastModeState = /** @type {import('../contracts.mjs').FastModeState} */ (msg.fast_mode_state);
+    live.fastModeDisabledReason = typeof msg.fast_mode_disabled_reason === 'string'
+      ? msg.fast_mode_disabled_reason
+      : null;
   }
 
   /**
@@ -1330,6 +1490,13 @@ export class EngineHost {
         live.claudeCodeVersion = msg.claude_code_version;
         if (msg.claude_code_version) this.#lastClaudeCodeVersion = msg.claude_code_version;
         if (live.state === 'starting') live.state = 'idle';
+        this.#applyFastModeReport(live, msg);
+        return;
+      case 'background_tasks_changed':
+        // The set replaces the previous one; ambient tasks (watchers, skip-transcript work) are not activity. A message
+        // without a task list changes nothing.
+        if (!Array.isArray(msg.tasks)) return;
+        live.backgroundTasks = msg.tasks.filter((task) => isPlainObject(task) && task.ambient !== true).length;
         return;
       case 'session_state_changed':
         if (!live.closing) {
@@ -1362,6 +1529,8 @@ export class EngineHost {
     const current = this.#live.get(live.sessionId) === live;
     if (current) this.#live.delete(live.sessionId);
     live.state = 'closing';
+    // A query that has ended reports no background tasks, so nothing keeps its session from being closed.
+    live.backgroundTasks = 0;
     // Ending the input lets sendMessage see that a query which ended by itself no longer takes messages.
     live.input.end();
     // A query that was replaced has already cancelled its requests; the session id may belong to the new query now.
@@ -1643,13 +1812,13 @@ export class EngineHost {
    * @param {{cwd: string, title?: string} & SessionSettings} options
    * @returns {Promise<LiveInfo>}
    */
-  async createSession({ cwd, title, model, permissionMode, effort }) {
+  async createSession({ cwd, title, model, permissionMode, effort, fastMode }) {
     if (typeof cwd !== 'string' || cwd === '') throw badRequest('The cwd must be a path.');
-    const settings = parseSettings({ model, permissionMode, effort });
+    const settings = parseSettings({ model, permissionMode, effort, fastMode });
     const titleText = title === undefined ? '' : parseText(title, 'title', TITLE_MAX);
     if (!(await this.#withinRoots(cwd))) throw outsideRoots();
     const trusted = await this.#trustOf(cwd);
-    const live = this.#startQuery({
+    const live = await this.#startQuery({
       mode: 'new',
       sessionId: null,
       cwd,
@@ -1787,6 +1956,14 @@ export class EngineHost {
       this.#remember(sessionId, { effort });
       this.#sync(live);
     }
+    if (parsed.fastMode !== undefined) {
+      const fastMode = parsed.fastMode;
+      await this.#control(sessionId, () => live.query.applyFlagSettings({ fastMode }),
+        'The fast mode could not be changed.');
+      live.fastMode = fastMode;
+      this.#remember(sessionId, { fastMode });
+      this.#sync(live);
+    }
     return this.#info(live);
   }
 
@@ -1836,18 +2013,65 @@ export class EngineHost {
   }
 
   /**
-   * Reloads plugins or skills of a live session.
+   * Reloads plugins, skills or output styles of a live session, as the terminal's reload commands do. Plugins are held
+   * when applying them would change the tool list the prompt cache depends on, unless `force` is set.
    * @param {string} sessionId
-   * @param {'plugins'|'skills'} what
+   * @param {'plugins'|'skills'|'output-styles'} what
+   * @param {{force?: boolean}} [options]
+   * @returns {Promise<ReloadResult>}
    */
-  async reload(sessionId, what) {
+  async reload(sessionId, what, { force } = {}) {
     requireSessionId(sessionId);
-    if (what !== 'plugins' && what !== 'skills') throw invalid('The reload target must be plugins or skills.');
+    if (!includes(RELOAD_TARGETS, what)) throw invalid('The reload target must be plugins, skills or output-styles.');
+    if (force !== undefined && (typeof force !== 'boolean' || what !== 'plugins')) {
+      throw badRequest('force is a boolean and applies to plugins only.');
+    }
     const live = await this.#requireLive(sessionId);
-    /** @type {() => Promise<unknown>} */
-    const reload = () => (what === 'plugins' ? live.query.reloadPlugins() : live.query.reloadSkills());
-    await this.#control(sessionId, reload, 'The session could not be reloaded.');
+    if (what === 'plugins') return this.#reloadPlugins(live, force === true);
+    if (what === 'output-styles') return this.#reloadOutputStyles(live);
+    await this.#control(sessionId, () => live.query.reloadSkills(), 'The session could not be reloaded.');
     live.capsCache = null;
+    return { ok: true };
+  }
+
+  /**
+   * @param {LiveRecord} live
+   * @param {boolean} force
+   * @returns {Promise<ReloadResult>}
+   */
+  async #reloadPlugins(live, force) {
+    const answer = await this.#control(live.sessionId,
+      () => (force ? live.query.reloadPlugins() : live.query.reloadPlugins({ holdOnCacheImpact: true })),
+      'The session could not be reloaded.');
+    if (answer?.held === true) {
+      // Nothing was applied, so the capabilities the session reports are still right and stay cached.
+      return { ok: false, held: true, cacheImpact: cacheImpactOf(answer.cache_impact) };
+    }
+    live.capsCache = null;
+    return { ok: true };
+  }
+
+  /**
+   * @param {LiveRecord} live
+   * @returns {Promise<ReloadResult>}
+   */
+  async #reloadOutputStyles(live) {
+    const answer = await this.#control(live.sessionId, () => live.query.reloadOutputStyles(),
+      'The output styles could not be reloaded.');
+    const availableOutputStyles = outputStylesOf(answer?.available_output_styles);
+    live.capsCache = null;
+    this.#patchRemembered(live.cwd, { availableOutputStyles });
+    return { ok: true, availableOutputStyles };
+  }
+
+  /**
+   * Applies a change to the capabilities last known for a folder, when there are any.
+   * @param {string} cwd
+   * @param {Partial<Capabilities>} patch
+   */
+  #patchRemembered(cwd, patch) {
+    const remembered = this.#capsByCwd.get(cwd);
+    if (remembered) this.#capsByCwd.set(cwd, { ...remembered, ...patch });
   }
 
   /**
@@ -1959,7 +2183,12 @@ export class EngineHost {
     let settings = {};
     if (previous) {
       cwd = previous.cwd;
-      settings = { model: previous.model, permissionMode: previous.permissionMode, effort: previous.effort };
+      settings = {
+        model: previous.model,
+        permissionMode: previous.permissionMode,
+        effort: previous.effort,
+        fastMode: previous.fastMode,
+      };
       await this.#detach(previous, { publish: false });
     } else {
       const { info } = await this.#scopeOf(sessionId);
@@ -1968,7 +2197,7 @@ export class EngineHost {
     this.#assertNotLocked(sessionId);
     const trusted = await this.#trustOf(cwd);
     this.#assertNotLocked(sessionId);
-    this.#startQuery({ mode: 'resume', sessionId, cwd, trusted, settings, resumeSessionAt: resumeAt });
+    await this.#startQuery({ mode: 'resume', sessionId, cwd, trusted, settings, resumeSessionAt: resumeAt });
   }
 
   /**
@@ -2061,6 +2290,55 @@ export class EngineHost {
     await this.#control(sessionId, () => live.query.stopTask(id), 'The task could not be stopped.');
   }
 
+  /**
+   * Moves the foreground Bash command or subagent that one tool call started to the background, or every foreground
+   * task without an id: the terminal's Ctrl+B. The blocked tool call returns at once and the turn goes on.
+   * @param {string} sessionId
+   * @param {string} [toolUseId]
+   * @returns {Promise<{backgrounded: boolean}>}
+   */
+  async backgroundTasks(sessionId, toolUseId) {
+    requireSessionId(sessionId);
+    const id = toolUseId === undefined ? undefined : parseToken(toolUseId, 'The tool use id');
+    this.#assertNotLocked(sessionId);
+    const live = await this.#requireLive(sessionId);
+    if (this.#config.backgroundTasksDisabled) {
+      throw new AppError(501, 'FEATURE_DISABLED', BACKGROUND_DISABLED_MESSAGE);
+    }
+    const backgrounded = await this.#control(sessionId, () => live.query.backgroundTasks(id),
+      'The tasks could not be moved to the background.');
+    return { backgrounded: backgrounded === true };
+  }
+
+  /**
+   * Changes the output style of a live session through the runtime's own settings writer (the terminal's /config):
+   * the project's local settings, which the runtime loads only for a trusted folder.
+   * @param {string} sessionId
+   * @param {string} style
+   * @returns {Promise<{outputStyle: string, availableOutputStyles: string[]}>}
+   */
+  async setOutputStyle(sessionId, style) {
+    requireSessionId(sessionId);
+    const name = parseOutputStyle(style);
+    this.#assertNotLocked(sessionId);
+    const live = await this.#requireLive(sessionId);
+    if (!live.trusted) throw new AppError(409, 'CONFLICT', 'Trust this folder to change its output style.');
+    const capabilities = await this.#liveCapabilities(live);
+    // Capabilities the runtime did not answer for are the last known ones; a style check against them would blame the
+    // client for the runtime's silence.
+    if (capabilities.stale) throw engineError('The output styles could not be read.');
+    if (!capabilities.availableOutputStyles.includes(name)) {
+      throw invalid('The output style is not one of the styles this session offers.');
+    }
+    await this.#control(sessionId, () => live.query.updateSettings('localSettings', { outputStyle: name }),
+      'The output style could not be changed.');
+    if (live.capsCache) {
+      live.capsCache = { ...live.capsCache, value: { ...live.capsCache.value, outputStyle: name } };
+    }
+    this.#patchRemembered(live.cwd, { outputStyle: name });
+    return { outputStyle: name, availableOutputStyles: [...capabilities.availableOutputStyles] };
+  }
+
   /** @param {string} sessionId @returns {Promise<string[]>} */
   async listSubagents(sessionId) {
     requireSessionId(sessionId);
@@ -2122,6 +2400,7 @@ export class EngineHost {
     if (outside > 0) this.#log.info('closed sessions outside the roots', { count: outside });
     const idle = [...this.#live.values()].filter((live) => live.state === 'idle'
       && this.#requests.count(live.sessionId) === 0
+      && live.backgroundTasks === 0
       && !this.#opening.has(live.sessionId)
       && now - live.lastActivity > timeout);
     await Promise.all(idle.map((live) => this.#detach(live, { publish: true })));

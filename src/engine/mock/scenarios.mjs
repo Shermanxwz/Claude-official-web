@@ -79,6 +79,12 @@ export class ScenarioFailure extends Error {
  */
 
 /**
+ * A foreground command or agent registered by foregroundTask. `moved` resolves with the task it became once a
+ * backgroundTasks call moves it.
+ * @typedef {{toolUseId: string, description: string, moved: Promise<{taskId: string}>}} ForegroundTask
+ */
+
+/**
  * @typedef {Object} TurnContext
  * @property {string} sessionId
  * @property {string} cwd
@@ -89,9 +95,14 @@ export class ScenarioFailure extends Error {
  * @property {number} delayMs
  * @property {boolean} streamPartials        whether text is streamed as stream_event messages
  * @property {number} turnIndex              zero-based turn number inside the session
- * @property {(kind: 'message'|'tool'|'agent'|'hook') => string} nextId
+ * @property {(kind: 'message'|'tool'|'agent'|'hook'|'task') => string} nextId
  * @property {() => {uuid: `${string}-${string}-${string}-${string}-${string}`, session_id: string}} envelope
  * @property {() => number} now
+ * @property {boolean} thinkingSummaries     the query was started with --thinking-display summarized
+ * @property {(toolUseId: string, description: string) => ForegroundTask} foregroundTask   registers a command that a
+ *   backgroundTasks call may move; call it before the tool call is streamed
+ * @property {(task: ForegroundTask) => AsyncGenerator<SDKMessage, {taskId: string}|null, unknown>} awaitBackground
+ *   waits until the command is moved to the background (`{taskId}`) or the wait ends (`null`)
  * @property {(ms: number) => AsyncGenerator<SDKMessage, void, unknown>} pause
  * @property {(toolName: string, input: Record<string, unknown>, detail: PermissionDetail) =>
  *   AsyncGenerator<SDKMessage, PermissionOutcome, unknown>} askPermission
@@ -108,13 +119,16 @@ export class ScenarioFailure extends Error {
  */
 
 /**
- * One block of a model response.
+ * One block of a model response. A thinking block carries its text (empty when the runtime omits summaries) and the
+ * signature the runtime attaches to it.
  * @typedef {{type: 'text', text: string, chunks?: string[]} |
+ *   {type: 'thinking', text: string, signature: string} |
  *   {type: 'tool_use', id: string, name: string, input: Record<string, unknown>}} ResponseBlock
  */
 
 /**
- * @typedef {{name: string, matches: (text: string) => boolean, run: (ctx: TurnContext) => AsyncGenerator<SDKMessage, void, unknown>}} Scenario
+ * @typedef {{name: string, matches: (text: string) => boolean,
+ *   run: (ctx: TurnContext) => AsyncGenerator<SDKMessage, void, unknown>}} Scenario
  */
 
 /**
@@ -444,7 +458,9 @@ export function permissionDenied(ctx, { toolName, toolUseId, message, reason }) 
  *   parentToolUseId?: string|null, agentId?: string|null}} args
  * @returns {SDKUserMessage}
  */
-export function toolResult(ctx, { toolUseId, content, isError = false, toolUseResult, parentToolUseId = null, agentId = null }) {
+export function toolResult(ctx, {
+  toolUseId, content, isError = false, toolUseResult, parentToolUseId = null, agentId = null,
+}) {
   /** @type {Extract<UserContentBlock, {type: 'tool_result'}>} */
   const block = { type: 'tool_result', tool_use_id: toolUseId, content, ...(isError ? { is_error: true } : {}) };
   return {
@@ -545,7 +561,10 @@ export function informational(ctx, content, level) {
  * @returns {import('@anthropic-ai/claude-agent-sdk').SDKHookStartedMessage}
  */
 export function hookStarted(ctx, { hookId, hookName, hookEvent }) {
-  return { type: 'system', subtype: 'hook_started', hook_id: hookId, hook_name: hookName, hook_event: hookEvent, ...ctx.envelope() };
+  return {
+    type: 'system', subtype: 'hook_started', hook_id: hookId, hook_name: hookName, hook_event: hookEvent,
+    ...ctx.envelope(),
+  };
 }
 
 /**
@@ -631,7 +650,7 @@ export function taskProgress(ctx, progress) {
 /**
  * @param {SessionView} ctx
  * @param {{taskId: string, toolUseId: string, summary: string, totalTokens: number, toolUses: number,
- *   durationMs: number, status?: 'completed'|'stopped'}} task
+ *   durationMs: number, status?: 'completed'|'stopped', outputFile?: string}} task
  * @returns {import('@anthropic-ai/claude-agent-sdk').SDKTaskNotificationMessage}
  */
 export function taskNotification(ctx, task) {
@@ -641,9 +660,113 @@ export function taskNotification(ctx, task) {
     task_id: task.taskId,
     tool_use_id: task.toolUseId,
     status: task.status ?? 'completed',
-    output_file: '',
+    output_file: task.outputFile ?? '',
     summary: task.summary,
     usage: { total_tokens: task.totalTokens, tool_uses: task.toolUses, duration_ms: task.durationMs },
+    ...ctx.envelope(),
+  };
+}
+
+/** How long a foreground command waits to be moved to the background before it finishes on its own. */
+export const BACKGROUND_WAIT_MS = 20000;
+/** How long a backgrounded command runs in the mock before it reports its completion. */
+export const BACKGROUND_RUN_MS = 1500;
+
+/**
+ * The file a backgrounded command writes its output to.
+ * @param {string} taskId
+ * @returns {string}
+ */
+export function outputFileOf(taskId) {
+  return `/tmp/mock-tasks/${taskId}.output`;
+}
+
+/**
+ * A foreground Bash command that was moved to the background: its task starts in the background.
+ * @param {SessionView} ctx
+ * @param {{taskId: string, toolUseId: string, description: string}} task
+ * @returns {import('@anthropic-ai/claude-agent-sdk').SDKTaskStartedMessage}
+ */
+export function bashTaskStarted(ctx, { taskId, toolUseId, description }) {
+  return {
+    type: 'system',
+    subtype: 'task_started',
+    task_id: taskId,
+    tool_use_id: toolUseId,
+    description,
+    task_type: 'local_bash',
+    is_backgrounded: true,
+    ...ctx.envelope(),
+  };
+}
+
+/**
+ * The full set of live background tasks after a change. Replace semantics: the set is the whole list.
+ * @param {SessionView} ctx
+ * @param {Array<{taskId: string, description: string}>} tasks
+ * @returns {import('@anthropic-ai/claude-agent-sdk').SDKBackgroundTasksChangedMessage}
+ */
+export function backgroundTasksChanged(ctx, tasks) {
+  return {
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: tasks.map((task) => ({ task_id: task.taskId, task_type: 'local_bash', description: task.description })),
+    ...ctx.envelope(),
+  };
+}
+
+/**
+ * The refusal of the primary model when no fallback model is configured.
+ * @param {TurnContext} ctx
+ * @returns {import('@anthropic-ai/claude-agent-sdk').SDKModelRefusalNoFallbackMessage}
+ */
+export function modelRefusalNoFallback(ctx) {
+  return {
+    type: 'system',
+    subtype: 'model_refusal_no_fallback',
+    original_model: 'claude-opus-mock',
+    request_id: null,
+    refused_user_message_uuid: ctx.userMessageUuid,
+    content: 'Claude Opus (mock) declined this request. No fallback model is configured.',
+    ...ctx.envelope(),
+  };
+}
+
+/**
+ * A refused response that was retried on the fallback model. The retracted messages leave the transcript.
+ * @param {TurnContext} ctx
+ * @param {{retracted: string[]}} refusal
+ * @returns {import('@anthropic-ai/claude-agent-sdk').SDKModelRefusalFallbackMessage}
+ */
+export function modelRefusalFallback(ctx, { retracted }) {
+  return {
+    type: 'system',
+    subtype: 'model_refusal_fallback',
+    trigger: 'refusal',
+    direction: 'retry',
+    scope: 'session',
+    original_model: 'claude-opus-mock',
+    fallback_model: 'claude-sonnet-mock',
+    request_id: null,
+    retracted_message_uuids: retracted,
+    refused_user_message_uuid: ctx.userMessageUuid,
+    content: 'Claude Opus (mock) declined this request, so it was retried with Claude Sonnet (mock).',
+    ...ctx.envelope(),
+  };
+}
+
+/**
+ * One step of a headless plugin installation.
+ * @param {SessionView} ctx
+ * @param {{status: 'started'|'installed'|'completed', name?: string}} step
+ * @returns {import('@anthropic-ai/claude-agent-sdk').SDKPluginInstallMessage}
+ */
+export function pluginInstall(ctx, { status, name }) {
+  return {
+    type: 'system',
+    subtype: 'plugin_install',
+    status,
+    ...(name === undefined ? {} : { name }),
     ...ctx.envelope(),
   };
 }
@@ -735,7 +858,9 @@ function streamEvent(ctx, event) {
  *   aborted?: boolean}} args
  * @returns {SDKAssistantMessage}
  */
-export function assistantMessage(ctx, { id, content, usage, stopReason = null, parentToolUseId, agentId, aborted = false }) {
+export function assistantMessage(ctx, {
+  id, content, usage, stopReason = null, parentToolUseId, agentId, aborted = false,
+}) {
   /** @type {SDKAssistantMessage} */
   const message = {
     type: 'assistant',
@@ -773,6 +898,7 @@ function deltaUsageOf(usage) {
  */
 function contentBlockOf(ctx, block) {
   if (block.type === 'text') return { type: 'text', text: block.text, citations: null };
+  if (block.type === 'thinking') return { type: 'thinking', thinking: block.text, signature: block.signature };
   return { type: 'tool_use', id: block.id, name: block.name, input: block.input };
 }
 
@@ -782,7 +908,9 @@ function contentBlockOf(ctx, block) {
  * @returns {NonNullableUsage}
  */
 function responseUsage(ctx, blocks) {
-  const outputText = blocks.map((block) => (block.type === 'text' ? block.text : JSON.stringify(block.input))).join('');
+  const outputText = blocks
+    .map((block) => (block.type === 'tool_use' ? JSON.stringify(block.input) : block.text))
+    .join('');
   return usageOf({
     input: BASE_PROMPT_TOKENS + Math.ceil(ctx.userText.length / 4) + ctx.turnIndex * 350,
     output: Math.max(1, Math.ceil(outputText.length / 4)),
@@ -798,8 +926,8 @@ function responseUsage(ctx, blocks) {
  * `ctx.pause`, so an interrupt takes effect at the next chunk.
  * @param {TurnContext} ctx
  * @param {ResponseBlock[]} blocks
- * @param {{stopReason?: 'end_turn'|'tool_use', stream?: boolean, parentToolUseId?: string|null, agentId?: string|null,
- *   pacing?: number}} [options]
+ * @param {{stopReason?: 'end_turn'|'tool_use'|'refusal', stream?: boolean, parentToolUseId?: string|null,
+ *   agentId?: string|null, pacing?: number}} [options]
  * @returns {AsyncGenerator<SDKMessage, string, unknown>} the response message id
  */
 export async function* modelResponse(ctx, blocks, options = {}) {
@@ -826,6 +954,25 @@ export async function* modelResponse(ctx, blocks, options = {}) {
           yield* ctx.pause(pacing);
           yield streamEvent(ctx, { type: 'content_block_delta', index, delta: { type: 'text_delta', text: chunk } });
         }
+      } else if (block.type === 'thinking') {
+        yield streamEvent(ctx, {
+          type: 'content_block_start',
+          index,
+          content_block: { type: 'thinking', thinking: '', signature: '' },
+        });
+        if (block.text !== '') {
+          yield* ctx.pause(pacing);
+          yield streamEvent(ctx, {
+            type: 'content_block_delta',
+            index,
+            delta: { type: 'thinking_delta', thinking: block.text, estimated_tokens: null },
+          });
+        }
+        yield streamEvent(ctx, {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'signature_delta', signature: block.signature },
+        });
       } else {
         yield streamEvent(ctx, {
           type: 'content_block_start',
@@ -856,7 +1003,7 @@ export async function* modelResponse(ctx, blocks, options = {}) {
       id,
       content: [contentBlockOf(ctx, block)],
       usage,
-      stopReason: !streamed && index === blocks.length - 1 ? stopReason : null,
+      stopReason: index === blocks.length - 1 ? stopReason : null,
       parentToolUseId,
       agentId,
     });
@@ -1032,7 +1179,10 @@ async function* bashScenario(ctx) {
   ], { stopReason: 'tool_use' });
   /** @type {PermissionUpdate[]} */
   const suggestions = [
-    { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow', destination: 'localSettings' },
+    {
+      type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow',
+      destination: 'localSettings',
+    },
     { type: 'addDirectories', directories: [join(ctx.cwd, '..')], destination: 'session' },
   ];
   const decision = yield* ctx.askPermission('Bash', input, {
@@ -1142,8 +1292,14 @@ async function* questionScenario(ctx) {
       header: 'Auth method',
       multiSelect: false,
       options: [
-        { label: 'Magic link', description: 'Passwordless sign-in by email', preview: '```text\nemail -> link -> session\n```' },
-        { label: 'Password', description: 'Classic email and password', preview: '```text\nemail + password -> session\n```' },
+        {
+          label: 'Magic link', description: 'Passwordless sign-in by email',
+          preview: '```text\nemail -> link -> session\n```',
+        },
+        {
+          label: 'Password', description: 'Classic email and password',
+          preview: '```text\nemail + password -> session\n```',
+        },
       ],
     },
     {
@@ -1235,7 +1391,10 @@ async function* todoScenario(ctx) {
   const toolUseId = ctx.nextId('tool');
   const todos = [
     { content: 'Read the existing routes', status: 'completed', activeForm: 'Reading the existing routes' },
-    { content: 'Add validation to the create handler', status: 'in_progress', activeForm: 'Adding validation to the create handler' },
+    {
+      content: 'Add validation to the create handler', status: 'in_progress',
+      activeForm: 'Adding validation to the create handler',
+    },
     { content: 'Write unit tests', status: 'pending', activeForm: 'Writing unit tests' },
     { content: 'Update the changelog', status: 'pending', activeForm: 'Updating the changelog' },
   ];
@@ -1246,7 +1405,8 @@ async function* todoScenario(ctx) {
   yield taskSummary(ctx, 'Updating the todo list');
   yield toolResult(ctx, {
     toolUseId,
-    content: 'Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable',
+    content: 'Todos have been modified successfully. Ensure that you continue to use the todo list to track '
+      + 'your progress. Please proceed with the current tasks if applicable',
     toolUseResult: { oldTodos: [], newTodos: todos },
   });
   yield* modelResponse(ctx, [{
@@ -1353,8 +1513,14 @@ async function* webScenario(ctx) {
       results: [{
         tool_use_id: searchId,
         content: [
-          { title: 'Session storage', url: 'https://example.com/docs', snippet: 'Sessions are stored as JSON transcripts.' },
-          { title: 'Managing sessions', url: 'https://example.com/blog/sessions', snippet: 'Resume, fork and rename sessions.' },
+          {
+            title: 'Session storage', url: 'https://example.com/docs',
+            snippet: 'Sessions are stored as JSON transcripts.',
+          },
+          {
+            title: 'Managing sessions', url: 'https://example.com/blog/sessions',
+            snippet: 'Resume, fork and rename sessions.',
+          },
         ],
       }],
       durationSeconds: 1.2,
@@ -1378,7 +1544,8 @@ async function* webScenario(ctx) {
   });
   yield* modelResponse(ctx, [{
     type: 'text',
-    text: 'Sessions are stored as one transcript file each. See the [session storage guide](https://example.com/docs) for details.',
+    text: 'Sessions are stored as one transcript file each. '
+      + 'See the [session storage guide](https://example.com/docs) for details.',
   }]);
 }
 
@@ -1518,6 +1685,92 @@ async function* slowScenario(ctx) {
 }
 
 /**
+ * Extended thinking: a thinking block, then the answer. The thinking text is kept only when summaries are requested.
+ */
+/** @type {Scenario['run']} */
+async function* thinkScenario(ctx) {
+  const reasoning = ctx.thinkingSummaries ? 'The request is simple, so I will answer it directly.' : '';
+  yield* modelResponse(ctx, [
+    { type: 'thinking', text: reasoning, signature: 'mock-thinking-signature' },
+    { type: 'text', text: 'Here is the answer, reached after thinking it through.' },
+  ]);
+}
+
+/** A build that can be moved to the background (Ctrl+B) while the turn goes on. */
+/** @type {Scenario['run']} */
+async function* backgroundScenario(ctx) {
+  const toolUseId = ctx.nextId('tool');
+  const description = 'Build the project';
+  const input = { command: 'npm run build', description };
+  const foreground = ctx.foregroundTask(toolUseId, description);
+  yield* modelResponse(ctx, [
+    { type: 'text', text: 'Starting the build.' },
+    { type: 'tool_use', id: toolUseId, name: 'Bash', input },
+  ], { stopReason: 'tool_use' });
+  yield taskSummary(ctx, `Running ${input.command}`);
+  yield toolProgress(ctx, toolUseId, 'Bash', 1);
+  const moved = yield* ctx.awaitBackground(foreground);
+  if (moved === null) {
+    yield toolResult(ctx, {
+      toolUseId,
+      content: 'Build succeeded',
+      toolUseResult: { stdout: 'Build succeeded', stderr: '', interrupted: false },
+    });
+    yield* modelResponse(ctx, [{ type: 'text', text: 'The build finished and succeeded.' }]);
+    return;
+  }
+  yield toolResult(ctx, {
+    toolUseId,
+    content: `Command running in background with ID: ${moved.taskId}. `
+      + `Output is being written to: ${outputFileOf(moved.taskId)}`,
+  });
+  yield bashTaskStarted(ctx, { taskId: moved.taskId, toolUseId, description });
+  yield* modelResponse(ctx, [{
+    type: 'text',
+    text: 'The build is running in the background. I will report when it finishes.',
+  }]);
+}
+
+/**
+ * The primary model refuses and no fallback model is configured: the refused answer stays, with the notice after it.
+ */
+/** @type {Scenario['run']} */
+async function* refusalNoFallbackScenario(ctx) {
+  yield* modelResponse(ctx, [{ type: 'text', text: "I can't help with that request." }], { stopReason: 'refusal' });
+  yield modelRefusalNoFallback(ctx);
+}
+
+/**
+ * The primary model refuses and the turn is retried on the fallback model, in the runtime's order: the refused answer
+ * is streamed, the fallback's answer names it in `supersedes` (a host evicts it on arrival), and the end-of-turn notice
+ * lists it again in `retracted_message_uuids`.
+ * @type {Scenario['run']}
+ */
+async function* refusalScenario(ctx) {
+  let refusedUuid = '';
+  for await (const message of modelResponse(ctx, [{ type: 'text', text: "I can't help with that request." }],
+    { stopReason: 'refusal' })) {
+    if (message.type === 'assistant') refusedUuid = message.uuid;
+    yield message;
+  }
+  for await (const message of modelResponse(ctx, [{ type: 'text', text: 'Here is the answer from the fallback model.' }])) {
+    yield message.type === 'assistant'
+      ? { ...message, supersedes: [/** @type {import('node:crypto').UUID} */ (refusedUuid)] }
+      : message;
+  }
+  yield modelRefusalFallback(ctx, { retracted: [refusedUuid] });
+}
+
+/** A headless plugin installation that finishes before the answer. */
+/** @type {Scenario['run']} */
+async function* pluginScenario(ctx) {
+  yield pluginInstall(ctx, { status: 'started' });
+  yield pluginInstall(ctx, { status: 'installed', name: 'demo-plugin' });
+  yield pluginInstall(ctx, { status: 'completed' });
+  yield* modelResponse(ctx, [{ type: 'text', text: 'Plugins are ready.' }]);
+}
+
+/**
  * Keyword match on word starts, so that "generate" does not select the rate scenario.
  * @param {string} word
  * @returns {(text: string) => boolean}
@@ -1551,6 +1804,11 @@ const SCENARIOS = [
   { name: 'auth', matches: keyword('auth'), run: authScenario },
   { name: 'error', matches: keyword('error'), run: errorScenario },
   { name: 'slow', matches: keyword('slow'), run: slowScenario },
+  { name: 'think', matches: keyword('think'), run: thinkScenario },
+  { name: 'background', matches: keyword('background'), run: backgroundScenario },
+  { name: 'refusal-none', matches: keyword('refusal-none'), run: refusalNoFallbackScenario },
+  { name: 'refusal', matches: keyword('refusal'), run: refusalScenario },
+  { name: 'plugin', matches: keyword('plugin'), run: pluginScenario },
   { name: 'default', matches: () => true, run: answerScenario },
 ];
 

@@ -74,7 +74,7 @@ Rate limit: 10 failed attempts per 10 minutes per client address → `429 RATE_L
   profile: 'read'|'standard'|'full',
   roots: string[],                      // absolute workspace roots
   defaults: { model: string|null, permissionMode: PermissionMode, effort: EffortLevel|null },
-  features: { terminal: boolean, bypass: boolean, uploads: boolean },
+  features: { terminal: boolean, bypass: boolean, uploads: boolean, backgroundTasks: boolean },  // see /background
   limits: { uploadMaxBytes: number, imageMaxBytes: number, maxLiveSessions: number } }
 ```
 
@@ -113,7 +113,11 @@ type LiveState = 'starting'|'idle'|'running'|'requires_action'|'closing'|'error'
 type LiveInfo = { sessionId: string, cwd: string, state: LiveState, model: string|null,
   permissionMode: PermissionMode, effort: EffortLevel|null, title: string|null,
   lockedBy: 'terminal'|null, pendingCount: number, lastActivity: number,
-  claudeCodeVersion: string|null, error: { code: string, message: string } | null, trusted: boolean };
+  claudeCodeVersion: string|null, error: { code: string, message: string } | null, trusted: boolean,
+  fastMode: boolean|null,                  // fast mode the gateway requested for this session; null = follow settings
+  fastModeState: 'off'|'on'|'cooldown'|null,     // what the runtime last reported (init or result); null = unknown
+  fastModeDisabledReason: string|null,     // FastModeDisabledReason from the same report; null when nothing blocks it
+  backgroundTasks: number };               // live background tasks, ambient ones excluded (background_tasks_changed)
 type SessionSummary = SDKSessionInfo & { live: LiveInfo | null };
 type PendingRequest = {
   id: string, sessionId: string, kind: 'permission'|'question'|'plan'|'elicitation', createdAt: number,
@@ -123,6 +127,21 @@ type PendingRequest = {
   mcpServer?: { name: string, source: string }, elicitation?: ElicitationRequest };
 type LiveEvent = { seq: number, msg: SDKMessage };
 ```
+
+### How live queries are started and kept
+
+- Thinking summaries: Claude Code reads `showThinkingSummaries` only in its interactive terminal; a non-interactive
+  session (every SDK query) receives thinking blocks without text unless the display is given explicitly. Before each
+  start the gateway reads the settings the query will load with `resolveSettings({cwd, settingSources})` (same sources
+  as the query, at most 2 s) and, unless they set `showThinkingSummaries: false`, starts the query with
+  `extraArgs: {'thinking-display': 'summarized'}` (the runtime's `--thinking-display` flag; the `thinking` option is
+  not used because it would also force the thinking type). When the lookup fails or times out, summaries are requested
+  (logged at debug level). A remembered `fastMode` is passed as the flag-layer overlay `settings: {fastMode}`.
+- Every query declares `perTaskStopAffordance: true` (see interrupt).
+- `LiveInfo.backgroundTasks` follows `system/background_tasks_changed` (replace semantics; entries with `ambient: true`
+  are not counted) and drops to 0 when the query ends. The idle sweep never closes a session whose count is above 0,
+  and making room for a new live session only evicts idle sessions without pending requests and without background
+  tasks (otherwise `429 TOO_MANY_SESSIONS`), so background work is never killed by housekeeping.
 
 ### `GET /api/sessions?cwd=<abs>&limit=100&offset=0`
 → `{ sessions: SessionSummary[] }` sorted by `lastModified` desc. Without `cwd`: all projects, filtered to sessions
@@ -164,10 +183,29 @@ without re-sending. → `{ accepted: true, duplicate: boolean }`.
 While a turn is running the message is queued by the runtime (shown as "queued" until echoed).
 
 ### `POST /api/sessions/:id/interrupt` → `{ ok: true }`
+Stops the current turn only. Every query declares `perTaskStopAffordance: true` (the UI stops background tasks one at a
+time from the Tasks panel), so background shells and agents keep running, as they do after Esc in the terminal.
 
-### `POST /api/sessions/:id/settings` `{ model?: string|null, permissionMode?: PermissionMode, effort?: EffortLevel|null }`
-Applies to the live query (`setModel`, `setPermissionMode`, `applyFlagSettings({effortLevel})`); if not live, stored
-for the next open. `bypassPermissions` requires feature + profile. → `{ live: LiveInfo | null }`
+### `POST /api/sessions/:id/background` `{ toolUseId?: string }` → `{ backgrounded: boolean }`
+The terminal's Ctrl+B: `backgroundTasks(toolUseId)`. With `toolUseId` it moves the one foreground Bash command or
+subagent started by that `tool_use` block to the background; without it, every foreground task. The blocking tool call
+returns at once with a "running in the background" `tool_result`, the turn continues, and the task reports through
+`system/task_*` messages. `backgrounded: false` when `toolUseId` matched no foreground task (it already finished, for
+example). Profile `standard`+. `409 SESSION_NOT_LIVE` when not live. `501 FEATURE_DISABLED` when background tasks are
+disabled for the runtime (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` set to a non-empty value other than `0`/`false` in the
+environment the gateway was started with, which the runtime inherits; `Config.backgroundTasksDisabled`), checked
+before the call. Other failures → `502 ENGINE_ERROR`.
+
+### `POST /api/sessions/:id/settings` `{ model?: string|null, permissionMode?: PermissionMode, effort?: EffortLevel|null, fastMode?: boolean|null }`
+Applies to the live query (`setModel`, `setPermissionMode`, `applyFlagSettings({effortLevel})`,
+`applyFlagSettings({fastMode})`); if not live, stored for the next open. `bypassPermissions` requires feature + profile.
+→ `{ live: LiveInfo | null }`
+`fastMode` is the terminal's `/fast`, kept in the session's flag settings layer only (nothing is written to settings
+files): `true`/`false` → `applyFlagSettings({fastMode: true|false})`, `null` → `applyFlagSettings({fastMode: null})`,
+which falls back to the user's settings. A stored value is applied at the next start through the `settings` option
+(`{fastMode}`). SDK sessions are opted out of fast mode until the host sets it (`fast_mode_disabled_reason:
+'sdk_opt_in_required'`). `LiveInfo.fastMode` reports the request; whether fast mode serves is `fastModeState` and
+`fastModeDisabledReason`, updated from `system/init` and from every `result` that carries them.
 
 ### `POST /api/sessions/:id/requests/:requestId`
 Body depends on the request kind:
@@ -203,7 +241,30 @@ Live sessions return fresh data (cached ≤ 30 s, commands refreshed by `command
 last known capabilities for the same cwd (or the last known globally) with `stale: true`, or empty lists.
 
 ### `POST /api/sessions/:id/mcp` `{ server: string, action: 'toggle'|'reconnect', enabled?: boolean }` → `{ mcpServers }`
-### `POST /api/sessions/:id/reload` `{ what: 'plugins'|'skills' }` → `{ ok: true }`
+### `POST /api/sessions/:id/reload` `{ what: 'plugins'|'skills'|'output-styles', force?: boolean }`
+```ts
+→ { ok: true, availableOutputStyles?: string[] }      // applied
+| { ok: false, held: true, cacheImpact: { mcpServersAdded: string[], mcpServersRemoved: string[],
+                                          lspToolChange: 'adds'|'may-add'|'removes'|'may-remove'|null } }
+```
+`plugins` runs the check the terminal's `/reload-plugins` makes: without `force` it calls
+`reloadPlugins({holdOnCacheImpact: true})`; when the runtime holds the reload because applying it would change the
+tool list the conversation's prompt cache depends on, nothing is applied and the answer is the `held` form (names are
+plugin-authored: display as text only). `force: true` calls `reloadPlugins()`. `skills` → `reloadSkills()`.
+`output-styles` → `reloadOutputStyles()` and returns the refreshed `availableOutputStyles`. `force` is only valid with
+`plugins`. Every successful reload drops the capabilities cache. Profile `standard`+; `409 SESSION_NOT_LIVE` when not
+live.
+
+### `POST /api/sessions/:id/output-style` `{ style: string }` → `{ outputStyle: string, availableOutputStyles: string[] }`
+The terminal's `/config` output-style row: `updateSettings('localSettings', {outputStyle: style})`, the runtime's own
+settings writer, which writes the project's `.claude/settings.local.json` and applies the style to the live session.
+`style` is 1–100 characters once trimmed (`400 BAD_REQUEST` otherwise) and must be one of the session's
+`availableOutputStyles` (`422 INVALID_ARGUMENT`); when the runtime does not answer for its styles the answer is
+`502 ENGINE_ERROR`. Style names longer than 100 characters are left out of `availableOutputStyles`. The runtime refuses sessions that
+do not load local settings, so an untrusted folder answers `409 CONFLICT` ("Trust this folder to change its output
+style.") before any call. Profile `standard`+; `409 SESSION_NOT_LIVE` when not live. The capabilities cache keeps the
+new `outputStyle`.
+
 ### `POST /api/sessions/:id/tasks/:taskId/stop` → `{ ok: true }`
 
 ### `POST /api/sessions/:id/rewind`

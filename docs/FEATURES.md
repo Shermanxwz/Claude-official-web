@@ -15,15 +15,18 @@ Terms used in the tables:
 | Capability | Web surface | Mechanism |
 |---|---|---|
 | Streaming replies | Text appears while it is generated; the final message replaces the draft | `stream_event` messages (partial messages are requested with `includePartialMessages`), then `assistant` |
-| Extended thinking | A collapsed "Thinking" block for each reply | `assistant` content blocks `thinking` and `redacted_thinking` |
+| Extended thinking | A collapsed "Thinking" block with the summary the runtime sends; a muted "Thinking" label when there is no text | `assistant` content blocks `thinking` and `redacted_thinking`. Summaries are requested with the runtime's `--thinking-display summarized` flag (`extraArgs`), because a non-interactive session ignores the `showThinkingSummaries` setting; a setting of `false` in any loaded settings file (read with `resolveSettings()`) is honored |
 | Markdown and code | Sanitized Markdown with highlighted code blocks | Text blocks rendered by `renderMarkdown()` (marked and DOMPurify) |
 | Tool use | One card per tool call, grouped into collapsible work steps | `assistant` `tool_use` blocks; results from `user` `tool_result` blocks |
 | All tool families | Bash and BashOutput; Read, Write, Edit, MultiEdit and NotebookEdit with diffs; Grep, Glob and LS; WebFetch and WebSearch; Agent and Task; TodoWrite; plan tools; `mcp__<server>__<tool>`; a generic fallback | Tool names in `tool_use` blocks; structured results from `tool_use_result` when present |
 | Subagents | The subagent's conversation nested inside its Agent or Task card | Messages with `parent_tool_use_id`; `listSubagents()` and `getSubagentMessages()` for history |
-| Background tasks | Task rows in the timeline and a background-tasks panel, with a stop action | `system` `task_started`, `task_progress`, `task_updated` and `task_notification`; `stopTask(taskId)` |
+| Background tasks | Task rows in the timeline, a header badge with the count, and a background-tasks panel with a stop action | `system` `task_started`, `task_progress`, `task_updated`, `task_notification` and `background_tasks_changed`; `stopTask(taskId)` |
+| Move to the background (Ctrl+B) | A "Run in background" button on a running Bash or Agent card | `backgroundTasks(toolUseId)`; `POST /api/sessions/:id/background` |
 | Work summary | A group label such as "5 steps" | `tool_use_summary` messages |
 | Turn footer | Duration, turn count, the error reason for failed turns and any permission denials | `result` message (`subtype` `success` or an error subtype; `permission_denials`) |
-| Interrupt | Stop button while a turn runs | `interrupt()` on the query |
+| Interrupt | Stop button while a turn runs; background tasks keep running, as after Esc in the terminal | `interrupt()` on the query; every query declares `perTaskStopAffordance` |
+| Refusal fallback | When the model declines and the turn is retried on a fallback model, a notice explains it and the declined response is marked as withdrawn. Without a fallback, a notice offers "Edit and retry" | `system` `model_refusal_fallback` (`retracted_message_uuids`) and `model_refusal_no_fallback` (`refused_user_message_uuid`) |
+| Plugin installation | A row for each installation step | `system` `plugin_install` messages |
 | Queued input | A message sent during a turn shows as queued until the runtime echoes it | Input streaming: the runtime queues the user message; gateway event `message_accepted` |
 | Compaction | A "Context compacted" divider and status text | `system` `compact_boundary` and `status` messages |
 | API retries | A muted inline notice | `system` `api_retry` messages |
@@ -37,7 +40,7 @@ Terms used in the tables:
 | Permission suggestions | "Allow always" saves the ticked suggestions. Allow rules and session-only mode switches start ticked; directory grants, other mode changes, deny and ask rules start unticked | `PermissionUpdate` suggestions and `suggestionIndexes` in the decision; when it is absent, only `addRules` and `replaceRules` with behavior `allow` are saved |
 | Questions | A question card with the offered options and free text (`AskUserQuestion`) | `canUseTool` for the `AskUserQuestion` tool; answers returned as `updatedInput.answers` |
 | Plan mode | A plan card to approve (choosing the next permission mode) or reject with feedback | `ExitPlanMode` through `canUseTool`; `setPermissionMode(nextMode)` after approval |
-| MCP elicitation | A form or link card asking an MCP server for input | `onElicitation` callback; accept, decline or cancel with content |
+| MCP elicitation | A form or link card asking an MCP server for input, and a muted row when a browser step completes | `onElicitation` callback; accept, decline or cancel with content; `system` `elicitation_complete` |
 | Permission modes | Mode picker: default, acceptEdits, plan, auto and dontAsk | `setPermissionMode(mode)`; `permissionMode` option when a session starts |
 | Bypass mode | Offered only when the operator enabled it | `bypassPermissions`; requires `CAW_ALLOW_BYPASS=1` and the `full` profile (`501 FEATURE_DISABLED` otherwise). The same rule applies to `CAW_DEFAULT_PERMISSION_MODE=bypassPermissions` |
 | Denials | A red row for each denied tool call | `system` `permission_denied` messages; `result.permission_denials` |
@@ -46,21 +49,22 @@ Terms used in the tables:
 
 | Capability | Web surface | Mechanism |
 |---|---|---|
-| Model switching | Model picker in the header and in the session settings | `setModel(model)`; `supportedModels()` lists the choices |
-| Effort | Picker for low, medium, high, xhigh and max | `applyFlagSettings({ effortLevel })` |
+| Model switching | Model picker in the header and in the session settings | `setModel(model)`; the choices come from `initializationResult().models` |
+| Effort | Picker for low, medium, high, xhigh and max, for the current session. Typing `/effort <level>` runs Claude Code's own command, which also saves the level as the default | `applyFlagSettings({ effortLevel })` |
+| Fast mode (`/fast`) | A "Fast" toggle when the model supports it, with the state Claude Code reports (on, cooling down, or why it is unavailable) | `applyFlagSettings({ fastMode })` in the session's flag layer; `supportsFastMode` in the model list; `fast_mode_state` and `fast_mode_disabled_reason` from `system` `init` and `result` |
 | Context usage | A context meter and a panel with the breakdown | `getContextUsage()` |
 | Usage limits | A banner when a limit or warning applies | `rate_limit_event` messages |
 | Prompt suggestions | A suggested next prompt above the composer | `prompt_suggestion` messages (`promptSuggestions` option) |
-| Account | Account information reported by Claude Code | `accountInfo()` |
+| Account | Account information reported by Claude Code | `initializationResult().account` |
 
 ## Commands and input
 
 | Capability | Web surface | Mechanism |
 |---|---|---|
-| Slash commands from Claude Code | Command palette opened with `/`, listing skills, custom commands and MCP prompts | `supportedCommands()`; the command is sent as a user message |
-| Commands with a graphical equivalent | `/model`, `/permissions`, `/effort`, `/rewind`, `/fork`, `/rename`, `/mcp` and `/terminal` | Gateway actions that call the SDK methods listed in this table |
+| Slash commands from Claude Code | Command palette opened with `/`, listing built-in commands, skills, custom commands and MCP prompts | `initializationResult().commands`, refreshed by `system` `commands_changed`; the command is sent as a user message |
+| Commands with a graphical equivalent | `/model`, `/permissions`, `/effort`, `/fast`, `/rewind`, `/fork`, `/rename`, `/mcp` and `/terminal` open the matching control when picked from the palette. Typed commands are always sent to Claude Code unchanged | Gateway actions that call the SDK methods listed in this table |
 | Commands that run inside the session | Output appears as a command-output card | Sent as a message; `system` `local_command_output` messages |
-| File mentions with `@` | Fuzzy file search inside the session's directory | `GET /api/fs/search` (containment-checked by the gateway) |
+| File mentions with `@` | Fuzzy file search inside the session's directory | `GET /api/fs/search` (containment-checked by the gateway). The runtime answers a `file_suggestions` control request, but the SDK has no public method for it, so the gateway searches itself |
 | Images | Paste or drag an image; thumbnails in the composer and the timeline | `POST /api/attachments`; sent as base64 image blocks |
 | Other files | Uploaded files shown as chips | Sent as `Attached file: <path>` text |
 | Keyboard input | Multi-line composer; Enter sends on desktop and Shift+Enter starts a new line | `POST /api/sessions/:id/messages` |
@@ -102,8 +106,8 @@ interface closes and reopens the current session.
 | CLAUDE.md, settings, permission rules, hooks, skills, commands, plugins, MCP servers and subagents | Load as they do in the terminal once the folder is trusted. For an untrusted folder, only user-level files load. The capabilities panel lists what was loaded | `systemPrompt` and `tools` presets (`claude_code`); `settingSources` `['user', 'project', 'local']` for a trusted folder and `['user']` otherwise |
 | MCP server status | An MCP panel with the state of each server and its tools | `mcpServerStatus()` |
 | MCP toggle and reconnect | Switch a server on or off, or reconnect it | `toggleMcpServer(name, enabled)`; `reconnectMcpServer(name)` |
-| Reload plugins and skills | A reload action after you install or change them | `reloadPlugins()` |
-| Output style | Shown in the capabilities panel when styles are available | `outputStyle` and `availableOutputStyles` in the capabilities response |
+| Reload plugins, skills and output styles | Reload actions in the capabilities panel. A plugin reload that would change the tools the prompt cache depends on asks first, as `/reload-plugins` does | `reloadPlugins({ holdOnCacheImpact: true })`, then `reloadPlugins()` after confirmation; `reloadSkills()`; `reloadOutputStyles()` |
+| Output style | A style picker in the capabilities panel for trusted folders, as the `/config` output-style row | `updateSettings('localSettings', { outputStyle })`, the runtime's own settings writer; styles from `initializationResult()` |
 | Hooks | Hook rows in the work steps; failing hooks are highlighted | `system` `hook_started`, `hook_progress` and `hook_response` messages |
 | Memory recall | A muted row when Claude Code recalls memory | `system` `memory_recall` messages |
 | Notifications | Toasts in the page, and browser notifications when you enable them | `system` `notification` messages |

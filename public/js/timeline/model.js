@@ -18,8 +18,9 @@
  *  - work:           { label, count, items, open, running }   (a run of tool cards and progress rows)
  *                      tool item = {kind:'tool', key, id, name, input, result: {content, isError, images}|null,
  *                                   structured, children (Entry[]|undefined), running, pendingRequestId,
- *                                   elapsedSeconds}
- *                      row item  = {kind:'row', key, rowKind:'hook'|'task'|'denied', ...fields}
+ *                                   elapsedSeconds, messageUuid, resultUuid}
+ *                      row item  = {kind:'row', key, rowKind:'hook'|'task'|'denied'|'notice'|'withdrawn', ...fields}
+ *  - withdrawn:      { key, uuid }   (a retracted response, shown as one muted "Response withdrawn" row)
  *  - notice:         { level:'info'|'warning'|'error'|'muted', code, text, vars }
  *  - divider:        { variant:'compact'|'clear', preTokens, trigger }
  *  - command-output: { text }
@@ -126,7 +127,7 @@ export function createModel() {
   let bubbleCount = new Map();
   /** @type {Map<string, Array<{raw: any, live: boolean}>>} */
   let orphans = new Map();
-  /** @type {Map<string, ToolResult & {structured?: unknown}>} */
+  /** @type {Map<string, ToolResult & {structured?: unknown, uuid?: string|null}>} */
   let pendingResults = new Map();
   /** @type {Array<Record<string, any>>} local user messages that wait behind a running turn, oldest first */
   let queued = [];
@@ -469,7 +470,7 @@ export function createModel() {
   /**
    * Creates the tool card for a tool_use block, or returns the one already known for that id.
    * @param {Flow} flow
-   * @param {{id: string, name: string, input: unknown}} spec
+   * @param {{id: string, name: string, input: unknown, messageUuid?: string|null}} spec
    */
   const addTool = (flow, spec) => {
     const id = spec.id || nextKey('tool', null);
@@ -487,6 +488,8 @@ export function createModel() {
       running: false,
       pendingRequestId: pendingRequestFor(id),
       elapsedSeconds: undefined,
+      messageUuid: spec.messageUuid ?? null,
+      resultUuid: null,
       version: 0,
     };
     touch(item);
@@ -496,7 +499,7 @@ export function createModel() {
     if (pendingResults.has(id)) {
       const queued = pendingResults.get(id);
       pendingResults.delete(id);
-      applyResult(item, queued, queued.structured);
+      applyResult(item, queued, queued.structured, queued.uuid);
     }
     drainOrphans(id);
     return item;
@@ -506,10 +509,12 @@ export function createModel() {
    * @param {Record<string, any>} item
    * @param {ToolResult} result
    * @param {unknown} [structured]
+   * @param {string|null} [uuid] the message that carried the result
    */
-  const applyResult = (item, result, structured) => {
+  const applyResult = (item, result, structured, uuid = null) => {
     if (item.result) return;
     item.result = { content: result.content, isError: result.isError, images: result.images ?? [] };
+    item.resultUuid = typeof uuid === 'string' ? uuid : null;
     if (structured !== undefined) item.structured = structured;
     touch(item);
     setField(item, 'running', false);
@@ -524,11 +529,11 @@ export function createModel() {
     if (child) syncFlow(child);
   };
 
-  /** @param {string} id @param {ToolResult} result @param {unknown} [structured] */
-  const deliverResult = (id, result, structured) => {
+  /** @param {string} id @param {ToolResult} result @param {unknown} [structured] @param {string|null} [uuid] */
+  const deliverResult = (id, result, structured, uuid = null) => {
     const item = toolIndex.get(id);
-    if (item) applyResult(item, result, structured);
-    else pendingResults.set(id, Object.assign({}, result, { structured }));
+    if (item) applyResult(item, result, structured, uuid);
+    else pendingResults.set(id, Object.assign({}, result, { structured, uuid }));
   };
 
   /** @param {string} id */
@@ -623,11 +628,12 @@ export function createModel() {
   const onUser = (raw, live) => {
     const message = isObject(raw.message) ? raw.message : {};
     const blocks = normalizeContent(message.content);
+    const uuid = typeof raw.uuid === 'string' ? raw.uuid : null;
     const toolResults = blocks.filter((block) => block.type === 'tool_result');
     const rest = blocks.filter((block) => block.type !== 'tool_result');
     for (const block of toolResults) {
       const structured = toolResults.length === 1 && raw.tool_use_result !== undefined ? raw.tool_use_result : undefined;
-      deliverResult(String(block.tool_use_id ?? ''), toolResultFrom(block), structured);
+      deliverResult(String(block.tool_use_id ?? ''), toolResultFrom(block), structured, uuid);
     }
     if (toolResults.length > 0 && rest.length === 0) return current ?? null;
 
@@ -638,7 +644,6 @@ export function createModel() {
     const visible = stripReminders(rawText);
     const images = rest.map((block) => (block.type === 'image' ? imageFrom(block) : null)).filter(Boolean);
     const origin = isObject(raw.origin) ? raw.origin : null;
-    const uuid = typeof raw.uuid === 'string' ? raw.uuid : null;
 
     const interrupt = INTERRUPT_NOTICES.get(visible.trim());
     if (interrupt) {
@@ -722,15 +727,15 @@ export function createModel() {
     } else if (type === 'redacted_thinking') {
       appendBubble(flow, { kind: 'thinking', text: '', redacted: true }, messageId, uuid, raw);
     } else if (type === 'tool_use') {
-      addTool(flow, { id: String(block.id ?? ''), name: String(block.name ?? 'tool'), input: block.input });
+      addTool(flow, { id: String(block.id ?? ''), name: String(block.name ?? 'tool'), input: block.input, messageUuid: uuid });
     } else if (type === 'server_tool_use' && block.name === 'web_search') {
       const input = isObject(block.input) ? block.input : {};
-      addTool(flow, { id: String(block.id ?? ''), name: 'WebSearch', input: { query: input.query ?? '' } });
+      addTool(flow, { id: String(block.id ?? ''), name: 'WebSearch', input: { query: input.query ?? '' }, messageUuid: uuid });
     } else if (type === 'web_search_tool_result') {
       const id = String(block.tool_use_id ?? '');
-      const card = toolIndex.get(id) ?? addTool(flow, { id, name: 'WebSearch', input: {} });
+      const card = toolIndex.get(id) ?? addTool(flow, { id, name: 'WebSearch', input: {}, messageUuid: uuid });
       const { result, structured } = webSearchResultFrom(block);
-      applyResult(card, result, structured);
+      applyResult(card, result, structured, uuid);
     } else {
       appendBubble(flow, { kind: 'generic', raw: block, label: String(type ?? 'block') }, messageId, uuid, raw);
     }
@@ -784,6 +789,8 @@ export function createModel() {
     const uuid = typeof raw.uuid === 'string' ? raw.uuid : null;
     const messageId = typeof message.id === 'string' ? message.id : nextKey('msg', null);
     if (live) markLive(flow.state);
+    // A refusal-fallback retry names the refused messages it replaces; they leave the timeline without a marker.
+    withdrawMessages(uuidSet(raw, 'supersedes'), { marker: false });
     if (live && draft && messageId === draft.messageId) {
       draft.finalized += content.length;
       touch(draft);
@@ -828,6 +835,192 @@ export function createModel() {
     }
     upsertRow(flow, `task:${taskId}`, fields);
     return flow;
+  };
+
+  /**
+   * Forgets a tool card that left the timeline, so a later result for its id is not attached to it.
+   * @param {Record<string, any>} item
+   */
+  const forgetTool = (item) => {
+    if (toolIndex.get(item.id) === item) toolIndex.delete(item.id);
+    groupOf.delete(item);
+    containerOf.delete(item);
+    childFlowOf.delete(item);
+  };
+
+  /**
+   * Takes a tool card out of its work group. Its result, if any, goes with it.
+   * @param {Flow} flow
+   * @param {Record<string, any>} item
+   */
+  const dropTool = (flow, item) => {
+    const group = groupOf.get(item);
+    if (group) {
+      const index = group.items.indexOf(item);
+      if (index >= 0) group.items.splice(index, 1);
+      refreshGroup(group);
+      touch(group);
+    }
+    forgetTool(item);
+    touchOwners(flow);
+  };
+
+  /**
+   * Puts the "Response withdrawn" marker where a tool card stood: the card leaves its group, and a muted row takes its
+   * place.
+   * @param {Flow} flow
+   * @param {Record<string, any>} item
+   * @param {string} uuid
+   */
+  const markToolWithdrawn = (flow, item, uuid) => {
+    const group = groupOf.get(item);
+    const row = { kind: 'row', key: `wd:${uuid}`, rowKind: 'withdrawn' };
+    touch(row);
+    const index = group ? group.items.indexOf(item) : -1;
+    if (group && index >= 0) {
+      group.items[index] = row;
+      groupOf.set(row, group);
+      containerOf.set(row, flow);
+      refreshGroup(group);
+      touch(group);
+    }
+    forgetTool(item);
+    touchOwners(flow);
+  };
+
+  /**
+   * Turns a retracted response into its marker. Each retracted message leaves one "Response withdrawn" marker where its
+   * first visible piece stood (an assistant bubble, or a tool card whose tool_use or tool_result came in it); the other
+   * pieces of that message are removed. Subagent flows are searched too. With `marker: false` (a message that
+   * supersedes them arrived, and stands in their place) every piece is removed and no marker is left.
+   * @param {Set<string>} uuids
+   * @param {{marker?: boolean}} [options]
+   */
+  const withdrawMessages = (uuids, { marker = true } = {}) => {
+    if (uuids.size === 0) return;
+    const marked = new Set();
+    /** @param {Flow} flow */
+    const visit = (flow) => {
+      for (const entry of [...flow.entries]) {
+        if (entry.kind === 'assistant' && uuids.has(entry.uuid)) {
+          if (!marker || marked.has(entry.uuid)) {
+            const index = flow.entries.indexOf(entry);
+            if (index >= 0) flow.entries.splice(index, 1);
+            bump();
+          } else {
+            marked.add(entry.uuid);
+            entry.kind = 'withdrawn';
+            entry.blocks = [];
+            touch(entry);
+          }
+          touchOwners(flow);
+        } else if (entry.kind === 'work') {
+          for (const item of [...entry.items]) {
+            if (item.kind !== 'tool') continue;
+            const hit = [item.messageUuid, item.resultUuid].find((id) => typeof id === 'string' && uuids.has(id));
+            if (hit === undefined) {
+              const child = childFlowOf.get(item);
+              if (child) visit(child);
+            } else if (!marker || marked.has(hit)) {
+              dropTool(flow, item);
+            } else {
+              marked.add(hit);
+              markToolWithdrawn(flow, item, hit);
+            }
+          }
+        }
+      }
+    };
+    for (const turn of turns) visit(turn);
+  };
+
+  /**
+   * The uuids a message lists in one of its fields, as a set of non-empty strings.
+   * @param {Record<string, any>} raw
+   * @param {'retracted_message_uuids'|'supersedes'} field
+   * @returns {Set<string>}
+   */
+  const uuidSet = (raw, field) => {
+    const list = Array.isArray(raw[field]) ? raw[field] : [];
+    return new Set(list.filter((id) => typeof id === 'string' && id !== ''));
+  };
+
+  /**
+   * The primary model refused a turn and a fallback model answered it. The retracted messages are withdrawn, and an open
+   * streaming draft goes too: the retry streams a new message. A subagent or side question that fell back shows the
+   * notice inside its work group, the session-level fallback as a notice in the turn.
+   * @param {Record<string, any>} raw
+   * @param {boolean} live
+   * @param {string|null} uuid
+   * @returns {Flow|null}
+   */
+  const onRefusalFallback = (raw, live, uuid) => {
+    const flow = resolveFlow(raw, live);
+    if (!flow) return null;
+    if (live) markLive(flow.state);
+    // A subagent or side question that fell back streams nothing into the main draft, so only a session fallback drops it.
+    if (raw.scope !== 'local') clearDraft();
+    withdrawMessages(uuidSet(raw, 'retracted_message_uuids'));
+    const vars = { category: typeof raw.api_refusal_category === 'string' ? raw.api_refusal_category : null };
+    const text = typeof raw.content === 'string' ? raw.content : '';
+    if (raw.scope === 'local') {
+      upsertRow(flow, `refusal:${uuid ?? nextKey('r', null)}`, { rowKind: 'notice', level: 'warning', code: 'refusal-fallback', vars, text });
+      return flow;
+    }
+    return addNotice(flow, 'warning', 'refusal-fallback', vars, text, uuid ? `n:${uuid}` : null);
+  };
+
+  /**
+   * The model refused and no fallback ran. The notice names the user message that was refused, so the view can offer to
+   * edit and retry it.
+   * @param {Record<string, any>} raw
+   * @param {boolean} live
+   * @param {string|null} uuid
+   * @returns {Flow|null}
+   */
+  const onRefusalNoFallback = (raw, live, uuid) => {
+    const flow = resolveFlow(raw, live);
+    if (!flow) return null;
+    if (live) markLive(flow.state);
+    const refused = typeof raw.refused_user_message_uuid === 'string' && raw.refused_user_message_uuid !== ''
+      ? raw.refused_user_message_uuid : null;
+    const vars = {
+      refused,
+      category: typeof raw.api_refusal_category === 'string' ? raw.api_refusal_category : null,
+    };
+    const text = typeof raw.content === 'string' ? raw.content : '';
+    return addNotice(flow, 'warning', 'refusal-no-fallback', vars, text, uuid ? `n:${uuid}` : null);
+  };
+
+  /**
+   * One step of a headless plugin installation, as a muted row. A failed install is a warning.
+   * @param {Record<string, any>} raw
+   * @param {boolean} live
+   * @param {string|null} uuid
+   * @returns {Flow}
+   */
+  const onPluginInstall = (raw, live, uuid) => {
+    const flow = live ? liveFlow() : baseFlow();
+    const status = typeof raw.status === 'string' ? raw.status : '';
+    const vars = {
+      status,
+      name: typeof raw.name === 'string' ? raw.name : '',
+      error: typeof raw.error === 'string' ? raw.error : '',
+    };
+    return addNotice(flow, status === 'failed' ? 'warning' : 'muted', 'plugin-install', vars, '', uuid ? `n:${uuid}` : null);
+  };
+
+  /**
+   * An MCP server confirmed that a URL step finished in the browser, as a muted row.
+   * @param {Record<string, any>} raw
+   * @param {boolean} live
+   * @param {string|null} uuid
+   * @returns {Flow}
+   */
+  const onElicitationComplete = (raw, live, uuid) => {
+    const flow = live ? liveFlow() : baseFlow();
+    const server = typeof raw.mcp_server_name === 'string' ? raw.mcp_server_name : '';
+    return addNotice(flow, 'muted', 'elicitation-complete', { server }, '', uuid ? `n:${uuid}` : null);
   };
 
   /** @param {Record<string, any>} raw @param {boolean} live @returns {Flow|null} */
@@ -949,6 +1142,16 @@ export function createModel() {
       case 'task_updated':
       case 'task_notification':
         return upsertTask(raw, subtype, live, uuid);
+      case 'model_refusal_fallback':
+        return onRefusalFallback(raw, live, uuid);
+      case 'model_refusal_no_fallback':
+        return onRefusalNoFallback(raw, live, uuid);
+      case 'plugin_install':
+        return onPluginInstall(raw, live, uuid);
+      case 'elicitation_complete':
+        return onElicitationComplete(raw, live, uuid);
+      case 'control_request_progress':
+        return null;
       default:
         return addGeneric(raw, live, `system/${subtype}`);
     }

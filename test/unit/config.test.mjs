@@ -298,3 +298,19 @@ describe('workspace roots', () => {
     assertInvalid({ CAW_WORKSPACE_ROOTS: `${dirA}::${dirB}` }, 'CAW_WORKSPACE_ROOTS');
   });
 });
+
+describe('background tasks switch', () => {
+  it('reads CLAUDE_CODE_DISABLE_BACKGROUND_TASKS as off when it is unset, blank, 0 or false in any letter case', () => {
+    for (const raw of [undefined, '', '   ', '0', ' 0 ', 'false', 'FALSE', 'False']) {
+      const extra = raw === undefined ? {} : { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: raw };
+      assert.equal(loadConfig(env(extra)).backgroundTasksDisabled, false, `value ${JSON.stringify(raw)}`);
+    }
+  });
+
+  it('reads any other non-empty value as on, the runtime inheriting the same variable', () => {
+    for (const raw of ['1', 'true', 'TRUE', 'yes', 'off', ' 1 ']) {
+      const config = loadConfig(env({ CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: raw }));
+      assert.equal(config.backgroundTasksDisabled, true, `value ${JSON.stringify(raw)}`);
+    }
+  });
+});

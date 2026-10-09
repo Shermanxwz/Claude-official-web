@@ -3,9 +3,9 @@
  * port with the deterministic mock engine, talks to it over HTTP with a cookie-aware client and reads its
  * Server-Sent Events. Nothing here changes product code.
  *
- * Pacing: startServer creates the mock adapter itself and reads CAW_MOCK_DELAY_MS from process.env, not from the env it
- * is given. The harness therefore builds the adapter with the pacing of the test env and passes it through the
- * documented `engine` option. The mismatch is covered by a skipped BUG test in auth-and-security.test.mjs.
+ * Pacing: startServer reads CAW_MOCK_DELAY_MS from the env it is given. The harness builds the mock adapter itself,
+ * with the pacing of the test env, because it also passes backgroundTiming and wrapEngine, and hands the adapter over
+ * through the documented `engine` option.
  */
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -57,9 +57,11 @@ function writeTree(dir, files) {
  * file search must skip). `outside` is a directory that is not a workspace root.
  * @param {Record<string, string>} [overrides] environment variables that replace the defaults
  * @param {{wrapEngine?: (engine: import('../../src/contracts.mjs').EngineAdapter) =>
- *   import('../../src/contracts.mjs').EngineAdapter}} [options]
+ *   import('../../src/contracts.mjs').EngineAdapter,
+ *   backgroundTiming?: {waitMs?: number, runMs?: number}}} [options] backgroundTiming shortens how long a foreground
+ *   command waits to be moved and how long a background command runs in the mock
  */
-export async function startTestServer(overrides = {}, { wrapEngine } = {}) {
+export async function startTestServer(overrides = {}, { wrapEngine, backgroundTiming } = {}) {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'caw-it-')));
   const root = path.join(base, 'workspace');
   const proj = path.join(root, 'proj');
@@ -74,7 +76,6 @@ export async function startTestServer(overrides = {}, { wrapEngine } = {}) {
     fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(home, { recursive: true });
     const env = {
-      PATH: process.env.PATH ?? '',
       HOME: home,
       CAW_ENGINE: 'mock',
       CAW_MOCK_DELAY_MS: '0',
@@ -87,7 +88,7 @@ export async function startTestServer(overrides = {}, { wrapEngine } = {}) {
     };
     const config = loadConfig(env);
     const log = createLogger({ level: 'error' });
-    const mock = createMockAdapter({ config, log, delayMs: Number(env.CAW_MOCK_DELAY_MS) });
+    const mock = createMockAdapter({ config, log, delayMs: Number(env.CAW_MOCK_DELAY_MS), backgroundTiming });
     const engine = wrapEngine ? wrapEngine(mock) : mock;
     running = await startServer({ env, engine, listenHost: '127.0.0.1', listenPort: 0 });
     const { url, events, engineHost } = running;

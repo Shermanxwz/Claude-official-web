@@ -107,7 +107,7 @@ listed methods):
 
 ```js
 createSidebar({ container, api, store, t, actions })                    // sessions, projects, search, new session
-createHeader({ container, api, store, t, actions }) -> { setSession(sessionId|null) }
+createHeader({ container, api, store, t, actions }) -> { setSession(sessionId|null), toggleFast() -> boolean }
 createComposer({ container, api, store, t, actions }) -> { setSession(sessionId|null), focus(), insertText(text),
                                                             setSuggestion(text|null) }
 createTimeline({ container, api, store, t, actions })                   // see below
@@ -124,9 +124,12 @@ actions = {
   sendMessage({ text, attachments, clientMessageId }),  // reuses clientMessageId when given (retry of a lost
                                        // response must not duplicate the turn), else crypto.randomUUID(); POST
   interrupt(),                         // POST /interrupt for the current session
-  updateSettings({ model, permissionMode, effort }),
+  updateSettings({ model, permissionMode, effort, fastMode }),   // any subset; fastMode: true|false|null
   openRewind(userMessageId?), openFork(upToMessageId?),   // timeline/rewind.js dialogs
   openTerminal(), openPanel(name), renameSession(), toast(message, level = 'info'),
+  confirmEndBackground(sessionId) -> Promise<boolean>,  // asks before close, terminal, trust restart or conversation
+                                       // rewind while LiveInfo.backgroundTasks > 0 (ending the query stops them)
+  toggleFastMode() -> boolean,         // the header's fast toggle (false when not offered); used by `/fast`
   insertIntoComposer(text),            // e.g. prompt suggestions, file mentions
 }
 ```
@@ -142,8 +145,10 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
 
 1. Entries are keyed by `uuid`; a message with a uuid already present is ignored (transcript/live overlap).
 2. Assistant messages: consecutive assistant entries with the same `message.id` render as one bubble; blocks are
-   `text` (Markdown), `thinking`/`redacted_thinking` (collapsed "Thinking" disclosure), `tool_use` (tool card),
-   `server_tool_use` / `web_search_tool_result` (web search card), anything else → generic block.
+   `text` (Markdown), `thinking`/`redacted_thinking` (collapsed "Thinking" disclosure; a block whose text is empty —
+   summaries off, or redacted — renders as a muted, non-expandable "Thinking" label instead of an empty disclosure),
+   `tool_use` (tool card), `server_tool_use` / `web_search_tool_result` (web search card), anything else → generic
+   block.
 3. Streaming: `stream_event` messages with `parent_tool_use_id === null` build a draft keyed by the message id from
    `message_start`; `content_block_start/delta/stop` update `draft.blocks[index]` (`text_delta`, `thinking_delta`,
    `input_json_delta` → raw partial JSON shown as text). When a final assistant message with the same `message.id`
@@ -168,10 +173,26 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
    - `system/local_command_output`: monospace "Command output" card.
    - `system/informational`: inline notice styled by `level`. `system/notification`: toast (shell) + nothing inline.
    - `system/permission_denied`: red inline row. `system/hook_*`: rows inside the work group (errors highlighted).
+   - An `assistant` message with `supersedes` (the fallback model's retry) evicts the listed messages on arrival —
+     assistant bubbles and tool cards whose `tool_use` or `tool_result` came in them — without a marker; it is their
+     replacement.
+   - `system/model_refusal_fallback` (sent at the end of the turn): warning-styled inline notice with `content`
+     (unstable prose: display only). Every entry still shown whose uuid is in `retracted_message_uuids` stops rendering
+     its content and becomes one muted "Response withdrawn" row (tool cards included). A session-scope notice drops a
+     streaming draft that is still open; `scope: 'local'` (a subagent or side question fell back) leaves the main draft
+     alone and renders the notice inside the work group.
+   - `system/model_refusal_no_fallback`: warning-styled inline notice with `content`; when
+     `refused_user_message_uuid` is set the notice offers "Edit and retry", which calls
+     `actions.openRewind(refused_user_message_uuid)`.
+   - `system/plugin_install`: muted row per message — started "Installing plugins…", installed "Installed plugin
+     {name}", failed (warning) "Could not install {name}: {error}", completed "Plugin installation finished." (the
+     locale files hold the exact strings, including the variants without a name).
+   - `system/elicitation_complete`: muted row "{mcp_server_name}: request completed in the browser". Pending request
+     cards are owned by the gateway and are not changed by it.
    - `system/task_*`: background task rows + feed the background tasks panel (shell reads from store).
    - `system/memory_recall`, `system/files_persisted`, `system/thinking_tokens`, `system/session_state_changed`,
-     `system/commands_changed`, `system/background_tasks_changed`: no inline row (state only), except memory recall →
-     muted row.
+     `system/commands_changed`, `system/background_tasks_changed`, `system/control_request_progress`: no inline row
+     (state only), except memory recall → muted row.
    - `conversation_reset`: divider "Conversation cleared".
    - `rate_limit_event`: banner (shell) when status ≠ `allowed`.
    - `prompt_suggestion`: suggestion chip above the composer (shell), latest only.
@@ -190,7 +211,12 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
 Each module exports `render(card, ctx) -> HTMLElement` where
 `card = { id, name, input, result?: { content, isError }, structured?, children?: Entry[], running: boolean,
 pendingRequestId?: string }` and
-`ctx = { t, renderMarkdown, sessionId, cwd, renderChildren(entries) -> HTMLElement, open: boolean }`.
+`ctx = { t, renderMarkdown, sessionId, cwd, renderChildren(entries) -> HTMLElement, open: boolean,
+background?: (toolUseId) -> Promise<void> }`. `background` is present only when the session is live, the profile is
+not `read` and `meta.features.backgroundTasks` is true; `bash.js` (Bash) and `agent.js` (Agent/Task) render a "Run in background" button (icon `layers`) on a card
+that is `running`, has no result and whose input does not set `run_in_background: true`. It calls
+`POST /api/sessions/:id/background {toolUseId}`; `backgrounded: false` → info toast "This task is no longer running in
+the foreground"; errors → error toast. The button disables itself while the request runs.
 `tools/shell.js` exports `toolShell({ iconName, title, subtitle, status: 'running'|'done'|'error'|'waiting', body,
 open })` used by every family so all cards share one look (header row: icon, title, monospace subtitle, status
 badge; body collapsible via a `<details>` element). Tool cards are styled in `public/css/tools.css`; their strings
@@ -230,8 +256,26 @@ command, at.
   header compacts into an overflow menu, composer stays at the bottom with safe-area insets, touch targets ≥ 44 px.
 - Composer: auto-growing textarea; Enter sends on desktop (Shift+Enter newline), button sends on touch devices; Stop
   button while running (interrupt); `/` opens the command palette (SDK commands + GUI commands `/model`,
-  `/permissions`, `/effort`, `/rewind`, `/fork`, `/rename`, `/mcp`, `/terminal`); `@` opens file search; paste/drag
+  `/permissions`, `/effort`, `/fast`, `/rewind`, `/fork`, `/rename`, `/mcp`, `/terminal`); a GUI command runs only when
+  picked from the palette, typed text is always sent to the runtime unchanged; `@` opens file search; paste/drag
   images and files (uploaded first, shown as chips); draft text persisted per session in `localStorage`.
+- Fast mode (header, next to effort; in the overflow menu on mobile): a toggle shown when the session's model supports
+  fast mode (`ModelInfo.supportsFastMode` of the model row the model select matches) or whenever `LiveInfo.fastMode` is
+  true or `fastModeState` is `'on'`/`'cooldown'`. Pressed = `fastMode === true`, or `fastMode === null` with
+  `fastModeState === 'on'`. Clicking sends `updateSettings({fastMode: !pressed})`. States: `'on'` accent; `'cooldown'`
+  warning label "Cooling down"; requested but `'off'` with a reason → muted with the localized reason in the tooltip
+  (unknown reasons show the raw value). Tooltip: "Faster output from Claude Opus. Availability and billing depend on
+  your plan." The GUI command `/fast` toggles the same control.
+- Background tasks: when `LiveInfo.backgroundTasks > 0` the header shows a small badge "{n} background" that opens the
+  Tasks panel.
+- Capabilities panel: the "Output style" section lists `availableOutputStyles` in a select with the current
+  `outputStyle`; changing it calls `POST /api/sessions/:id/output-style`, then updates the panel and toasts "Output
+  style set to {style}". The select is disabled with the note "Trust this folder to change its output style." when
+  `LiveInfo.trusted` is false, and with "Open the session to change its output style." when not live. A "Reload
+  styles" button calls `POST /reload {what:'output-styles'}`. "Reload plugins" first calls `POST /reload
+  {what:'plugins'}`; a `held` answer opens `confirmDialog` ("Reloading changes the tools this conversation uses, so
+  the next reply cannot reuse the prompt cache." plus the added/removed MCP servers and the LSP change as plain text);
+  confirming repeats the call with `force: true`.
 - Accessibility: semantic buttons, `aria-label`s, visible focus, dialogs trap focus and close on Esc,
   `prefers-reduced-motion` respected, color contrast ≥ 4.5:1 in both themes.
 - Never block the UI on a failed request: show a toast with the localized error and keep state consistent.

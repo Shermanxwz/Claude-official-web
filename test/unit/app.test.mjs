@@ -51,7 +51,7 @@ function liveInfo(sessionId, extra = {}) {
 const HOST_METHODS = ['listSessions', 'getSession', 'getTranscript', 'createSession', 'openSession', 'closeSession',
   'sendMessage', 'interrupt', 'updateSettings', 'respond', 'getContextUsage', 'getCapabilities', 'mcpAction',
   'reload', 'rewind', 'fork', 'rename', 'tag', 'deleteSession', 'stopTask', 'listSubagents', 'getSubagentMessages',
-  'sessionCwd'];
+  'sessionCwd', 'backgroundTasks', 'setOutputStyle'];
 
 /**
  * Engine host double: records every call and answers with canned values. Tests override `replies` to force errors.
@@ -77,7 +77,7 @@ function makeEngineHost() {
       availableOutputStyles: [],
     }),
     mcpAction: () => [],
-    reload: () => undefined,
+    reload: () => ({ ok: true }),
     rewind: () => ({ conversation: { resumeAt: 'u-prev' } }),
     fork: () => ({ sessionId: NEW_SESSION }),
     rename: () => undefined,
@@ -87,6 +87,11 @@ function makeEngineHost() {
     listSubagents: () => ['agent-1'],
     getSubagentMessages: () => [],
     sessionCwd: () => root,
+    backgroundTasks: () => ({ backgrounded: true }),
+    setOutputStyle: (/** @type {string} */ _id, /** @type {string} */ style) => ({
+      outputStyle: style,
+      availableOutputStyles: ['default', style],
+    }),
   };
   /** @type {any} */
   const host = { calls, replies, live: /** @type {unknown[]} */ ([]), allLive: () => host.live };
@@ -188,10 +193,10 @@ function makeTerminal(enabled) {
 
 /**
  * @param {{profile?: 'read'|'standard'|'full', allowBypass?: boolean, terminal?: boolean, publicOrigin?: string,
- *   requireAuth?: boolean}} [options]
+ *   requireAuth?: boolean, backgroundTasksDisabled?: boolean}} [options]
  */
 async function startApp({ profile = 'full', allowBypass = false, terminal = false, publicOrigin = '',
-  requireAuth = true } = {}) {
+  requireAuth = true, backgroundTasksDisabled = false } = {}) {
   /** @type {Record<string, string>} */
   const env = {
     HOME: root,
@@ -204,6 +209,7 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
   };
   if (requireAuth) env.CAW_TOKEN = TOKEN;
   else env.CAW_REQUIRE_AUTH = '0';
+  if (backgroundTasksDisabled) env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
   if (publicOrigin) env.CAW_PUBLIC_ORIGIN = publicOrigin;
   const config = loadConfig(env, { packageVersion: '1.2.3' });
   /** @type {string[]} */
@@ -659,7 +665,7 @@ describe('route mapping', () => {
       assert.equal(first.claudeCodeVersion, null);
       assert.deepEqual(first.roots, ctx.config.roots);
       assert.deepEqual(first.defaults, { model: null, permissionMode: 'default', effort: null });
-      assert.deepEqual(first.features, { terminal: true, bypass: true, uploads: true });
+      assert.deepEqual(first.features, { terminal: true, bypass: true, uploads: true, backgroundTasks: true });
       assert.deepEqual(first.limits, { uploadMaxBytes: 26214400, imageMaxBytes: 5242880, maxLiveSessions: 4 });
 
       ctx.engineHost.live = [liveInfo(SESSION, { claudeCodeVersion: '2.1.295' })];
@@ -785,7 +791,7 @@ describe('route mapping', () => {
       assert.deepEqual((await request(ctx, 'POST', `${base}/tasks/task.9:x/stop`)).json, { ok: true });
       assert.deepEqual(ctx.engineHost.calls.map((call) => [call.name, ...call.args]), [
         ['mcpAction', SESSION, 'github', { action: 'toggle', enabled: false }],
-        ['reload', SESSION, 'plugins'],
+        ['reload', SESSION, 'plugins', {}],
         ['rewind', SESSION, { userMessageId: 'u-2', mode: 'both', dryRun: true }],
         ['fork', SESSION, { upToMessageId: 'u-2', title: 'Branch' }],
         ['respond', SESSION, 'req-1', { decision: 'allow', updatedInput: { a: 1 } }],
@@ -1219,6 +1225,78 @@ describe('terminal endpoint', () => {
       assert.match(await rawExchange(ctx.port, upgradeHead(ctx, { Cookie: ctx.cookie })),
         /^HTTP\/1\.1 501 Not Implemented/);
       assert.equal(ctx.terminal.calls.length, 0);
+    });
+  });
+});
+
+describe('runtime feature routes', () => {
+  it('moves a tool call to the background for the standard profile, validates the id and refuses reads', async () => {
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}/background`;
+      assert.deepEqual((await request(ctx, 'POST', base, { body: { toolUseId: 'toolu_mock_1' } })).json,
+        { backgrounded: true });
+      assert.equal((await request(ctx, 'POST', base, {})).status, 200);
+      assert.equal((await request(ctx, 'POST', base, { body: { toolUseId: 'not valid!' } })).status, 400);
+      assert.deepEqual(ctx.engineHost.calls.filter((call) => call.name === 'backgroundTasks')
+        .map((call) => call.args), [[SESSION, 'toolu_mock_1'], [SESSION, undefined]]);
+    });
+    await withApp({ profile: 'read' }, async (ctx) => {
+      await login(ctx);
+      assert.equal((await request(ctx, 'POST', `/api/sessions/${SESSION}/background`, {})).status, 403);
+      assert.equal(ctx.engineHost.calls.some((call) => call.name === 'backgroundTasks'), false);
+    });
+  });
+
+  it('changes the output style through the host and refuses a missing or non-text style', async () => {
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}/output-style`;
+      assert.deepEqual((await request(ctx, 'POST', base, { body: { style: 'learning' } })).json,
+        { outputStyle: 'learning', availableOutputStyles: ['default', 'learning'] });
+      assert.equal((await request(ctx, 'POST', base, { body: {} })).status, 400);
+      assert.equal((await request(ctx, 'POST', base, { body: { style: 7 } })).status, 400);
+      assert.deepEqual(ctx.engineHost.calls.filter((call) => call.name === 'setOutputStyle')
+        .map((call) => call.args), [[SESSION, 'learning']]);
+    });
+  });
+
+  it('reloads with force only when the client sends it, and validates the target and the flag', async () => {
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}/reload`;
+      assert.deepEqual((await request(ctx, 'POST', base, { body: { what: 'plugins', force: true } })).json,
+        { ok: true });
+      assert.equal((await request(ctx, 'POST', base, { body: { what: 'output-styles' } })).status, 200);
+      assert.equal((await request(ctx, 'POST', base, { body: { what: 'hooks' } })).status, 422);
+      assert.equal((await request(ctx, 'POST', base, { body: { what: 'plugins', force: 'yes' } })).status, 400);
+      assert.deepEqual(ctx.engineHost.calls.filter((call) => call.name === 'reload').map((call) => call.args), [
+        [SESSION, 'plugins', { force: true }],
+        [SESSION, 'output-styles', {}],
+      ]);
+    });
+  });
+
+  it('takes fastMode as true, false or null in the settings and refuses other values before the host', async () => {
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}/settings`;
+      for (const fastMode of [true, false, null]) {
+        assert.equal((await request(ctx, 'POST', base, { body: { fastMode } })).status, 200);
+      }
+      const refused = await request(ctx, 'POST', base, { body: { fastMode: 'on' } });
+      assert.equal(refused.status, 422);
+      assert.equal(refused.json.error.code, 'INVALID_ARGUMENT');
+      assert.deepEqual(ctx.engineHost.calls.filter((call) => call.name === 'updateSettings')
+        .map((call) => call.args), [[SESSION, { fastMode: true }], [SESSION, { fastMode: false }],
+        [SESSION, { fastMode: null }]]);
+    });
+  });
+
+  it('reports the background feature as off when the runtime disabled background tasks', async () => {
+    await withApp({ backgroundTasksDisabled: true }, async (ctx) => {
+      await login(ctx);
+      assert.equal((await request(ctx, 'GET', '/api/meta', {})).json.features.backgroundTasks, false);
     });
   });
 });

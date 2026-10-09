@@ -579,6 +579,34 @@
   line-height: 1.55;
 }
 
+/* A thinking block with no text: the rule of .thinking and a plain label, with no disclosure to open. */
+.thinking-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: fit-content;
+  max-width: 100%;
+  min-height: 28px;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border-strong);
+  color: var(--fg-subtle);
+  font-size: var(--fs-sm);
+}
+
+/* A response a fallback model withdrew: one muted line in place of the retracted text. */
+.withdrawn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: center;
+  max-width: 100%;
+  padding: var(--space-1) var(--space-3);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--fg-subtle);
+  font-size: var(--fs-sm);
+}
+
 .draft-tool {
   padding: var(--space-2) var(--space-3);
   border: 1px dashed var(--border-strong);
@@ -1044,6 +1072,12 @@
 
 .notice-collapse > summary {
   cursor: pointer;
+}
+
+/* The one action a notice may carry (Edit and retry) keeps its size and sits after the text. */
+.notice-action {
+  flex: none;
+  align-self: center;
 }
 
 .divider {

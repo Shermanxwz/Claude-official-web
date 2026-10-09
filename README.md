@@ -39,11 +39,13 @@ configurable (`CAW_APP_NAME`, default `Agent Web`).
 This is an overview. The complete map, with the SDK call or message behind each feature, is in
 [docs/FEATURES.md](docs/FEATURES.md).
 
-- **Conversation:** streaming replies, collapsible thinking, Markdown and code, tool cards for every tool family (diffs
-  for edits), subagents nested in their parent card, background tasks, interrupts, queued messages, compaction and
-  context usage.
+- **Conversation:** streaming replies, collapsible thinking with its summary, Markdown and code, tool cards for every
+  tool family (diffs for edits), subagents nested in their parent card, background tasks (including moving a running
+  command or subagent to the background, like Ctrl+B), interrupts that leave background tasks running, queued
+  messages, refusal-fallback notices, compaction and context usage.
 - **Approvals:** permission cards (allow once, allow always, or deny with a reason), answers to AskUserQuestion, plan
-  approval, MCP elicitation, permission modes, and model and effort switching. Allow always saves the ticked suggestions:
+  approval, MCP elicitation, permission modes, and model, effort and fast mode switching. Allow always saves the ticked
+  suggestions:
   allow rules and session-only mode switches start ticked, directory grants and other changes only when you tick them.
 - **Sessions:** start, resume, rename, tag, fork, rewind code or conversation, delete, paged history, and a session list
   grouped by project.
@@ -51,8 +53,11 @@ This is an overview. The complete map, with the SDK call or message behind each 
   without a terminal), `@` file mentions, image and file attachments, and prompt suggestions.
 - **Workspaces and folder trust:** allowed roots with a directory browser. Every path is checked against those roots. A
   folder's project settings, hooks, skills, CLAUDE.md and MCP servers load only after you trust the folder.
-- **Extensions:** MCP server status, toggle and reconnect; reload of plugins and skills; CLAUDE.md, settings, hooks and
-  plugins loaded as they are in the terminal, once the folder is trusted.
+- **Extensions:** MCP server status, toggle and reconnect; reload of plugins (with the prompt-cache check of
+  `/reload-plugins`), skills and output styles; an output style picker; CLAUDE.md, settings, hooks and plugins loaded as
+  they are in the terminal, once the folder is trusted.
+- **Official interfaces only:** every Claude Code feature goes through a public SDK interface. The few parts the gateway
+  implements itself, and the reasons, are listed in [ARCHITECTURE.md](ARCHITECTURE.md#official-interfaces).
 - **Operations:** a token login (stored as a hash by default), a health endpoint, structured logs, a systemd service
   installer, and a verification suite (`npm run seal`).
 - **Terminal fallback (optional):** a terminal tab for the commands that exist only in the terminal.
@@ -260,7 +265,7 @@ What this means for you:
 npm ci
 npm run dev            # mock engine, restarts on change, no login
 npm test               # unit and integration tests
-npm run test:e2e       # 22 browser tests; install Chromium first: npx playwright-core install chromium
+npm run test:e2e       # 30 browser tests; install Chromium first: npx playwright-core install chromium
 npm run typecheck      # tsc over the JSDoc types
 npm run check          # static rules over the whole tree
 npm run seal           # runs the checks above and verifies the source manifest; writes .state/seal-receipt.json

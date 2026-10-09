@@ -30,6 +30,9 @@
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').ForkSessionOptions} ForkSessionOptions */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').ForkSessionResult} ForkSessionResult */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SessionMutationOptions} SessionMutationOptions */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').ResolveSettingsOptions} ResolveSettingsOptions */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').ResolvedSettings} ResolvedSettings */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').FastModeState} FastModeState */
 
 export const PERMISSION_MODES = /** @type {const} */ (['default', 'acceptEdits', 'plan', 'auto', 'dontAsk',
   'bypassPermissions']);
@@ -70,6 +73,8 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {{model: string|null, permissionMode: PermissionMode, effort: EffortLevel|null}} defaults
  * @property {boolean} terminal
  * @property {boolean} allowBypass
+ * @property {boolean} backgroundTasksDisabled   CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is set (non-empty, not 0/false)
+ *   in the environment the gateway was started with, which the runtime inherits
  * @property {number} idleTimeoutMs
  * @property {number} maxLiveSessions
  * @property {number} uploadMaxBytes
@@ -95,6 +100,10 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {string|null} claudeCodeVersion
  * @property {{code: string, message: string}|null} error
  * @property {boolean} trusted              project settings, hooks, skills and MCP servers of cwd are loaded
+ * @property {boolean|null} fastMode        fast mode the gateway requested (flag settings layer); null = settings decide
+ * @property {FastModeState|null} fastModeState   what the runtime last reported (init or result); null = unknown
+ * @property {string|null} fastModeDisabledReason   FastModeDisabledReason from the same report; null = nothing blocks
+ * @property {number} backgroundTasks       live non-ambient background tasks (system/background_tasks_changed)
  */
 
 /**
@@ -159,6 +168,8 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {(sessionId: string, options?: SessionMutationOptions) => Promise<void>} deleteSession
  * @property {(sessionId: string) => Promise<string[]>} listSubagents
  * @property {(sessionId: string, agentId: string) => Promise<SessionMessage[]>} getSubagentMessages
+ * @property {(options: ResolveSettingsOptions) => Promise<ResolvedSettings>} resolveSettings
+ *   the settings cascade a query with these options would load (SDK `resolveSettings`, no process is spawned)
  */
 
 /**
@@ -184,10 +195,18 @@ export const SESSION_COOKIE = 'caw_session';
  */
 
 /**
+ * Answer of a reload: applied, or held by the runtime's prompt-cache check (plugins without `force`).
+ * @typedef {{ok: true, availableOutputStyles?: string[]} | {ok: false, held: true, cacheImpact: {
+ *   mcpServersAdded: string[], mcpServersRemoved: string[],
+ *   lspToolChange: 'adds'|'may-add'|'removes'|'may-remove'|null}}} ReloadResult
+ */
+
+/**
  * @typedef {Object} SessionSettings
  * @property {string|null} [model]
  * @property {PermissionMode} [permissionMode]
  * @property {EffortLevel|null} [effort]
+ * @property {boolean|null} [fastMode]
  */
 
 /**
@@ -210,7 +229,12 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {(sessionId: string) => Promise<Capabilities>} getCapabilities
  * @property {(sessionId: string, server: string, action: {action: 'toggle'|'reconnect', enabled?: boolean}) =>
  *   Promise<McpServerStatus[]>} mcpAction
- * @property {(sessionId: string, what: 'plugins'|'skills') => Promise<void>} reload
+ * @property {(sessionId: string, what: 'plugins'|'skills'|'output-styles', opts?: {force?: boolean}) =>
+ *   Promise<ReloadResult>} reload
+ * @property {(sessionId: string, toolUseId?: string) => Promise<{backgrounded: boolean}>} backgroundTasks
+ *   moves foreground Bash commands and subagents to the background (the terminal's Ctrl+B)
+ * @property {(sessionId: string, style: string) => Promise<{outputStyle: string, availableOutputStyles: string[]}>}
+ *   setOutputStyle   writes the project's local settings through the runtime's own writer
  * @property {(sessionId: string, opts: {userMessageId: string, mode: 'code'|'conversation'|'both', dryRun?: boolean}) =>
  *   Promise<{files?: RewindFilesResult, conversation?: {resumeAt: string}}>} rewind
  * @property {(sessionId: string, opts: {upToMessageId?: string, title?: string}) => Promise<{sessionId: string}>} fork

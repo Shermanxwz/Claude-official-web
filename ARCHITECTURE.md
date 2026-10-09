@@ -48,6 +48,39 @@ Engine adapter: src/engine/sdk-adapter.mjs (real)  |  src/engine/mock/ (determin
   them as generic cards, so new runtime features remain inspectable before the UI learns them.
 - Folder trust mirrors Claude Code's trust dialog: only trusted folders load project settings, hooks, skills, MCP
   servers and CLAUDE.md (`settingSources` includes `project` and `local`); untrusted folders run with user settings.
+- Thinking is shown as the terminal shows it: queries start with the runtime's `--thinking-display summarized` flag
+  (`extraArgs`), because a non-interactive session ignores `showThinkingSummaries`; a setting that turns summaries
+  off (`showThinkingSummaries: false`) is honored.
+- Stop behaves like Esc: queries declare `perTaskStopAffordance`, so an interrupt ends the turn and background tasks keep
+  running until they are stopped from the Tasks panel. Ctrl+B is `backgroundTasks()`.
+
+## Official interfaces
+
+Every Claude Code behavior goes through a public export of `@anthropic-ai/claude-agent-sdk`: `query()` and its
+control methods, its callbacks (`canUseTool`, `onElicitation`), the session functions (`listSessions`,
+`getSessionMessages`, `renameSession`, `forkSession`, …) and `resolveSettings()`. Settings are changed only through the
+runtime (`applyFlagSettings`, `updateSettings`, permission updates returned from `canUseTool`), never by editing files.
+Typed slash commands are passed to the runtime unchanged, so its own handlers run.
+
+The gateway implements only what has no public interface:
+
+| Part | Why it is the gateway's |
+|---|---|
+| Login, cookies, Origin/Host checks, SSE, uploads, workspace roots | Hosting a web UI, not a Claude Code feature |
+| `@` file autocomplete (`GET /api/fs/search`) | The runtime answers a `file_suggestions` control request, but the SDK exposes no method for it |
+| Folder trust store | The SDK has no API for Claude Code's trust records; trust is applied through `settingSources` |
+
+Public SDK interfaces that are deliberately not used:
+
+| Interface | Reason |
+|---|---|
+| `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET` | Marked unstable by the SDK; the runtime's `/usage` command works when typed |
+| `readMcpResource` (MCP Apps widgets) | Alpha, and it renders third-party HTML |
+| `onUserDialog` / `supportedDialogKinds` | Payload shapes are not documented; without them the runtime uses its plain refusal flow, which the UI renders |
+| `prewarm`, `startup` | Alpha process pre-warming; sessions start on demand |
+| `setMcpPermissionModeOverride` | Only tightens MCP servers under `bypassPermissions`/`auto`; not exposed yet |
+| `resumeDropsTurn` | Guards single-turn truncation in headless edit-and-retry; rewind here spans any number of turns |
+| `/bridge`, `/browser` subpath exports | They connect to Anthropic's hosted sessions (Remote Control), not to a self-hosted runtime |
 
 ## Process model
 

@@ -1119,3 +1119,241 @@ test('an unknown message type or subtype is kept as a diagnostic entry; a docume
   assert.equal(notice.diagnostic, undefined, 'a documented subtype is a notice, not a diagnostic entry');
   assert.equal(notice.text, 'Note.');
 });
+
+/** The rows of a work group that a turn holds, by their row kind. */
+const rowsOf = (model, rowKind) => find(model, 'work')
+  .flatMap((group) => group.items)
+  .filter((item) => item.kind === 'row' && item.rowKind === rowKind);
+
+test('a fallback notice withdraws the refused response: one marker, the notice, then the retry', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'Explain the exploit'));
+  model.applyLiveEvent(live.assistant(2, 'refused', [{ type: 'text', text: "I can't help with that request." }]));
+  model.applyLiveEvent(live.system(3, 'model_refusal_fallback', {
+    trigger: 'refusal',
+    direction: 'retry',
+    scope: 'session',
+    original_model: 'claude-main',
+    fallback_model: 'claude-fallback',
+    request_id: 'req-1',
+    api_refusal_category: 'cyber',
+    retracted_message_uuids: [uuid(2)],
+    content: 'The primary model declined; a fallback answered.',
+  }));
+  model.applyLiveEvent(live.assistant(4, 'retry', [{ type: 'text', text: 'Here is the answer from the fallback model.' }]));
+
+  const withdrawn = find(model, 'withdrawn');
+  assert.equal(withdrawn.length, 1);
+  assert.equal(withdrawn[0].uuid, uuid(2));
+  assert.deepEqual(withdrawn[0].blocks, [], 'the refused content is no longer carried');
+  const notice = find(model, 'notice').find((entry) => entry.code === 'refusal-fallback');
+  assert.equal(notice.level, 'warning');
+  assert.equal(notice.text, 'The primary model declined; a fallback answered.');
+  assert.equal(notice.vars.category, 'cyber');
+  const texts = find(model, 'assistant').flatMap((entry) => entry.blocks.map((block) => block.text));
+  assert.deepEqual(texts, ['Here is the answer from the fallback model.']);
+  assert.deepEqual(model.getEntries().map((entry) => entry.kind), ['user', 'withdrawn', 'notice', 'assistant']);
+});
+
+test('tool cards of a retracted message become one marker in their group and take their results with them', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'list the files'));
+  model.applyLiveEvent(live.assistant(2, 'refused', [
+    { type: 'tool_use', id: 'R1', name: 'Bash', input: { command: 'ls' } },
+    { type: 'tool_use', id: 'R2', name: 'Read', input: { file_path: 'a.txt' } },
+  ]));
+  model.applyLiveEvent(live.toolResult(3, 'R1', 'a.txt'));
+  model.applyLiveEvent(live.system(4, 'model_refusal_fallback', { retracted_message_uuids: [uuid(2), uuid(3)], content: '' }));
+  model.applyLiveEvent(live.assistant(5, 'retry', [{ type: 'text', text: 'Done another way.' }]));
+
+  assert.equal(toolsIn(find(model, 'work')[0] ?? { items: [] }).length, 0, 'no tool card of the refused message stays');
+  const markers = rowsOf(model, 'withdrawn');
+  assert.equal(markers.length, 1, 'the refused tool calls leave one marker');
+  assert.equal(markers[0].key, `wd:${uuid(2)}`);
+  assert.equal(find(model, 'withdrawn').length, 0);
+  const notice = find(model, 'notice').find((entry) => entry.code === 'refusal-fallback');
+  assert.equal(notice.text, '', 'empty content stays empty; the view supplies its default wording');
+  assert.equal(model.getRunState().running, true, 'the turn is still running the retry');
+});
+
+test('a retracted tool result withdraws its card while the tool_use message stays', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'read the secret'));
+  model.applyLiveEvent(live.assistant(2, 'm', [{ type: 'tool_use', id: 'S1', name: 'Read', input: { file_path: 's' } }]));
+  model.applyLiveEvent(live.toolResult(3, 'S1', 'TOP SECRET'));
+  model.applyLiveEvent(live.system(4, 'model_refusal_fallback', { retracted_message_uuids: [uuid(3)], content: 'x' }));
+
+  assert.equal(toolsIn(find(model, 'work')[0]).length, 0);
+  assert.equal(rowsOf(model, 'withdrawn').length, 1);
+  assert.equal(JSON.stringify(model.getEntries()).includes('TOP SECRET'), false, 'the withdrawn result is not carried');
+});
+
+test('a streaming draft that is open when the fallback notice arrives is dropped', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'x'));
+  model.applyLiveEvent(live.stream(2, { type: 'message_start', message: { id: 'draft-1' } }));
+  model.applyLiveEvent(live.stream(3, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
+  model.applyLiveEvent(live.stream(4, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'half an answer' } }));
+  assert.equal(find(model, 'assistant').filter((entry) => entry.streaming).length, 1);
+  model.applyLiveEvent(live.system(5, 'model_refusal_fallback', { retracted_message_uuids: [], content: 'fell back' }));
+  assert.equal(find(model, 'assistant').filter((entry) => entry.streaming).length, 0);
+  assert.equal(model.getEntries().some((entry) => JSON.stringify(entry).includes('half an answer')), false);
+});
+
+test('a retry that supersedes the refused answer evicts it on arrival; the end-of-turn notice leaves no marker', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'Explain the exploit'));
+  model.applyLiveEvent(live.assistant(2, 'refused', [
+    { type: 'text', text: "I can't help with that request." },
+  ]));
+  model.applyLiveEvent(live.assistant(3, 'refused-tools', [{ type: 'tool_use', id: 'RT', name: 'Bash', input: { command: 'ls' } }]));
+  model.applyLiveEvent(live.toolResult(4, 'RT', 'tombstoned'));
+  model.applyLiveEvent(live.assistant(5, 'retry', [{ type: 'text', text: 'Here is the answer from the fallback model.' }],
+    { supersedes: [uuid(2), uuid(3), uuid(4)] }));
+
+  assert.equal(find(model, 'withdrawn').length, 0, 'a superseded message leaves no marker');
+  assert.equal(rowsOf(model, 'withdrawn').length, 0);
+  assert.equal(JSON.stringify(model.getEntries()).includes("I can't help"), false);
+  assert.equal(JSON.stringify(model.getEntries()).includes('tombstoned'), false);
+  model.applyLiveEvent(live.system(6, 'model_refusal_fallback', {
+    scope: 'session', retracted_message_uuids: [uuid(2), uuid(3), uuid(4)], content: 'Retried on the fallback model.',
+  }));
+  assert.equal(find(model, 'withdrawn').length, 0, 'the notice finds nothing left to withdraw');
+  const texts = find(model, 'assistant').flatMap((entry) => entry.blocks.map((block) => block.text));
+  assert.deepEqual(texts, ['Here is the answer from the fallback model.']);
+  assert.equal(find(model, 'notice').filter((entry) => entry.code === 'refusal-fallback').length, 1);
+});
+
+test('a local fallback leaves the main answer that is still streaming untouched', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'x'));
+  model.applyLiveEvent(live.stream(2, { type: 'message_start', message: { id: 'main-1' } }));
+  model.applyLiveEvent(live.stream(3, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
+  model.applyLiveEvent(live.stream(4, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello ' } }));
+  model.applyLiveEvent(live.system(5, 'model_refusal_fallback', { scope: 'local', content: 'A subagent fell back.' }));
+  model.applyLiveEvent(live.stream(6, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'world' } }));
+  const streaming = find(model, 'assistant').filter((entry) => entry.streaming);
+  assert.equal(streaming.length, 1);
+  assert.equal(streaming[0].blocks.map((block) => block.text).join(''), 'Hello world');
+  model.applyLiveEvent(live.assistant(7, 'main-1', [{ type: 'text', text: 'Hello world' }]));
+  assert.equal(find(model, 'assistant').filter((entry) => entry.streaming).length, 0, 'the final message closes the draft');
+});
+
+test('a local fallback (subagent or side question) renders its notice inside the work group', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'x'));
+  model.applyLiveEvent(live.assistant(2, 'm', [{ type: 'tool_use', id: 'B1', name: 'Bash', input: { command: 'ls' } }]));
+  model.applyLiveEvent(live.system(3, 'model_refusal_fallback', { scope: 'local', content: 'The side question fell back.' }));
+
+  assert.equal(find(model, 'notice').some((entry) => entry.code === 'refusal-fallback'), false);
+  const [row] = rowsOf(model, 'notice');
+  assert.equal(row.code, 'refusal-fallback');
+  assert.equal(row.level, 'warning');
+  assert.equal(row.text, 'The side question fell back.');
+});
+
+test('a retraction inside a subagent withdraws the subagent message in its card', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'delegate'));
+  model.applyLiveEvent(live.assistant(2, 'm', [{ type: 'tool_use', id: 'AG', name: 'Agent', input: { prompt: 'p', description: 'd' } }]));
+  model.applyLiveEvent(live.assistant(5, 'sub', [{ type: 'text', text: 'subagent refusal text' }], { parent_tool_use_id: 'AG' }));
+  model.applyLiveEvent(live.system(6, 'model_refusal_fallback', { scope: 'local', retracted_message_uuids: [uuid(5)], content: 'sub fell back' }));
+
+  const card = toolsIn(find(model, 'work')[0])[0];
+  assert.equal(card.children.some((entry) => entry.kind === 'assistant'), false);
+  assert.equal(card.children.filter((entry) => entry.kind === 'withdrawn').length, 1);
+  assert.equal(JSON.stringify(model.getEntries()).includes('subagent refusal text'), false);
+});
+
+test('a withdrawal survives a replay: duplicates are ignored and a reloaded page keeps the marker', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'x'));
+  model.applyLiveEvent(live.assistant(2, 'refused', [{ type: 'text', text: 'no' }]));
+  model.applyLiveEvent(live.system(3, 'model_refusal_fallback', { retracted_message_uuids: [uuid(2)], content: 'c' }));
+  model.applyLiveEvent(live.assistant(2, 'refused', [{ type: 'text', text: 'no' }]));
+  assert.equal(find(model, 'withdrawn').length, 1, 'a repeated copy of the refused message is not added back');
+
+  model.prependTranscript([tx('user', 90, { role: 'user', content: 'earlier' })]);
+  assert.equal(find(model, 'withdrawn').length, 1);
+  assert.equal(JSON.stringify(model.getEntries()).includes('"no"'), false);
+});
+
+test('an empty or unknown retraction list changes nothing and a malformed notice never throws', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'x'));
+  model.applyLiveEvent(live.assistant(2, 'm', [{ type: 'text', text: 'kept' }]));
+  model.applyLiveEvent(live.system(3, 'model_refusal_fallback', { retracted_message_uuids: [uuid(99), 7, null] }));
+  model.applyLiveEvent(live.system(4, 'model_refusal_fallback', { retracted_message_uuids: 'not-a-list', content: 3 }));
+  model.applyLiveEvent(live.system(5, 'model_refusal_no_fallback', { refused_user_message_uuid: 12 }));
+  assert.equal(find(model, 'withdrawn').length, 0);
+  assert.equal(find(model, 'assistant')[0].blocks[0].text, 'kept');
+  const notices = find(model, 'notice').filter((entry) => entry.code === 'refusal-fallback');
+  assert.equal(notices.length, 2);
+  assert.equal(notices[1].text, '', 'non-text content shows the view default');
+  const [noFallback] = find(model, 'notice').filter((entry) => entry.code === 'refusal-no-fallback');
+  assert.equal(noFallback.vars.refused, null, 'a non-string uuid is not offered for edit and retry');
+});
+
+test('a refusal with no fallback keeps the refused user message uuid for edit and retry', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'a request'));
+  model.applyLiveEvent(live.system(2, 'model_refusal_no_fallback', {
+    original_model: 'claude-main',
+    request_id: null,
+    api_refusal_category: 'bio',
+    refused_user_message_uuid: uuid(1),
+    content: 'The model declined this request.',
+  }));
+  const [notice] = find(model, 'notice').filter((entry) => entry.code === 'refusal-no-fallback');
+  assert.equal(notice.level, 'warning');
+  assert.equal(notice.vars.refused, uuid(1));
+  assert.equal(notice.text, 'The model declined this request.');
+  assert.equal(model.getUserMessages().length, 1, 'the refused prompt stays a sent message');
+});
+
+test('plugin installation shows one muted row per step, and a failed install is a warning', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.system(1, 'plugin_install', { status: 'started' }));
+  model.applyLiveEvent(live.system(2, 'plugin_install', { status: 'installed', name: 'demo-plugin' }));
+  model.applyLiveEvent(live.system(3, 'plugin_install', { status: 'failed', name: 'broken', error: 'network down' }));
+  model.applyLiveEvent(live.system(4, 'plugin_install', { status: 'completed' }));
+  const rows = find(model, 'notice').filter((entry) => entry.code === 'plugin-install');
+  assert.deepEqual(rows.map((row) => row.vars.status), ['started', 'installed', 'failed', 'completed']);
+  assert.deepEqual(rows.map((row) => row.level), ['muted', 'muted', 'warning', 'muted']);
+  assert.equal(rows[1].vars.name, 'demo-plugin');
+  assert.equal(rows[2].vars.error, 'network down');
+});
+
+test('an MCP elicitation completion is a muted row that names the server', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.system(1, 'elicitation_complete', { mcp_server_name: 'docs', elicitation_id: 'e1' }));
+  const [row] = find(model, 'notice').filter((entry) => entry.code === 'elicitation-complete');
+  assert.equal(row.level, 'muted');
+  assert.equal(row.vars.server, 'docs');
+});
+
+test('control request progress changes no entry', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'x'));
+  const before = model.getEntries().length;
+  model.applyLiveEvent(live.system(2, 'control_request_progress', { request_id: 'r1', status: 'api_retry', attempt: 1 }));
+  model.applyLiveEvent(live.system(3, 'control_request_progress', { request_id: 'r1', status: 'started' }));
+  assert.equal(model.getEntries().length, before);
+  assert.equal(find(model, 'generic').length, 0);
+});
+
+test('thinking blocks keep their text, and an empty or redacted block has no text for the view to label', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'x'));
+  model.applyLiveEvent(live.assistant(2, 'm', [
+    { type: 'thinking', thinking: '', signature: 's' },
+    { type: 'redacted_thinking', data: 'opaque' },
+    { type: 'thinking', thinking: 'weighing options', signature: 's' },
+  ]));
+  const blocks = find(model, 'assistant')[0].blocks;
+  assert.deepEqual(blocks.map((block) => [block.kind, block.text, block.redacted]), [
+    ['thinking', '', false],
+    ['thinking', '', true],
+    ['thinking', 'weighing options', false],
+  ]);
+});

@@ -136,6 +136,19 @@ function readPackageVersion() {
 }
 
 /**
+ * Whether the runtime will be told to run without background tasks: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is set to a
+ * non-empty value other than 0 or false. The runtime inherits this environment, so the gateway checks the same value.
+ * @param {string|undefined} raw
+ * @returns {boolean}
+ */
+function backgroundTasksDisabledIn(raw) {
+  const value = optionalText(raw);
+  if (value === null) return false;
+  const lowered = value.toLowerCase();
+  return lowered !== '0' && lowered !== 'false';
+}
+
+/**
  * @param {Record<string, string|undefined>} env
  * @returns {string}
  */
@@ -256,6 +269,7 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
     defaults: Object.freeze({ model, permissionMode, effort }),
     terminal: flag('CAW_TERMINAL', env.CAW_TERMINAL, false),
     allowBypass,
+    backgroundTasksDisabled: backgroundTasksDisabledIn(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS),
     idleTimeoutMs: integer('CAW_IDLE_TIMEOUT_MS', env.CAW_IDLE_TIMEOUT_MS, 1800000, 60000, 86400000),
     maxLiveSessions: integer('CAW_MAX_LIVE_SESSIONS', env.CAW_MAX_LIVE_SESSIONS, 4, 1, 32),
     uploadMaxBytes: integer('CAW_UPLOAD_MAX_BYTES', env.CAW_UPLOAD_MAX_BYTES, 26214400, 1024, 1073741824),

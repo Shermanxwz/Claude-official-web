@@ -1,14 +1,14 @@
 import { errorText } from '../api.js';
 import { getLocale } from '../i18n.js';
 import { clear, h, icon } from '../dom.js';
-import { effortLevelsFor, effortModelFor, modelSelectPlan } from './composer-logic.js';
+import { effortLevelsFor, effortModelFor, fastModeView, modelSelectPlan } from './composer-logic.js';
 import { openDialog } from './dialog.js';
 import { openMenu } from './menu.js';
 
 /**
- * Session header: title, working directory, model / permission / effort controls, context meter, state badge and the
- * overflow menu. It renders from the store and changes settings through `actions.updateSettings`, showing the new
- * value at once and rolling it back when the request fails.
+ * Session header: title, working directory, model / permission / effort and fast mode controls, the background tasks
+ * badge, context meter, state badge and the overflow menu. It renders from the store and changes settings through
+ * `actions.updateSettings`, showing the new value at once and rolling it back when the request fails.
  */
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto', 'dontAsk'];
@@ -126,6 +126,8 @@ export function createHeader({ container, api, store, t, actions }) {
     options: { model: [], mode: [], effort: [] },
     /** The option values the header selects show, so the phone pickers mark the same choices. */
     selected: { model: '', mode: 'default', effort: '' },
+    /** What the fast mode control shows, as computed by the last sync. */
+    fast: fastModeView(null, false),
     disposed: false,
   };
 
@@ -162,6 +164,18 @@ export function createHeader({ container, api, store, t, actions }) {
     attrs: { 'aria-label': t('header.effortLabel') },
     on: { change: () => commitChange({ effort: effortSel.value || null }) },
   }));
+  const fastBtn = /** @type {HTMLButtonElement} */ (h('button', {
+    class: 'hdr-fast',
+    attrs: { type: 'button', 'aria-pressed': 'false' },
+    on: { click: () => commitChange({ fastMode: !view.fast.pressed }) },
+  }, icon('spark'), h('span', { class: 'hdr-fast-label', text: t('header.fast') })));
+  const fastNote = h('span', { class: 'hdr-fast-note', attrs: { role: 'status' }, text: t('header.fast.cooling') });
+  const tasksText = h('span', { class: 'hdr-tasks-text' });
+  const tasksBtn = /** @type {HTMLButtonElement} */ (h('button', {
+    class: 'hdr-tasks',
+    attrs: { type: 'button', title: t('header.tasks') },
+    on: { click: () => actions.openPanel('tasks') },
+  }, icon('layers'), tasksText));
 
   const ctxFill = h('span', { class: 'ctx-fill' });
   const ctxLabel = h('span', { class: 'ctx-label' });
@@ -181,8 +195,8 @@ export function createHeader({ container, api, store, t, actions }) {
     on: { click: openOverflow },
   }, icon('more'));
 
-  const controls = h('div', { class: 'hdr-controls' }, modelSel, modeSel, effortSel, ctxBtn);
-  const right = h('div', { class: 'hdr-right' }, controls, badge, moreBtn);
+  const controls = h('div', { class: 'hdr-controls' }, modelSel, modeSel, effortSel, fastBtn, fastNote, ctxBtn);
+  const right = h('div', { class: 'hdr-right' }, controls, tasksBtn, badge, moreBtn);
   const root = h('header', { class: 'session-header' }, left, right);
   container.appendChild(root);
 
@@ -211,7 +225,48 @@ export function createHeader({ container, api, store, t, actions }) {
       ? { model: live.model ?? null, permissionMode: live.permissionMode ?? 'default', effort: live.effort ?? null }
       : { model: defaults.model ?? null, permissionMode: defaults.permissionMode ?? 'default',
         effort: defaults.effort ?? null };
-    return { ...base, ...(id ? view.overrides.get(id) : null) };
+    return { ...base, fastMode: live?.fastMode ?? null, ...(id ? view.overrides.get(id) : null) };
+  }
+
+  /**
+   * The fast mode control. The model row the model select matches (the account default when none is set) decides
+   * whether the model offers fast mode; the live info supplies what the runtime reports.
+   * @param {any[]} models
+   * @param {string|null} defaultModel
+   * @param {any} live
+   * @param {{model: string|null, fastMode: boolean|null}} settings
+   */
+  function fastView(models, defaultModel, live, settings) {
+    const row = effortModelFor(models, settings.model, defaultModel);
+    return fastModeView({
+      requested: settings.fastMode,
+      runtime: live?.fastModeState ?? null,
+      reason: live?.fastModeDisabledReason ?? null,
+    }, row?.supportsFastMode === true);
+  }
+
+  /**
+   * Localized reason fast mode cannot serve. A reason without a translation is shown as the runtime sent it.
+   * @param {string} reason
+   * @returns {string}
+   */
+  function fastReasonText(reason) {
+    const key = `header.fast.reason.${reason}`;
+    const text = t(key);
+    return text === key ? reason : text;
+  }
+
+  /**
+   * One-line status of the fast mode control, for the phone menu's label.
+   * @param {{pressed: boolean, state: string|null, reason: string|null}} fast
+   * @returns {string}
+   */
+  function fastStatus(fast) {
+    if (fast.state === 'cooldown') return t('header.fast.cooling');
+    if (fast.pressed && fast.state === 'off' && fast.reason) {
+      return t('header.fast.unavailable', { reason: fastReasonText(fast.reason) });
+    }
+    return fast.pressed ? t('header.fast.stateOn') : t('header.fast.stateOff');
   }
 
   function sync() {
@@ -285,6 +340,23 @@ export function createHeader({ container, api, store, t, actions }) {
     effortSel.disabled = !editable;
     modeSel.title = t(`common.mode.${modeValue}.hint`);
     effortSel.hidden = levels.length === 0;
+
+    const fast = fastView(models, defaults.model ?? null, live, settings);
+    view.fast = fast;
+    fastBtn.hidden = !fast.visible;
+    fastBtn.disabled = !editable;
+    fastBtn.setAttribute('aria-pressed', String(fast.pressed));
+    fastBtn.dataset.state = fast.state ?? 'unknown';
+    fastBtn.classList.toggle('is-muted', fast.pressed && fast.state === 'off');
+    fastBtn.title = fast.state === 'off' && fast.reason
+      ? `${t('header.fast.tip')}\n${fastReasonText(fast.reason)}`
+      : t('header.fast.tip');
+    fastNote.hidden = fast.state !== 'cooldown';
+
+    const background = Number(live?.backgroundTasks) || 0;
+    tasksBtn.hidden = background <= 0;
+    if (background > 0) tasksText.textContent = t('header.background', { count: background });
+
     controls.hidden = !hasSession;
     view.options = { model: modelPlan.options, mode: modeOptions, effort: effortOptions.slice(1) };
     view.selected = { model: modelPlan.value, mode: modeValue, effort: effortValue };
@@ -411,10 +483,13 @@ export function createHeader({ container, api, store, t, actions }) {
    * @param {string} labelKey
    * @param {string} iconName
    * @param {() => void} onSelect
-   * @param {{disabled?: boolean, label?: string}} [extra]
+   * @param {{disabled?: boolean, label?: string, checked?: boolean}} [extra]  checked: a checkable row
    */
   function menuItem(labelKey, iconName, onSelect, extra = {}) {
-    return { label: extra.label ?? t(labelKey), icon: iconName, disabled: Boolean(extra.disabled), onClick: onSelect };
+    /** @type {{label: string, icon: string, disabled: boolean, onClick: () => void, checked?: boolean}} */
+    const item = { label: extra.label ?? t(labelKey), icon: iconName, disabled: Boolean(extra.disabled), onClick: onSelect };
+    if (extra.checked !== undefined) item.checked = extra.checked;
+    return item;
   }
 
   /**
@@ -481,6 +556,16 @@ export function createHeader({ container, api, store, t, actions }) {
           pick('header.effortLabel', 'gauge', effortChoices, view.selected.effort,
             (value) => commitChange({ effort: value || null }));
         }
+        // On phones the header shows no controls, so fast mode is a checkable row of the overflow menu.
+        const models = Array.isArray(s.capabilities?.[id]?.models) ? s.capabilities[id].models : [];
+        const fast = fastView(models, meta.defaults?.model ?? null, live, effectiveSettings(id, live, meta));
+        if (fast.visible) {
+          items.push(menuItem('header.fast', 'spark', () => commitChange({ fastMode: !fast.pressed }), {
+            disabled: !editable,
+            label: `${t('header.fast')}: ${fastStatus(fast)}`,
+            checked: fast.pressed,
+          }));
+        }
       }
       items.push('separator');
       items.push(menuItem('header.rewind', 'rewind', () => actions.openRewind(), { disabled: !editable }));
@@ -510,6 +595,16 @@ export function createHeader({ container, api, store, t, actions }) {
         if (view.liveState) refreshContext(next);
       }
       sync();
+    },
+    /**
+     * Toggles fast mode as the header button does, from the state the header shows (a change still in flight
+     * included). Returns false when the control is not offered or not editable.
+     * @returns {boolean}
+     */
+    toggleFast() {
+      if (!view.id || !view.fast.visible || fastBtn.disabled) return false;
+      commitChange({ fastMode: !view.fast.pressed });
+      return true;
     },
     destroy() {
       view.disposed = true;

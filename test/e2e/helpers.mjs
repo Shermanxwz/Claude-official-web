@@ -279,12 +279,13 @@ export async function signIn(page, url, token = TOKEN) {
 
 /**
  * Creates a session through the New session dialog: opens the dialog, enters the folder, optionally titles the
- * session and starts it. Returns the new session id from the URL hash.
+ * session and starts it. Returns the new session id from the URL hash. The dialog trusts an untrusted folder by default;
+ * `trust: false` leaves the folder untrusted, so the session starts with user settings only.
  * @param {import('playwright-core').Page} page
- * @param {{folder?: string, title?: string}} [options]
+ * @param {{folder?: string, title?: string, trust?: boolean}} [options]
  * @returns {Promise<string>}
  */
-export async function createSession(page, { folder = PROJECT, title } = {}) {
+export async function createSession(page, { folder = PROJECT, title, trust = true } = {}) {
   await page.getByRole('button', { name: 'New session', exact: true }).first().click();
   const dialog = page.getByRole('dialog', { name: 'New session', exact: true });
   await dialog.waitFor();
@@ -298,6 +299,12 @@ export async function createSession(page, { folder = PROJECT, title } = {}) {
     return false;
   }, { message: `the New session dialog never showed the folder ${folder}` });
   if (title) await dialog.getByPlaceholder('A name for this session').fill(title);
+  if (!trust) {
+    // The trust notice shows only while the folder on screen is untrusted; its checkbox is what applies trust.
+    const checkbox = dialog.locator('.trust-notice input[type="checkbox"]');
+    await checkbox.waitFor({ state: 'attached' });
+    await checkbox.uncheck();
+  }
   await dialog.getByRole('button', { name: 'Start session', exact: true }).click();
   await dialog.waitFor({ state: 'detached' });
   await page.waitForFunction(() => /^#\/s\/[0-9a-f-]{36}$/i.test(location.hash));

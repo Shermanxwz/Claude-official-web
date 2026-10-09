@@ -87,17 +87,21 @@
   white-space: nowrap;
 }
 
+/* The right side may shrink below its content: the model and permission selects then truncate their text, so the
+   controls still fit next to the title on the narrowest desktop widths. */
 .hdr-right {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .hdr-controls {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  min-width: 0;
 }
 
 .hdr-select {
@@ -118,6 +122,88 @@
 .hdr-select:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+/* Fast mode, beside the effort select. Pressed (requested, or running with nothing requested) reads as accent. A request
+   the runtime refuses reads muted; the reason is in the tooltip. Cooling down is a warning label next to it. */
+.hdr-fast {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.hdr-fast:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.hdr-fast:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.hdr-fast .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.hdr-fast[aria-pressed='true'],
+.hdr-fast[data-state='on'] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.hdr-fast.is-muted {
+  border-color: var(--border);
+  background: var(--bg-elev);
+  color: var(--fg-subtle);
+}
+
+.hdr-fast-note {
+  flex: 0 0 auto;
+  color: var(--warning);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+/* Background tasks: a small pill that opens the Tasks panel. It stays visible on phones, where the other controls hide. */
+.hdr-tasks {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--info-soft);
+  color: var(--info);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.hdr-tasks:hover {
+  border-color: var(--info);
+}
+
+.hdr-tasks .icon {
+  width: 13px;
+  height: 13px;
 }
 
 .hdr-icon-btn {
@@ -768,6 +854,10 @@
     min-height: 44px;
   }
 
+  .hdr-tasks {
+    min-height: 44px;
+  }
+
   .composer-input {
     font-size: 16px;
   }
@@ -815,7 +905,9 @@
   .composer-icon-btn,
   .composer-send,
   .composer-stop,
-  .hdr-icon-btn {
+  .hdr-icon-btn,
+  .hdr-fast,
+  .hdr-tasks {
     min-width: 44px;
     min-height: 44px;
   }

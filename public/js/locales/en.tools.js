@@ -130,6 +130,8 @@ registerMessages('en', {
   'tools.agent.asyncLaunched': 'Running in the background',
   'tools.agent.background': 'background',
   'tools.agent.copyResult': 'Copy result',
+  'tools.background.run': 'Run in background',
+  'tools.background.hint': 'Keep running in the background while the conversation continues',
   'tools.agent.isolation': 'isolation: {mode}',
   'tools.agent.openSession': 'Open cloud session',
   'tools.agent.tokens': 'Tokens: {count}',

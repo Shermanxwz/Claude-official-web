@@ -25,6 +25,7 @@ const GUI_COMMANDS = [
   { id: 'model', name: 'model' },
   { id: 'permissions', name: 'permissions' },
   { id: 'effort', name: 'effort' },
+  { id: 'fast', name: 'fast' },
   { id: 'rewind', name: 'rewind' },
   { id: 'fork', name: 'fork' },
   { id: 'rename', name: 'rename' },
@@ -594,6 +595,9 @@ export function createComposer({ container, api, store, t, actions }) {
       case 'effort':
         focusHeaderSetting(guiId);
         break;
+      case 'fast':
+        toggleFast();
+        break;
       case 'rewind':
         actions.openRewind();
         break;
@@ -621,6 +625,16 @@ export function createComposer({ container, api, store, t, actions }) {
       default:
         break;
     }
+  }
+
+  /**
+   * The GUI `/fast` command: flips fast mode the way the header toggle does. When the session's model does not offer fast
+   * mode and nothing requests or runs it, the command says so instead.
+   */
+  /** The header owns the fast mode control, including a change still in flight, so `/fast` goes through it. */
+  function toggleFast() {
+    if (!view.id) return;
+    if (!actions.toggleFastMode?.()) actions.toast(t('composer.fastUnavailable'), 'info');
   }
 
   /** @param {string} guiId */

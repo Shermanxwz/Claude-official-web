@@ -130,6 +130,8 @@ registerMessages('zh-CN', {
   'tools.agent.asyncLaunched': '正在后台运行',
   'tools.agent.background': '后台',
   'tools.agent.copyResult': '复制结果',
+  'tools.background.run': '后台运行',
+  'tools.background.hint': '转入后台继续运行，对话可以继续进行',
   'tools.agent.isolation': '隔离：{mode}',
   'tools.agent.openSession': '打开云端会话',
   'tools.agent.tokens': 'Token 数：{count}',

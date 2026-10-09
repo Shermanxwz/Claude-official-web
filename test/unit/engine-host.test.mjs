@@ -48,6 +48,8 @@ class FakeQuery {
       mcpServerStatus: structuredClone(DEFAULT_MCP),
       rewindFiles: { ...DEFAULT_REWIND },
       getContextUsage: structuredClone(DEFAULT_CONTEXT),
+      backgroundTasks: true,
+      reloadOutputStyles: { available_output_styles: ['default', 'explanatory'] },
     };
   }
 
@@ -92,9 +94,12 @@ class FakeQuery {
   mcpServerStatus() { return this.#call('mcpServerStatus'); }
   toggleMcpServer(name, enabled) { return this.#call('toggleMcpServer', name, enabled); }
   reconnectMcpServer(name) { return this.#call('reconnectMcpServer', name); }
-  reloadPlugins() { return this.#call('reloadPlugins'); }
+  reloadPlugins(options) { return this.#call('reloadPlugins', options); }
   reloadSkills() { return this.#call('reloadSkills'); }
+  reloadOutputStyles() { return this.#call('reloadOutputStyles'); }
   stopTask(taskId) { return this.#call('stopTask', taskId); }
+  backgroundTasks(toolUseId) { return this.#call('backgroundTasks', toolUseId); }
+  updateSettings(source, settings) { return this.#call('updateSettings', source, settings); }
 
   close() {
     this.calls.push(['close']);
@@ -142,12 +147,25 @@ function createEngine() {
     calls: /** @type {unknown[][]} */ ([]),
     startError: /** @type {Error|null} */ (null),
     infoError: /** @type {Error|null} */ (null),
+    /** The settings the user's files define, as resolveSettings reports them. */
+    settingsOnDisk: /** @type {Record<string, unknown>} */ ({}),
+    /** Every resolveSettings call, with its options. */
+    settingsLookups: /** @type {Array<Record<string, unknown>>} */ ([]),
+    resolveError: /** @type {Error|null} */ (null),
+    resolveHangs: false,
     /** @param {{prompt: AsyncQueue<unknown>, options: Record<string, unknown>}} params */
     query({ prompt, options }) {
       if (engine.startError) throw engine.startError;
       const query = new FakeQuery(prompt, options);
       engine.queries.push(query);
       return query;
+    },
+    /** @param {Record<string, unknown>} [options] */
+    async resolveSettings(options) {
+      engine.settingsLookups.push(options ?? {});
+      if (engine.resolveHangs) await new Promise(() => {});
+      if (engine.resolveError) throw engine.resolveError;
+      return { effective: { ...engine.settingsOnDisk }, provenance: {}, sources: [] };
     },
     async listSessions(options) {
       engine.calls.push(['listSessions', options]);
@@ -268,14 +286,17 @@ const INSIDE_ROOTS = async (p) => p === CWD || p.startsWith(`${CWD}/`);
 /**
  * A host wired to the fake engine, a recording publisher, a recording logger and a manual clock.
  * `trusted` is the isTrustedCwd option; `null` leaves the option out so the host's default applies. `allowed` answers
- * the workspace roots check.
+ * the workspace roots check. `settingsOnDisk` is what the fake engine reports for the user's settings files.
  * @param {{config?: Record<string, unknown>, clock?: number,
- *   trusted?: ((p: string) => Promise<boolean>)|null, allowed?: (p: string) => Promise<boolean>}} [options]
+ *   trusted?: ((p: string) => Promise<boolean>)|null, allowed?: (p: string) => Promise<boolean>,
+ *   settingsOnDisk?: Record<string, unknown>}} [options]
  */
-function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED, allowed = INSIDE_ROOTS } = {}) {
+function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED, allowed = INSIDE_ROOTS,
+  settingsOnDisk = {} } = {}) {
   const events = [];
   const logs = [];
   const engine = createEngine();
+  engine.settingsOnDisk = settingsOnDisk;
   const time = { now: clock };
   let seq = 0;
   const recordLog = (level) => (msg, fields) => logs.push({ level, msg, fields });
@@ -409,6 +430,8 @@ describe('EngineHost starting queries', () => {
       promptSuggestions: true,
       agentProgressSummaries: true,
       enableFileCheckpointing: true,
+      perTaskStopAffordance: true,
+      extraArgs: { 'thinking-display': 'summarized' },
       toolConfig: { askUserQuestion: { previewFormat: 'markdown' } },
     });
     assert.ok(query.prompt instanceof AsyncQueue);
@@ -1655,7 +1678,7 @@ describe('EngineHost MCP servers, reload and context usage', () => {
     await h.host.reload(sessionId, 'plugins');
     await h.host.reload(sessionId, 'skills');
     assert.deepEqual(query.calls.filter((call) => call[0].startsWith('reload')), [
-      ['reloadPlugins'], ['reloadSkills'],
+      ['reloadPlugins', { holdOnCacheImpact: true }], ['reloadSkills'],
     ]);
     await h.host.getCapabilities(sessionId);
     assert.equal(query.calls.filter((call) => call[0] === 'initializationResult').length, 2);
@@ -2744,5 +2767,354 @@ describe('EngineHost bypassPermissions suggestions', () => {
     assert.deepEqual(await pending, {
       behavior: 'allow', updatedInput: { command: 'ls' }, updatedPermissions: [bypass],
     });
+  });
+});
+
+/**
+ * A system/background_tasks_changed message: the whole set of live tasks after a change.
+ * @param {string} sessionId
+ * @param {Array<Record<string, unknown>>} tasks
+ */
+function backgroundChange(sessionId, tasks) {
+  return { type: 'system', subtype: 'background_tasks_changed', tasks, uuid: randomUUID(), session_id: sessionId };
+}
+
+/**
+ * A result message of a finished turn. Fields that a test does not set are the ordinary ones of a success.
+ * @param {string} sessionId
+ * @param {Record<string, unknown>} [overrides]
+ */
+function resultMessage(sessionId, overrides = {}) {
+  return {
+    type: 'result',
+    subtype: 'success',
+    uuid: randomUUID(),
+    session_id: sessionId,
+    is_error: false,
+    result: 'Done.',
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+    total_cost_usd: 0,
+    usage: {},
+    modelUsage: {},
+    permission_denials: [],
+    stop_reason: 'end_turn',
+    ...overrides,
+  };
+}
+
+/** @param {{fastModeState: string|null, fastModeDisabledReason: string|null}} info */
+function pickFastMode(info) {
+  return { state: info.fastModeState, reason: info.fastModeDisabledReason };
+}
+
+const RUNNING_TASK = { task_id: 'bash-1', task_type: 'local_bash', description: 'npm run build' };
+
+describe('EngineHost settings overlay and fast mode', () => {
+  test('thinking summaries are requested with the display flag unless the loaded settings turn them off', async () => {
+    const off = harness({ settingsOnDisk: { showThinkingSummaries: false } });
+    const kept = await startLive(off);
+    assert.equal('extraArgs' in kept.query.options, false);
+    assert.equal('settings' in kept.query.options, false);
+    assert.deepEqual(off.engine.settingsLookups, [{ cwd: CWD, settingSources: ['user', 'project', 'local'] }]);
+
+    // A non-interactive runtime ignores the setting itself, so a user who asked for summaries gets the flag too.
+    const on = harness({ settingsOnDisk: { showThinkingSummaries: true } });
+    assert.deepEqual((await startLive(on)).query.options.extraArgs, { 'thinking-display': 'summarized' });
+
+    const open = harness();
+    const added = await startLive(open);
+    assert.deepEqual(added.query.options.extraArgs, { 'thinking-display': 'summarized' });
+    assert.equal('settings' in added.query.options, false);
+    assert.equal('thinking' in added.query.options, false);
+  });
+
+  test('an untrusted folder reads and loads only the user settings', async () => {
+    const h = harness({ trusted: async () => false, settingsOnDisk: { fastMode: true } });
+    const { query } = await startLive(h);
+    assert.deepEqual(h.engine.settingsLookups, [{ cwd: CWD, settingSources: ['user'] }]);
+    assert.deepEqual(query.options.settingSources, ['user']);
+    assert.deepEqual(query.options.extraArgs, { 'thinking-display': 'summarized' });
+    assert.equal('settings' in query.options, false);
+  });
+
+  test('a failed lookup still requests thinking summaries and logs the failure without its text', async () => {
+    const h = harness();
+    h.engine.resolveError = new Error('cannot read /home/alice/.claude/settings.json');
+    const { query } = await startLive(h);
+    assert.deepEqual(query.options.extraArgs, { 'thinking-display': 'summarized' });
+    const failure = h.logs.find((entry) => entry.msg === 'settings lookup failed; thinking summaries requested');
+    assert.equal(failure?.level, 'debug');
+    assert.equal(JSON.stringify(h.logs).includes('alice'), false);
+  });
+
+  test('a lookup that does not answer within two seconds is abandoned and summaries are requested', async (t) => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+    t.after(() => mock.timers.reset());
+    const h = harness();
+    h.engine.resolveHangs = true;
+    const started = h.host.createSession({ cwd: CWD });
+    await flush();
+    mock.timers.tick(1999);
+    await flush();
+    assert.equal(h.engine.queries.length, 0);
+    mock.timers.tick(1);
+    await started;
+    assert.deepEqual(h.engine.queries[0].options.extraArgs, { 'thinking-display': 'summarized' });
+  });
+
+  test('a remembered fast mode rides the flag overlay of the next start, and null leaves it to the settings',
+    async () => {
+      const h = harness();
+      addSession(h.engine, S1);
+      await h.host.updateSettings(S1, { fastMode: true });
+      const first = await openLive(h, S1);
+      assert.deepEqual(first.query.options.settings, { fastMode: true });
+      await h.host.closeSession(S1);
+      await h.host.updateSettings(S1, { fastMode: false });
+      assert.deepEqual((await openLive(h, S1)).query.options.settings, { fastMode: false });
+      await h.host.closeSession(S1);
+      await h.host.updateSettings(S1, { fastMode: null });
+      const third = await openLive(h, S1);
+      assert.equal('settings' in third.query.options, false);
+    });
+
+  test('the fast mode that init and every result report replaces the live state', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h, { cwd: CWD }, {
+      fast_mode_state: 'off',
+      fast_mode_disabled_reason: 'sdk_opt_in_required',
+    });
+    assert.deepEqual(pickFastMode(h.host.liveInfo(sessionId)), { state: 'off', reason: 'sdk_opt_in_required' });
+    query.emit(resultMessage(sessionId, { fast_mode_state: 'on' }));
+    await flush();
+    assert.deepEqual(pickFastMode(h.host.liveInfo(sessionId)), { state: 'on', reason: null });
+    query.emit(resultMessage(sessionId, { fast_mode_state: 'off', fast_mode_disabled_reason: 'model_not_allowed' }));
+    await flush();
+    assert.deepEqual(pickFastMode(h.host.liveInfo(sessionId)), { state: 'off', reason: 'model_not_allowed' });
+    query.emit(resultMessage(sessionId));
+    await flush();
+    assert.deepEqual(pickFastMode(h.host.liveInfo(sessionId)), { state: 'off', reason: 'model_not_allowed' });
+  });
+
+  test('fastMode reaches the live query as a flag setting, and an invalid value is refused first', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    const on = await h.host.updateSettings(sessionId, { fastMode: true });
+    assert.equal(on.fastMode, true);
+    assert.deepEqual(query.calls.at(-1), ['applyFlagSettings', { fastMode: true }]);
+    const off = await h.host.updateSettings(sessionId, { fastMode: null });
+    assert.equal(off.fastMode, null);
+    assert.deepEqual(query.calls.at(-1), ['applyFlagSettings', { fastMode: null }]);
+    await expectError(h.host.updateSettings(sessionId, { fastMode: 'yes' }), 422, 'INVALID_ARGUMENT');
+    assert.equal(query.calls.filter((call) => call[0] === 'applyFlagSettings').length, 2);
+  });
+});
+
+describe('EngineHost background tasks', () => {
+  test('background_tasks_changed sets the live count and leaves ambient tasks out', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    query.emit(backgroundChange(sessionId, [RUNNING_TASK, { ...RUNNING_TASK, task_id: 'agent-1', ambient: true }]));
+    await flush();
+    assert.equal(h.host.liveInfo(sessionId).backgroundTasks, 1);
+    query.emit(backgroundChange(sessionId, []));
+    await flush();
+    assert.equal(h.host.liveInfo(sessionId).backgroundTasks, 0);
+  });
+
+  test('a background_tasks_changed message without a task list changes nothing and keeps the session running',
+    async () => {
+      const h = harness();
+      const { sessionId, query } = await startLive(h);
+      query.emit(backgroundChange(sessionId, [RUNNING_TASK]));
+      await flush();
+      query.emit({ type: 'system', subtype: 'background_tasks_changed', uuid: randomUUID(), session_id: sessionId });
+      query.emit(backgroundChange(sessionId, [RUNNING_TASK, null, 'shell']));
+      await flush();
+      assert.equal(h.host.liveInfo(sessionId).backgroundTasks, 1);
+      assert.notEqual(h.host.liveInfo(sessionId).state, 'error');
+    });
+
+  test('the idle sweep and making room leave a session with background tasks alone', async () => {
+    const h = harness({ config: { maxLiveSessions: 1, idleTimeoutMs: MINUTE } });
+    const { sessionId, query } = await startLive(h);
+    query.emit(backgroundChange(sessionId, [RUNNING_TASK]));
+    await flush();
+    const later = h.time.now + 10 * MINUTE;
+    assert.equal(await h.host.sweepIdle(later), 0);
+    await expectError(h.host.createSession({ cwd: CWD }), 429, 'TOO_MANY_SESSIONS');
+    assert.equal(query.closed, false);
+    query.emit(backgroundChange(sessionId, []));
+    await flush();
+    assert.equal(await h.host.sweepIdle(later), 1);
+    assert.equal(h.host.liveInfo(sessionId), null);
+  });
+
+  test('a query that ends takes its count with it, and the next start begins at zero', async () => {
+    const h = harness();
+    addSession(h.engine, S1);
+    const { query } = await openLive(h, S1);
+    query.emit(backgroundChange(S1, [RUNNING_TASK]));
+    await flush();
+    assert.equal(h.host.liveInfo(S1).backgroundTasks, 1);
+    query.finish();
+    await flush();
+    assert.equal(h.host.liveInfo(S1), null);
+    await openLive(h, S1);
+    assert.equal(h.host.liveInfo(S1).backgroundTasks, 0);
+  });
+
+  test('backgroundTasks reports whether a task moved, with or without a tool use id', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    assert.deepEqual(await h.host.backgroundTasks(sessionId, 'toolu_mock_1'), { backgrounded: true });
+    assert.deepEqual(query.calls.at(-1), ['backgroundTasks', 'toolu_mock_1']);
+    query.values.backgroundTasks = false;
+    assert.deepEqual(await h.host.backgroundTasks(sessionId, 'toolu_done'), { backgrounded: false });
+    assert.deepEqual(await h.host.backgroundTasks(sessionId), { backgrounded: false });
+    assert.deepEqual(query.calls.at(-1), ['backgroundTasks', undefined]);
+  });
+
+  test('backgroundTasks answers 501 before the query is touched when the runtime disabled tasks', async () => {
+    const h = harness({ config: { backgroundTasksDisabled: true } });
+    const { sessionId, query } = await startLive(h);
+    await expectError(h.host.backgroundTasks(sessionId, 'toolu_mock_1'), 501, 'FEATURE_DISABLED');
+    assert.equal(query.calls.some((call) => call[0] === 'backgroundTasks'), false);
+  });
+
+  test('backgroundTasks needs a live session, refuses a locked one and reports failures without the engine text',
+    async () => {
+      const h = harness();
+      addSession(h.engine, S1);
+      await expectError(h.host.backgroundTasks(S1, 'toolu_mock_1'), 409, 'SESSION_NOT_LIVE');
+      await openLive(h, S1);
+      const release = await h.host.lockForTerminal(S1);
+      await expectError(h.host.backgroundTasks(S1, 'toolu_mock_1'), 409, 'SESSION_LOCKED');
+      release();
+      const { query } = await openLive(h, S1);
+      query.failures.set('backgroundTasks', new Error('socket /run/caw/secret'));
+      await assert.rejects(h.host.backgroundTasks(S1, 'toolu_mock_1'), (error) => error.status === 502
+        && error.code === 'ENGINE_ERROR' && error.message === 'The tasks could not be moved to the background.');
+    });
+});
+
+describe('EngineHost output style', () => {
+  test('setOutputStyle writes the local setting and keeps cached capabilities in step', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    await h.host.getCapabilities(sessionId);
+    const answer = await h.host.setOutputStyle(sessionId, '  explanatory ');
+    assert.deepEqual(answer, { outputStyle: 'explanatory', availableOutputStyles: ['default', 'explanatory'] });
+    assert.deepEqual(query.calls.at(-1), ['updateSettings', 'localSettings', { outputStyle: 'explanatory' }]);
+    assert.equal((await h.host.getCapabilities(sessionId)).outputStyle, 'explanatory');
+    assert.equal(query.calls.filter((call) => call[0] === 'initializationResult').length, 1);
+  });
+
+  test('an untrusted folder answers 409 before any call, and styles are validated before the write', async () => {
+    const untrusted = harness({ trusted: async () => false });
+    const closed = await startLive(untrusted);
+    await expectError(untrusted.host.setOutputStyle(closed.sessionId, 'explanatory'), 409, 'CONFLICT');
+    assert.equal(closed.query.calls.some((call) => call[0] === 'updateSettings'), false);
+
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    await expectError(h.host.setOutputStyle(sessionId, '   '), 400, 'BAD_REQUEST');
+    await expectError(h.host.setOutputStyle(sessionId, 'x'.repeat(101)), 400, 'BAD_REQUEST');
+    await expectError(h.host.setOutputStyle(sessionId, 'learning'), 422, 'INVALID_ARGUMENT');
+    assert.equal(query.calls.some((call) => call[0] === 'updateSettings'), false);
+  });
+
+  test('a closed session is not live, and a failed write is reported without the engine text', async () => {
+    const h = harness();
+    addSession(h.engine, S1);
+    await expectError(h.host.setOutputStyle(S1, 'explanatory'), 409, 'SESSION_NOT_LIVE');
+    const { sessionId, query } = await startLive(h);
+    query.failures.set('updateSettings', new Error('EACCES /home/alice/project/.claude'));
+    await assert.rejects(h.host.setOutputStyle(sessionId, 'explanatory'), (error) => error.status === 502
+      && error.message === 'The output style could not be changed.');
+    assert.equal((await h.host.getCapabilities(sessionId)).outputStyle, 'default');
+  });
+
+  test('when the runtime does not answer for its styles, the change is an engine error, not a bad style', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    query.failures.set('initializationResult', new Error('timeout'));
+    await expectError(h.host.setOutputStyle(sessionId, 'explanatory'), 502, 'ENGINE_ERROR');
+    assert.equal(query.calls.some((call) => call[0] === 'updateSettings'), false);
+  });
+
+  test('style names a client could not select are left out of the lists', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    const long = 'x'.repeat(101);
+    query.values.initializationResult = { ...query.values.initializationResult,
+      available_output_styles: ['default', long, '', '  ', 7, 'Concise'] };
+    assert.deepEqual((await h.host.getCapabilities(sessionId)).availableOutputStyles, ['default', 'Concise']);
+    query.values.reloadOutputStyles = { available_output_styles: ['default', long, 'Learning'] };
+    assert.deepEqual(await h.host.reload(sessionId, 'output-styles'),
+      { ok: true, availableOutputStyles: ['default', 'Learning'] });
+  });
+});
+
+describe('EngineHost plugin and output style reloads', () => {
+  test('a plugins reload is held when the runtime reports cache impact, and the cached capabilities stay', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    await h.host.getCapabilities(sessionId);
+    query.values.reloadPlugins = {
+      held: true,
+      cache_impact: { mcp_servers_added: ['plugin:docs:search'], mcp_servers_removed: [], lsp_tool_change: 'may-add' },
+    };
+    assert.deepEqual(await h.host.reload(sessionId, 'plugins'), {
+      ok: false,
+      held: true,
+      cacheImpact: { mcpServersAdded: ['plugin:docs:search'], mcpServersRemoved: [], lspToolChange: 'may-add' },
+    });
+    assert.deepEqual(query.calls.at(-1), ['reloadPlugins', { holdOnCacheImpact: true }]);
+    await h.host.getCapabilities(sessionId);
+    assert.equal(query.calls.filter((call) => call[0] === 'initializationResult').length, 1);
+  });
+
+  test('force applies the plugins reload, and a reload that is not held is ok and drops the cache', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    await h.host.getCapabilities(sessionId);
+    query.values.reloadPlugins = { held: false };
+    assert.deepEqual(await h.host.reload(sessionId, 'plugins'), { ok: true });
+    assert.deepEqual(query.calls.at(-1), ['reloadPlugins', { holdOnCacheImpact: true }]);
+    assert.deepEqual(await h.host.reload(sessionId, 'plugins', { force: true }), { ok: true });
+    assert.deepEqual(query.calls.at(-1), ['reloadPlugins', undefined]);
+    await h.host.getCapabilities(sessionId);
+    assert.equal(query.calls.filter((call) => call[0] === 'initializationResult').length, 2);
+  });
+
+  test('the output styles reload returns the refreshed list, and the remembered styles follow it', async () => {
+    const h = harness();
+    addSession(h.engine, S1);
+    const { query } = await openLive(h, S1);
+    await h.host.getCapabilities(S1);
+    query.values.reloadOutputStyles = { available_output_styles: ['default', 'explanatory', 'learning'] };
+    assert.deepEqual(await h.host.reload(S1, 'output-styles'), {
+      ok: true,
+      availableOutputStyles: ['default', 'explanatory', 'learning'],
+    });
+    await h.host.closeSession(S1);
+    const remembered = await h.host.getCapabilities(S1);
+    assert.equal(remembered.stale, true);
+    assert.deepEqual(remembered.availableOutputStyles, ['default', 'explanatory', 'learning']);
+  });
+
+  test('force is valid for plugins only, and a failed reload is reported without the engine text', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    await expectError(h.host.reload(sessionId, 'skills', { force: true }), 400, 'BAD_REQUEST');
+    await expectError(h.host.reload(sessionId, 'output-styles', { force: false }), 400, 'BAD_REQUEST');
+    await expectError(h.host.reload(sessionId, 'plugins', { force: 'yes' }), 400, 'BAD_REQUEST');
+    assert.equal(query.calls.some((call) => call[0].startsWith('reload')), false);
+    query.failures.set('reloadPlugins', new Error('/home/alice/plugins secret'));
+    await assert.rejects(h.host.reload(sessionId, 'plugins'), (error) => error.status === 502
+      && error.message === 'The session could not be reloaded.');
   });
 });

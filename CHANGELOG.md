@@ -3,6 +3,39 @@
 All notable changes to this project are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning.
 
+## [1.1.0] - 2026-10-09
+
+An audit of every public interface of the Claude Agent SDK 0.3.295 against the gateway. Capabilities the SDK offers
+are now wired through it; what the gateway implements itself, and the SDK interfaces it deliberately leaves out, are
+listed under "Official interfaces" in `ARCHITECTURE.md`.
+
+### Added
+
+- Ctrl+B equivalent: a "Run in background" button on a running Bash or Agent card (`backgroundTasks()`,
+  `POST /api/sessions/:id/background`), a header badge with the number of background tasks, and
+  `features.backgroundTasks` in `GET /api/meta` (false when `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` is set).
+- Fast mode (`/fast`): a toggle for models that support it, applied through the session's flag settings layer
+  (`applyFlagSettings({fastMode})`), with the state and the reason Claude Code reports. `fastMode`,
+  `fastModeState`, `fastModeDisabledReason` and `backgroundTasks` in `LiveInfo`.
+- Output style picker for trusted folders through the runtime's own settings writer
+  (`updateSettings('localSettings', {outputStyle})`, `POST /api/sessions/:id/output-style`), and a reload for output
+  styles.
+- Plugin reloads run the check `/reload-plugins` makes: when applying would change the tools the prompt cache depends
+  on, the UI shows what would change and asks before `force: true`.
+- Notices for a model refusal with fallback (the declined response is marked as withdrawn) and without fallback (with
+  "Edit and retry"), plugin installation steps and completed MCP browser steps.
+- `/fast` in the command palette.
+
+### Changed
+
+- Thinking now shows its summary: queries start with the runtime's `--thinking-display summarized` flag, because a
+  non-interactive session ignores the `showThinkingSummaries` setting; `showThinkingSummaries: false` in any loaded
+  settings file is honored (read with `resolveSettings()`). A thinking block without text shows a muted label.
+- Stop behaves like Esc in the terminal: queries declare `perTaskStopAffordance`, so background tasks keep running
+  after an interrupt and are stopped from the Tasks panel.
+- The idle sweep and the live-session limit never close a session that has background tasks running.
+- The mock engine reports Claude Code's own output style names and only reads the environment given to the server.
+
 ## [1.0.0] - 2026-10-09
 
 First release of claude-official-web, a self-hosted graphical Web host for the official Claude Agent SDK

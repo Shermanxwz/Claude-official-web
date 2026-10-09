@@ -118,6 +118,48 @@ export function linkAction(href, label) {
 }
 
 /**
+ * "Run in background" for a foreground task (a Bash command or a subagent) that is still running and has no result yet.
+ * It moves that task to the background through `ctx.background`, and stays disabled until the request settles. The
+ * control belongs to the action row of the card body, never to its summary, so a click does not toggle the details.
+ * Returns null when the card does not offer it: no background access, no tool use id, not running, already answered,
+ * waiting for a permission decision, or started with run_in_background.
+ * @param {{ id?: string, running: boolean, result?: unknown, input?: unknown, pendingRequestId?: string }} card
+ * @param {{ background?: (toolUseId: string) => Promise<void>, t?: Translate }} ctx
+ * @returns {HTMLButtonElement | null}
+ */
+export function backgroundAction(card, ctx) {
+  const run = ctx.background;
+  if (typeof run !== 'function' || typeof card.id !== 'string' || card.id === '') return null;
+  if (card.running !== true || card.result || card.pendingRequestId) return null;
+  const input = card.input && typeof card.input === 'object' ? /** @type {Record<string, unknown>} */ (card.input) : {};
+  if (input.run_in_background === true) return null;
+  const translate = ctx.t ?? defaultT;
+  const toolUseId = card.id;
+  const button = /** @type {HTMLButtonElement} */ (
+    h(
+      'button',
+      {
+        class: 'tool-action tool-background',
+        attrs: { type: 'button', title: translate('tools.background.hint') },
+        on: {
+          click: async () => {
+            button.disabled = true;
+            try {
+              await run(toolUseId);
+            } finally {
+              button.disabled = false;
+            }
+          },
+        },
+      },
+      icon('layers'),
+      h('span', { text: translate('tools.background.run') }),
+    )
+  );
+  return button;
+}
+
+/**
  * Small pill used for flags, counts and identifiers.
  * @param {string} text
  * @param {{ kind?: 'neutral' | 'accent' | 'success' | 'warning' | 'danger', title?: string, mono?: boolean }} [options]

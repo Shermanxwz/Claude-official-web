@@ -3,6 +3,7 @@
  * Everything inside the conversation area belongs here; the shell owns the header, sidebar, composer and dialogs.
  */
 import { h, clear, icon } from '../dom.js';
+import { errorText } from '../api.js';
 import { createModel } from './model.js';
 import { renderTool } from './tools/index.js';
 import { summarizeTool } from './tools/summaries.js';
@@ -60,12 +61,28 @@ export function createTimeline({ container, api, store, t, actions }) {
   };
   refs.scroller.addEventListener('scroll', onScroll, { passive: true });
   refs.jump.addEventListener('click', onJump);
+  /**
+   * The terminal's Ctrl+B for one foreground tool call: the command or subagent it started keeps running in the
+   * background while the turn goes on. `backgrounded: false` means it had already finished; failures are toasts.
+   * @param {string} toolUseId
+   */
+  const backgroundTool = async (toolUseId) => {
+    const sessionId = state.sessionId;
+    if (!sessionId) return;
+    try {
+      const result = await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/background`, { toolUseId });
+      if (result?.backgrounded !== true) actions.toast(t('cards.background.gone'), 'info');
+    } catch (err) {
+      actions.toast(errorText(err, t), 'error');
+    }
+  };
   const ui = {
     env,
     openState,
     cwd: () => currentCwd(env, state.sessionId),
     sessionId: () => state.sessionId,
     renderChildren: (entries) => renderPlainEntries(ui, entries),
+    background: backgroundTool,
   };
 
   const scheduleRender = () => {
@@ -589,6 +606,7 @@ function buildEntry(ui, entry, previous) {
     case 'assistant': return assistantEl(ui, entry, previous);
     case 'work': return workEl(ui, entry, previous);
     case 'notice': return noticeEl(ui, entry);
+    case 'withdrawn': return withdrawnEl(ui);
     case 'divider': return dividerEl(ui, entry);
     case 'command-output': return commandEl(ui, entry);
     case 'result': return resultEl(ui, entry);
@@ -757,11 +775,12 @@ function blockEl(ui, block) {
     case 'text':
       return renderMarkdown(block.text);
     case 'thinking': {
-      const body = block.redacted ? t('cards.thinking.redacted') : block.text;
+      // Without summaries (or when the model redacted the reasoning) there is no text to open: a plain label says so.
+      if (!block.text) return thinkingLabel(ui, block);
       const details = h('details', { class: ['thinking', block.streaming && 'is-streaming'], dataset: { kind: 'thinking' } },
         h('summary', { class: 'thinking-summary' }, icon('brain'),
           h('span', { class: block.streaming ? 'shimmer' : null, text: t('cards.thinking') })),
-        h('div', { class: 'thinking-body', text: body }));
+        h('div', { class: 'thinking-body', text: block.text }));
       syncOpen(details, ui.openState, `thinking:${block.key}`, false);
       return details;
     }
@@ -853,6 +872,7 @@ function itemEl(ui, item) {
     cwd: ui.cwd(),
     renderChildren: ui.renderChildren,
     open: Boolean(item.running || item.pendingRequestId),
+    background: backgroundAvailable(ui.env, ui.sessionId()) ? ui.background : undefined,
   };
   try {
     const card = renderTool(item, context);
@@ -868,6 +888,8 @@ function itemEl(ui, item) {
 /** @param {any} ui @param {Record<string, any>} row */
 function rowEl(ui, row) {
   const { t } = ui.env;
+  if (row.rowKind === 'withdrawn') return withdrawnEl(ui);
+  if (row.rowKind === 'notice') return noticeEl(ui, row);
   if (row.rowKind === 'denied') {
     return h('div', { class: 'work-row is-denied', dataset: { kind: 'denied' }, attrs: { role: 'status' } },
       icon('shield'),
@@ -912,7 +934,7 @@ function rowEl(ui, row) {
 
 /** @param {any} ui @param {Record<string, any>} entry */
 function noticeEl(ui, entry) {
-  const { t } = ui.env;
+  const { t, actions } = ui.env;
   const level = entry.level || 'info';
   const text = noticeText(ui, entry);
   const iconName = level === 'error' ? 'alert' : level === 'warning' ? 'alert' : level === 'muted' ? 'info' : 'info';
@@ -921,11 +943,28 @@ function noticeEl(ui, entry) {
       h('summary', { text: t('cards.notice.note') }),
       h('div', { class: 'notice-text', text }))
     : h('div', { class: 'notice-text', text });
+  // A refused prompt can be edited and sent again: the rewind dialog opens on that message.
+  const refused = entry.code === 'refusal-no-fallback' && typeof entry.vars?.refused === 'string' ? entry.vars.refused : null;
   return h('div', {
     class: ['notice', `is-${level}`],
     dataset: { kind: 'notice', code: entry.code },
     attrs: { role: level === 'error' ? 'alert' : 'status' },
-  }, icon(iconName), body);
+  }, icon(iconName), body, refused ? h('button', {
+    class: 'btn btn-ghost btn-sm notice-action',
+    attrs: { type: 'button' },
+    text: t('cards.refusal.editRetry'),
+    on: { click: () => actions.openRewind(refused) },
+  }) : null);
+}
+
+/**
+ * The line a response leaves behind when a fallback model retracted it. Muted, and it takes no part in the transcript.
+ * @param {any} ui
+ */
+function withdrawnEl(ui) {
+  const { t } = ui.env;
+  return h('div', { class: 'withdrawn', dataset: { kind: 'withdrawn' }, attrs: { role: 'status' } },
+    icon('x'), h('span', { text: t('cards.withdrawn') }));
 }
 
 /** @param {any} ui @param {Record<string, any>} entry */
@@ -933,6 +972,11 @@ function noticeText(ui, entry) {
   const { t } = ui.env;
   const vars = entry.vars ?? {};
   switch (entry.code) {
+    case 'refusal-fallback': return entry.text || t('cards.refusal.fallbackDefault');
+    case 'refusal-no-fallback': return entry.text || t('cards.refusal.noFallbackDefault');
+    case 'plugin-install': return pluginInstallText(ui, vars);
+    case 'elicitation-complete':
+      return t('cards.elicitation.done', { server: vars.server || t('cards.request.unknownServer') });
     case 'api-retry': {
       const seconds = Number.isFinite(vars.delayMs) ? Math.max(1, Math.round(vars.delayMs / 1000)) : 0;
       const base = t('cards.notice.apiRetry', { attempt: vars.attempt ?? '?', max: vars.max ?? '?', seconds });
@@ -1042,6 +1086,60 @@ function genericEl(label, raw, ui) {
       h('span', { class: 'generic-label', text: String(label) }),
       h('span', { class: 'generic-hint', text: t('cards.generic.hint') })),
     h('pre', { class: 'generic-body', text: json }));
+}
+
+/**
+ * A thinking block with no text: a muted label, not a disclosure. A redacted block explains itself in its tooltip.
+ * @param {any} ui
+ * @param {Record<string, any>} block
+ */
+function thinkingLabel(ui, block) {
+  const { t } = ui.env;
+  return h('div', {
+    class: 'thinking-label',
+    dataset: { kind: 'thinking' },
+    attrs: block.redacted ? { title: t('cards.thinking.redacted') } : {},
+  }, icon('brain'), h('span', { text: t('cards.thinking') }));
+}
+
+/**
+ * Text of one headless plugin installation step.
+ * @param {any} ui
+ * @param {Record<string, any>} vars  status, name and error of the step
+ * @returns {string}
+ */
+function pluginInstallText(ui, vars) {
+  const { t } = ui.env;
+  const name = typeof vars.name === 'string' ? vars.name : '';
+  const error = typeof vars.error === 'string' ? vars.error : '';
+  switch (vars.status) {
+    case 'started': return t('cards.plugin.started');
+    case 'installed': return name ? t('cards.plugin.installed', { name }) : t('cards.plugin.installedAny');
+    case 'failed':
+      if (name && error) return t('cards.plugin.failed', { name, error });
+      if (name) return t('cards.plugin.failedName', { name });
+      return error ? t('cards.plugin.failedAny', { error }) : t('cards.plugin.failedPlain');
+    case 'completed': return t('cards.plugin.completed');
+    default: return t('cards.plugin.update');
+  }
+}
+
+/**
+ * Whether tool cards may offer "Run in background": the session is live, the viewer may act (the profile is not read)
+ * and the server runs background tasks (meta.features.backgroundTasks).
+ * @param {Env} env
+ * @param {string|null} sessionId
+ * @returns {boolean}
+ */
+function backgroundAvailable(env, sessionId) {
+  if (!sessionId) return false;
+  try {
+    const state = env.store.get();
+    const profile = state.auth?.profile ?? state.meta?.profile ?? null;
+    return Boolean(state.live?.[sessionId]) && profile !== 'read' && state.meta?.features?.backgroundTasks === true;
+  } catch {
+    return false;
+  }
 }
 
 /**

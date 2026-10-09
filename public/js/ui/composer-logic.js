@@ -183,6 +183,7 @@ export function effortLevelsFor(model) {
  * @property {string} [description]
  * @property {boolean} [supportsEffort]
  * @property {string[]} [supportedEffortLevels]
+ * @property {boolean} [supportsFastMode]
  */
 
 /** Characters that may follow a canonical model id in a concrete one: a date, a [1m] context tag, '@' for Vertex. */
@@ -271,6 +272,36 @@ export function modelSelectPlan(models, current, labels) {
 export function effortModelFor(models, current, defaultModel) {
   const id = typeof current === 'string' && current.trim() ? current : defaultModel;
   return findModelInfo(models, id);
+}
+
+/**
+ * What the Fast mode control shows for a session.
+ * @typedef {Object} FastModeView
+ * @property {boolean} visible  whether the control is shown at all
+ * @property {boolean} pressed  whether fast mode is requested, or, when nothing is requested, running
+ * @property {'on'|'cooldown'|'off'|null} state  what the runtime last reported; null when it has not said
+ * @property {string|null} reason  why fast mode cannot serve (FastModeDisabledReason), or null
+ */
+
+/**
+ * The Fast mode control for one session. `requested` is what the user chose (LiveInfo.fastMode: true, false, or null to
+ * follow the settings), `runtime` what the runtime last reported (fastModeState) and `reason` the disabled reason. The
+ * control is shown when the model supports fast mode, or while a request is on or the runtime is on or cooling down.
+ * It is pressed when the request is on, or when nothing is requested and the runtime is on.
+ * @param {{requested?: boolean|null, runtime?: string|null, reason?: string|null} | null | undefined} input
+ * @param {boolean} supported  the model row the session uses reports supportsFastMode
+ * @returns {FastModeView}
+ */
+export function fastModeView(input, supported) {
+  const { requested = null, runtime = null, reason = null } = input ?? {};
+  const state = runtime === 'on' || runtime === 'cooldown' || runtime === 'off' ? runtime : null;
+  const asked = requested === true || requested === false ? requested : null;
+  return {
+    visible: supported === true || asked === true || state === 'on' || state === 'cooldown',
+    pressed: asked === true || (asked === null && state === 'on'),
+    state,
+    reason: typeof reason === 'string' && reason !== '' ? reason : null,
+  };
 }
 
 /**

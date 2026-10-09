@@ -16,9 +16,13 @@ import { EFFORT_LEVELS, isUuid, PERMISSION_MODES } from '../../contracts.mjs';
 import {
   activeGoal,
   autocompactState,
+  backgroundTasksChanged,
+  BACKGROUND_RUN_MS,
+  BACKGROUND_WAIT_MS,
   commandLifecycle,
   CONTEXT_MAX_TOKENS,
   interruptedMessage,
+  outputFileOf,
   permissionDenied,
   postTurnSummary,
   promptSuggestion,
@@ -69,7 +73,8 @@ import { newRecord, sliceRecord } from './store.mjs';
 
 /**
  * One configured MCP server as the mock tracks it.
- * @typedef {{status: 'connected'|'failed'|'needs-auth'|'pending'|'disabled', error?: string, enabled: boolean}} McpEntry
+ * @typedef {{status: 'connected'|'failed'|'needs-auth'|'pending'|'disabled', error?: string,
+ *   enabled: boolean}} McpEntry
  */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').NonNullableUsage} NonNullableUsage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').ModelUsage} ModelUsage */
@@ -84,6 +89,10 @@ import { newRecord, sliceRecord } from './store.mjs';
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').AccountInfo} AccountInfo */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').McpServerStatus} McpServerStatus */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKControlReadFileResponse} ReadFileResponse */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKControlReloadPluginsResponse} ReloadPluginsResponse */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').FastModeState} FastModeState */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').FastModeDisabledReason} FastModeDisabledReason */
+/** @typedef {import('./scenarios.mjs').ForegroundTask} ForegroundTask */
 
 export const MODEL_DEFAULT = 'claude-sonnet-mock';
 export const CLAUDE_CODE_VERSION = '2.1.295-mock';
@@ -93,7 +102,10 @@ const TOOL_NAMES = ['Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'WebFetch',
   'AskUserQuestion', 'ExitPlanMode'];
 /** Tools that acceptEdits mode runs without asking. */
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
-const OUTPUT_STYLES = ['default', 'explanatory', 'learning'];
+/** The output styles Claude Code 2.1.x ships, with the names it reports. */
+const OUTPUT_STYLES = ['default', 'Proactive', 'Concise', 'Explanatory', 'Learning'];
+/** The filesystem settings sources a query loads when settingSources is omitted. */
+const SETTING_SOURCES = ['user', 'project', 'local'];
 const SUGGESTIONS = [
   'Show me the project structure',
   'Run the test suite',
@@ -129,7 +141,12 @@ export class SessionClosed extends Error {
 export function uuidFor(sessionId, sequence) {
   const hex = createHash('sha256').update(`${sessionId}:${sequence}`).digest('hex');
   const variant = ((Number.parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80).toString(16);
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(18, 20)}-${hex.slice(20, 32)}`;
+  const first = hex.slice(0, 8);
+  const second = hex.slice(8, 12);
+  const third = `4${hex.slice(13, 16)}`;
+  const fourth = `${variant}${hex.slice(18, 20)}`;
+  const fifth = hex.slice(20, 32);
+  return `${first}-${second}-${third}-${fourth}-${fifth}`;
 }
 
 /**
@@ -281,6 +298,21 @@ async function* singlePrompt(text) {
 }
 
 /**
+ * Pacing of the background tasks: the wait of a foreground command and the run of a background one, in milliseconds.
+ * @typedef {{waitMs?: number, runMs?: number}} BackgroundTiming
+ */
+
+/**
+ * A foreground task as the session keeps it: the scenario's handle plus the resolver a backgroundTasks call uses.
+ * @typedef {ForegroundTask & {resolve: (task: {taskId: string}) => void}} ForegroundEntry
+ */
+/**
+ * A task running in the background. Its completion is scheduled on `timer`, which ends early when the task is stopped.
+ * @typedef {{taskId: string, toolUseId: string, description: string, startedAt: number,
+ *   timer: ReturnType<typeof setTimeout>}} BackgroundTask
+ */
+
+/**
  * Mutable state shared by the session generator, the scenarios and the control methods.
  * @typedef {Object} SessionCore
  * @property {string} sessionId
@@ -307,6 +339,19 @@ async function* singlePrompt(text) {
  * @property {Map<string, {toolUseId: string, stopped: boolean}>} tasks
  * @property {Set<string>} stoppedToolUseIds        tool_use ids whose task was stopped
  * @property {string[]} userMessageUuids            prompts the turn in progress answers; empty between turns
+ * @property {Record<string, unknown>} flagSettings the flag layer: the settings option, then applyFlagSettings
+ * @property {Record<string, unknown>} fileSettings the settings the user's files define, under the flag layer
+ * @property {string[]} settingSources              the filesystem sources the query loads
+ * @property {boolean} perTaskStopAffordance        an interrupt keeps the background tasks when true
+ * @property {string|null} thinkingDisplay          the --thinking-display flag (extraArgs); a non-interactive runtime
+ *   sends thinking text only when it is 'summarized', whatever showThinkingSummaries says
+ * @property {boolean} backgroundDisabled           the runtime refuses background tasks
+ * @property {{waitMs: number, runMs: number}} backgroundTiming   how long a foreground command waits to be moved, and
+ *   how long a background command runs in the mock
+ * @property {Map<string, ForegroundEntry>} foreground   commands and agents that a backgroundTasks call can move
+ * @property {Map<string, BackgroundTask>} background    tasks running in the background, by task id
+ * @property {Set<string>} pendingPlugins           plugins installed but not applied by a reload yet
+ * @property {Set<string>} appliedPlugins           plugins a reload applied
  * @property {boolean} closed
  */
 
@@ -387,7 +432,7 @@ async function pumpSource(queue, source, signal, accept) {
 export function validateOptions(options) {
   if (!isObject(options)) throw new TypeError('The query options must be an object.');
   const { sessionId, resume, resumeSessionAt, forkSession, continue: continueLatest, permissionMode, effort, model,
-    cwd, title } = options;
+    cwd, title, settings, perTaskStopAffordance, settingSources, extraArgs } = options;
   if (sessionId !== undefined && (typeof sessionId !== 'string' || !isUuid(sessionId))) {
     throw new TypeError('sessionId must be a UUID.');
   }
@@ -418,6 +463,18 @@ export function validateOptions(options) {
   }
   if (title !== undefined && (typeof title !== 'string' || title.trim() === '')) {
     throw new TypeError('title must be a non-empty string.');
+  }
+  if (settings !== undefined && !isObject(settings)) throw new TypeError('settings must be an object.');
+  if (extraArgs !== undefined && (!isObject(extraArgs) || Object.values(extraArgs)
+    .some((value) => value !== null && typeof value !== 'string'))) {
+    throw new TypeError('extraArgs must map flag names to strings or null.');
+  }
+  if (perTaskStopAffordance !== undefined && typeof perTaskStopAffordance !== 'boolean') {
+    throw new TypeError('perTaskStopAffordance must be a boolean.');
+  }
+  if (settingSources !== undefined && (!Array.isArray(settingSources)
+    || settingSources.some((source) => !SETTING_SOURCES.some((known) => known === source)))) {
+    throw new TypeError(`settingSources must only list ${SETTING_SOURCES.join(', ')}.`);
   }
 }
 
@@ -476,17 +533,38 @@ export function openRecord({ store, options, cwd, now }) {
 
 /**
  * Id prefixes used by the scenarios, one counter per kind so that ids never repeat inside a session.
- * @type {Record<'message'|'tool'|'agent'|'hook', string>}
+ * @type {Record<'message'|'tool'|'agent'|'hook'|'task', string>}
  */
-const ID_PREFIX = { message: 'msg_mock_', tool: 'toolu_mock_', agent: 'agent_mock_', hook: 'hook_mock_' };
+const ID_PREFIX = {
+  message: 'msg_mock_',
+  tool: 'toolu_mock_',
+  agent: 'agent_mock_',
+  hook: 'hook_mock_',
+  task: 'task_mock_',
+};
+
+/**
+ * The thinking display a query was started with: the value of `--thinking-display` in extraArgs, or null.
+ * @param {unknown} extraArgs
+ * @returns {string|null}
+ */
+function thinkingDisplayOf(extraArgs) {
+  if (!isObject(extraArgs)) return null;
+  const value = extraArgs['thinking-display'];
+  return typeof value === 'string' ? value : null;
+}
 
 /**
  * Builds the shared state of one session from its stored record.
- * @param {{record: MockSessionRecord, options: SdkOptions, store: MockStore, delayMs: number, log: Logger|undefined}} args
+ * @param {{record: MockSessionRecord, options: SdkOptions, store: MockStore, delayMs: number, log: Logger|undefined,
+ *   fileSettings: Record<string, unknown>, backgroundDisabled: boolean, backgroundTiming: BackgroundTiming}} args
  * @returns {SessionCore}
  */
-export function createCore({ record, options, store, delayMs, log }) {
+export function createCore({
+  record, options, store, delayMs, log, fileSettings, backgroundDisabled, backgroundTiming,
+}) {
   const { uuid: uuidSequence = 0, ...counters } = record.counters;
+  const settingSources = Array.isArray(options.settingSources) ? [...options.settingSources] : [...SETTING_SOURCES];
   let pending = signalPair();
   /** @type {SessionCore} */
   const core = {
@@ -521,6 +599,20 @@ export function createCore({ record, options, store, delayMs, log }) {
     tasks: new Map(),
     stoppedToolUseIds: new Set(),
     userMessageUuids: [],
+    flagSettings: isObject(options.settings) ? { ...options.settings } : {},
+    fileSettings: settingSources.length > 0 ? { ...fileSettings } : {},
+    settingSources,
+    perTaskStopAffordance: options.perTaskStopAffordance === true,
+    thinkingDisplay: thinkingDisplayOf(options.extraArgs),
+    backgroundDisabled,
+    backgroundTiming: {
+      waitMs: backgroundTiming.waitMs ?? BACKGROUND_WAIT_MS,
+      runMs: backgroundTiming.runMs ?? BACKGROUND_RUN_MS,
+    },
+    foreground: new Map(),
+    background: new Map(),
+    pendingPlugins: new Set(),
+    appliedPlugins: new Set(),
     closed: false,
   };
   return core;
@@ -529,7 +621,7 @@ export function createCore({ record, options, store, delayMs, log }) {
 /**
  * The next id of one kind, such as `toolu_mock_3`.
  * @param {SessionCore} core
- * @param {'message'|'tool'|'agent'|'hook'} kind
+ * @param {'message'|'tool'|'agent'|'hook'|'task'} kind
  * @returns {string}
  */
 export function nextId(core, kind) {
@@ -669,7 +761,10 @@ export class TurnObserver {
     }
     for (const block of content) {
       if (block.type === 'tool_use') {
-        this.openTools.set(block.id, { parentToolUseId: message.parent_tool_use_id, agentId: message.agent_id ?? null });
+        this.openTools.set(block.id, {
+          parentToolUseId: message.parent_tool_use_id,
+          agentId: message.agent_id ?? null,
+        });
       }
       if (topLevel && block.type === 'text') this.finalText = block.text;
     }
@@ -718,7 +813,7 @@ function userBlocks(message) {
  * @property {OnElicitation|undefined} onElicitation
  * @property {SDKPermissionDenial[]} denials                  denied tool calls of this turn
  * @property {number} startedAt
- * @property {string} userMessageUuid                         uuid of the last prompt of the turn's batch, as the SDK reports it
+ * @property {string} userMessageUuid                         uuid of the batch's last prompt, as the SDK reports it
  * @property {string[]} userMessageUuids                      every prompt the turn answers, in consumption order
  */
 
@@ -766,7 +861,8 @@ export function describeSessionOf(core) {
   ];
   const used = rows.reduce((sum, row) => sum + row.tokens, 0);
   const models = Object.values(core.modelUsage);
-  const total = (/** @type {(model: ModelUsage) => number} */ pick) => models.reduce((sum, model) => sum + pick(model), 0);
+  const total = (/** @type {(model: ModelUsage) => number} */ pick) =>
+    models.reduce((sum, model) => sum + pick(model), 0);
   return {
     model: core.model,
     plan: 'Pro',
@@ -900,7 +996,213 @@ export function turnContextOf({ core, turn, userText, streamPartials }) {
     elicitation: (request) => elicitationOf(core, turn, request),
     mcpConnected: (serverName) => core.mcp.get(serverName)?.status === 'connected',
     describeSession: () => describeSessionOf(core),
+    thinkingSummaries: core.thinkingDisplay === 'summarized',
+    foregroundTask: (toolUseId, description) => foregroundTaskOf(core, toolUseId, description),
+    awaitBackground: (task) => awaitBackgroundOf(core, turn, task),
   };
+}
+
+/**
+ * Removes the refused messages that a fallback retracted from the transcript, as the SDK evicts them on arrival.
+ * @param {SessionCore} core
+ * @param {string[]} uuids
+ * @returns {void}
+ */
+function evictRetracted(core, uuids) {
+  if (uuids.length === 0) return;
+  const retracted = new Set(uuids);
+  persist(core, (record) => {
+    record.transcript = record.transcript.filter((entry) => !retracted.has(entry.uuid));
+  });
+}
+
+/**
+ * Registers a Bash command or an agent as a foreground task. A backgroundTasks call can move it while the turn waits.
+ * The registration is made before the tool call streams, so a request that arrives early is not lost.
+ * @param {SessionCore} core
+ * @param {string} toolUseId
+ * @param {string} description
+ * @returns {ForegroundEntry}
+ */
+export function foregroundTaskOf(core, toolUseId, description) {
+  /** @type {(task: {taskId: string}) => void} */
+  let resolve = () => {};
+  /** @type {Promise<{taskId: string}>} */
+  const moved = new Promise((resolveMoved) => {
+    resolve = resolveMoved;
+  });
+  /** @type {ForegroundEntry} */
+  const entry = { toolUseId, description, moved, resolve };
+  core.foreground.set(toolUseId, entry);
+  return entry;
+}
+
+/**
+ * Waits until a foreground task is moved to the background. Resolves with the new task, or with null when the wait
+ * ends first, in which case the command finishes in the foreground. The wait ends with the turn.
+ * @param {SessionCore} core
+ * @param {TurnState} turn
+ * @param {ForegroundTask} task
+ * @returns {AsyncGenerator<SDKMessage, {taskId: string}|null, unknown>}
+ */
+export async function* awaitBackgroundOf(core, turn, task) {
+  /** @type {ReturnType<typeof setTimeout>|undefined} */
+  let timer;
+  /** @type {Promise<null>} */
+  const timeout = new Promise((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(null), core.backgroundTiming.waitMs);
+  });
+  try {
+    return yield* waitFor(core, Promise.race([task.moved, timeout]), turn.signal);
+  } finally {
+    clearTimeout(timer);
+    if (core.foreground.get(task.toolUseId) === task) core.foreground.delete(task.toolUseId);
+  }
+}
+
+/**
+ * Starts a task in the background. Its completion is scheduled, and the end of the session clears the schedule.
+ * @param {SessionCore} core
+ * @param {{taskId: string, toolUseId: string, description: string}} task
+ * @returns {void}
+ */
+function startBackground(core, { taskId, toolUseId, description }) {
+  const timer = setTimeout(() => {
+    const notice = endBackground(core, taskId, 'completed', `Background command "${description}" completed`);
+    if (notice === null) return;
+    core.outbox.push(notice, backgroundTasksChanged(sessionView(core), backgroundListOf(core)));
+    core.notify();
+  }, core.backgroundTiming.runMs);
+  core.background.set(taskId, { taskId, toolUseId, description, startedAt: Date.now(), timer });
+  core.sessionAbort.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+}
+
+/**
+ * Ends a background task: it leaves the set, its schedule is cleared and its terminal notice is returned.
+ * @param {SessionCore} core
+ * @param {string} taskId
+ * @param {'completed'|'stopped'} status
+ * @param {string} summary
+ * @returns {SDKMessage|null}
+ */
+function endBackground(core, taskId, status, summary) {
+  const task = core.background.get(taskId);
+  if (task === undefined) return null;
+  clearTimeout(task.timer);
+  core.background.delete(taskId);
+  return taskNotification(sessionView(core), {
+    taskId,
+    toolUseId: task.toolUseId,
+    summary,
+    totalTokens: 0,
+    toolUses: 0,
+    durationMs: Math.max(0, Date.now() - task.startedAt),
+    status,
+    outputFile: outputFileOf(taskId),
+  });
+}
+
+/**
+ * The live background tasks, in the shape background_tasks_changed lists them.
+ * @param {SessionCore} core
+ * @returns {Array<{taskId: string, description: string}>}
+ */
+function backgroundListOf(core) {
+  return [...core.background.values()].map((task) => ({ taskId: task.taskId, description: task.description }));
+}
+
+/**
+ * The settings a query runs with: the settings the user's files define, under the flag layer. A null in the flag layer
+ * means the files decide, as applyFlagSettings({fastMode: null}) does.
+ * @param {SessionCore} core
+ * @returns {Record<string, unknown>}
+ */
+export function effectiveSettingsOf(core) {
+  const flags = Object.entries(core.flagSettings).filter(([, value]) => value !== null && value !== undefined);
+  return { ...core.fileSettings, ...Object.fromEntries(flags) };
+}
+
+/**
+ * Whether a model serves fast mode, matched by its alias or its resolved id.
+ * @param {string} model
+ * @returns {boolean}
+ */
+function supportsFastMode(model) {
+  return MODELS.some((entry) => entry.supportsFastMode === true
+    && (entry.value === model || entry.resolvedModel === model));
+}
+
+/**
+ * The fast mode fields of system/init and of every result. An SDK session is opted out until the host sets fastMode in
+ * the flag layer (sdk_opt_in_required); null hands the decision to the user's files; a model without fast mode reports
+ * model_not_allowed; otherwise the state is on or off.
+ * @param {SessionCore} core
+ * @returns {{fast_mode_state: FastModeState, fast_mode_disabled_reason?: FastModeDisabledReason}}
+ */
+export function fastModeFieldsOf(core) {
+  const flag = core.flagSettings.fastMode;
+  const requested = typeof flag === 'boolean' ? flag : (flag === null ? core.fileSettings.fastMode : undefined);
+  if (requested === false) return { fast_mode_state: 'off' };
+  if (typeof requested !== 'boolean') {
+    return { fast_mode_state: 'off', fast_mode_disabled_reason: 'sdk_opt_in_required' };
+  }
+  if (!supportsFastMode(core.model)) return { fast_mode_state: 'off', fast_mode_disabled_reason: 'model_not_allowed' };
+  return { fast_mode_state: 'on' };
+}
+
+/**
+ * The MCP server a plugin contributes, named the way the runtime scopes plugin servers.
+ * @param {string} plugin
+ * @returns {string}
+ */
+function pluginServerOf(plugin) {
+  return `plugin:${plugin}:docs`;
+}
+
+/**
+ * What applying the pending plugins would change in the tool list: the plugin servers they register.
+ * @param {SessionCore} core
+ * @returns {{mcp_servers_added: string[], mcp_servers_removed: string[], lsp_tool_change: null}}
+ */
+function cacheImpactOf(core) {
+  return {
+    mcp_servers_added: [...core.pendingPlugins].map(pluginServerOf),
+    mcp_servers_removed: [],
+    lsp_tool_change: null,
+  };
+}
+
+/**
+ * The lists a reload answers with: what the session has now.
+ * @param {SessionCore} core
+ * @returns {Omit<ReloadPluginsResponse, 'held' | 'cache_impact'>}
+ */
+function reloadListsOf(core) {
+  return {
+    commands: COMMANDS.map((command) => ({ ...command })),
+    agents: AGENTS.map((agent) => ({ ...agent })),
+    plugins: [...core.appliedPlugins].map((name) => ({
+      name,
+      path: `/mock/plugins/${name}`,
+      source: 'mock',
+      version: '1.0.0',
+    })),
+    mcpServers: mcpStatusOf(core),
+    error_count: 0,
+  };
+}
+
+/**
+ * Applies the pending plugins: their servers connect and the plugins join the session.
+ * @param {SessionCore} core
+ * @returns {void}
+ */
+function applyPluginReload(core) {
+  for (const plugin of core.pendingPlugins) {
+    core.mcp.set(pluginServerOf(plugin), { status: 'connected', enabled: true });
+    core.appliedPlugins.add(plugin);
+  }
+  core.pendingPlugins.clear();
 }
 
 /**
@@ -937,6 +1239,10 @@ const PERSISTED_SYSTEM_SUBTYPES = new Set(['compact_boundary', 'local_command_ou
  * @returns {void}
  */
 export function persistIfNeeded(core, message) {
+  if (message.type === 'system' && message.subtype === 'model_refusal_fallback') {
+    evictRetracted(core, message.retracted_message_uuids ?? []);
+    return;
+  }
   /** @type {MockEntry|null} */
   let entry = null;
   if (message.type === 'assistant' || message.type === 'user') {
@@ -1050,6 +1356,7 @@ export function resultOf(core, turn, observer, outcome) {
     session_id: core.sessionId,
     user_message_uuid: turn.userMessageUuid,
     user_message_uuids: [...turn.userMessageUuids],
+    ...fastModeFieldsOf(core),
   };
   if (outcome.error === null) {
     return {
@@ -1113,6 +1420,14 @@ export function* closeInterruptedTurn(core, ctx, turn, observer, seen) {
       status: 'stopped',
     }));
   }
+  if (!core.perTaskStopAffordance && core.background.size > 0) {
+    // Without perTaskStopAffordance, an interrupt also stops the background tasks.
+    for (const taskId of [...core.background.keys()]) {
+      const notice = endBackground(core, taskId, 'stopped', 'Stopped by the interrupt');
+      if (notice !== null) yield seen(notice);
+    }
+    yield seen(backgroundTasksChanged(ctx, backgroundListOf(core)));
+  }
   yield seen(syntheticUser(ctx, '[Request interrupted by user]'));
 }
 
@@ -1139,10 +1454,14 @@ export async function* runTurn(core, options, prompts, streamPartials) {
       typeof message.rate_limit_info.utilization === 'number') {
       core.fiveHourUtilization = message.rate_limit_info.utilization * 100;
     }
-    if (message.type === 'system' && message.subtype === 'task_started') {
+    // A background shell is not part of the turn, so an interrupt leaves it running.
+    if (message.type === 'system' && message.subtype === 'task_started' && message.task_type !== 'local_bash') {
       core.tasks.set(message.task_id, { toolUseId: message.tool_use_id, stopped: false });
     }
     if (message.type === 'system' && message.subtype === 'task_notification') core.tasks.delete(message.task_id);
+    if (message.type === 'system' && message.subtype === 'plugin_install' && message.status === 'installed') {
+      if (message.name !== undefined) core.pendingPlugins.add(message.name);
+    }
     persistIfNeeded(core, message);
     return message;
   };
@@ -1176,6 +1495,7 @@ export async function* runTurn(core, options, prompts, streamPartials) {
   } finally {
     core.turnAbort = null;
     core.userMessageUuids = [];
+    core.foreground.clear();
   }
   yield seen(result);
   yield seen(postTurnSummary(ctx, {
@@ -1233,11 +1553,13 @@ export function parentToolUseIdOf(message) {
 
 /** Slash commands the mock advertises, as the SDK lists them. */
 export const COMMANDS = [
-  { name: 'compact', description: 'Clear conversation history but keep a summary in context', argumentHint: '<instructions>', builtin: true },
+  { name: 'compact', description: 'Clear conversation history but keep a summary in context',
+    argumentHint: '<instructions>', builtin: true },
   { name: 'clear', description: 'Clear conversation history and free up context', argumentHint: '', builtin: true },
   { name: 'context', description: 'Show current context usage', argumentHint: '', builtin: true },
   { name: 'usage', description: 'Show session cost, token usage and plan limits', argumentHint: '', builtin: true },
-  { name: 'init', description: 'Initialize a new CLAUDE.md file with codebase documentation', argumentHint: '', builtin: true },
+  { name: 'init', description: 'Initialize a new CLAUDE.md file with codebase documentation',
+    argumentHint: '', builtin: true },
   { name: 'review', description: 'Review a pull request', argumentHint: '<pr number>', builtin: true },
   { name: 'code-review', description: 'Review the current changes for bugs and style issues', argumentHint: '<files>' },
   { name: 'verify', description: 'Check that the project builds and its tests pass', argumentHint: '' },
@@ -1249,7 +1571,8 @@ const SKILL_NAMES = ['code-review', 'verify', 'deploy-check'];
 
 /** @type {AgentInfo[]} */
 export const AGENTS = [
-  { name: 'general-purpose', description: 'General-purpose agent for researching complex questions and multi-step tasks' },
+  { name: 'general-purpose',
+    description: 'General-purpose agent for researching complex questions and multi-step tasks' },
   { name: 'Explore', description: 'Fast agent for exploring codebases and answering questions about them' },
   { name: 'Plan', description: 'Software architect agent for designing implementation plans' },
 ];
@@ -1275,6 +1598,7 @@ export const MODELS = [
     description: 'Most capable model for complex, long-running work',
     supportsEffort: true,
     supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    supportsFastMode: true,
   },
   {
     value: 'sonnet',
@@ -1316,6 +1640,7 @@ export function initMessage(core) {
     agents: AGENTS.map((agent) => agent.name),
     effort: core.effort,
     capabilities: ['interrupt_receipt_v1'],
+    ...fastModeFieldsOf(core),
     ...envelopeOf(core),
   };
 }
@@ -1369,6 +1694,15 @@ function acceptPrompt(core, message) {
 }
 
 /**
+ * Resolves once no background task runs. Every change of the session wakes the check.
+ * @param {SessionCore} core
+ * @returns {Promise<void>}
+ */
+async function backgroundIdle(core) {
+  while (core.background.size > 0) await core.changed();
+}
+
+/**
  * The session generator: init, the autocompact and goal settings, then one turn per batch of prompts, until the prompts
  * end or the session closes. A batch is the prompt that was taken plus every prompt already waiting behind it, so
  * prompts sent close together are answered by one turn. Control messages are yielded while the session waits for its
@@ -1386,7 +1720,11 @@ export async function* sessionLoop(core, queue, options) {
     yield activeGoal(view);
     for (;;) {
       const next = yield* waitFor(core, queue.take(), core.sessionAbort.signal);
-      if (next.done === true) break;
+      if (next.done === true) {
+        // The prompts have ended, but background work still reports: the session stays open until it finishes.
+        yield* waitFor(core, backgroundIdle(core), core.sessionAbort.signal);
+        break;
+      }
       // One macrotask lets the pump deliver the prompts the host already pushed.
       yield* waitFor(core, new Promise((resolveTick) => setImmediate(resolveTick)), core.sessionAbort.signal);
       const batch = [next.value, ...queue.drainWaiting()];
@@ -1516,7 +1854,8 @@ export function contextUsageOf(core) {
     };
   }));
   const totals = Object.values(core.modelUsage);
-  const sumOf = (/** @type {(model: ModelUsage) => number} */ pick) => totals.reduce((sum, model) => sum + pick(model), 0);
+  const sumOf = (/** @type {(model: ModelUsage) => number} */ pick) =>
+    totals.reduce((sum, model) => sum + pick(model), 0);
   const hasUsage = totals.length > 0;
   return {
     categories,
@@ -1649,6 +1988,12 @@ export function createControls({ open, isClosed, close, queue, store }) {
       }
       if (typeof settings.model === 'string') current.model = settings.model;
       if (settings.model === null) current.model = MODEL_DEFAULT;
+      if (settings.fastMode !== undefined) {
+        if (settings.fastMode !== null && typeof settings.fastMode !== 'boolean') {
+          throw new TypeError('fastMode must be a boolean or null.');
+        }
+        current.flagSettings.fastMode = settings.fastMode;
+      }
       announce(current, current.permissionMode);
     },
     updateSettings: async (source, settings) => {
@@ -1658,7 +2003,13 @@ export function createControls({ open, isClosed, close, queue, store }) {
       for (const [key, value] of Object.entries(settings)) {
         if (typeof value !== 'string') throw new TypeError(`${key} must be a string.`);
       }
+      if (source === 'localSettings' && !current.settingSources.includes('local')) {
+        throw new Error('Local settings are not loaded for this session.');
+      }
       if (source === 'localSettings' && typeof settings.outputStyle === 'string') {
+        if (!OUTPUT_STYLES.some((style) => style === settings.outputStyle)) {
+          throw new TypeError(`Unknown output style: ${settings.outputStyle}`);
+        }
         current.outputStyle = settings.outputStyle;
       }
     },
@@ -1704,22 +2055,24 @@ export function createControls({ open, isClosed, close, queue, store }) {
     },
     seedReadState: async (path, mtime) => {
       live();
-      if (typeof path !== 'string' || !Number.isFinite(mtime)) throw new TypeError('seedReadState needs a path and an mtime.');
+      if (typeof path !== 'string' || !Number.isFinite(mtime)) {
+        throw new TypeError('seedReadState needs a path and an mtime.');
+      }
     },
     reloadPlugins: async (options) => {
       const current = live();
-      return {
-        commands: COMMANDS.map((command) => ({ ...command })),
-        agents: AGENTS.map((agent) => ({ ...agent })),
-        plugins: [],
-        mcpServers: mcpStatusOf(current),
-        error_count: 0,
-        ...(options?.holdOnCacheImpact === true ? { held: false } : {}),
-      };
+      const hold = options?.holdOnCacheImpact === true;
+      // The check the terminal's /reload-plugins makes: once a turn has run, the prompt cache depends on the tool list.
+      if (hold && current.pendingPlugins.size > 0 && current.turnIndex > 0) {
+        return { ...reloadListsOf(current), held: true, cache_impact: cacheImpactOf(current) };
+      }
+      applyPluginReload(current);
+      return { ...reloadListsOf(current), ...(hold ? { held: false } : {}) };
     },
     reloadSkills: async () => {
       live();
-      return { skills: COMMANDS.filter((command) => SKILL_NAMES.includes(command.name)).map((command) => ({ ...command })) };
+      const skills = COMMANDS.filter((command) => SKILL_NAMES.includes(command.name));
+      return { skills: skills.map((command) => ({ ...command })) };
     },
     reloadOutputStyles: async () => {
       live();
@@ -1776,6 +2129,12 @@ export function createControls({ open, isClosed, close, queue, store }) {
     },
     stopTask: async (taskId) => {
       const current = live();
+      const notice = endBackground(current, taskId, 'stopped', 'Stopped by request');
+      if (notice !== null) {
+        current.outbox.push(notice, backgroundTasksChanged(sessionView(current), backgroundListOf(current)));
+        current.notify();
+        return;
+      }
       const task = current.tasks.get(taskId);
       if (task === undefined || task.stopped) return;
       task.stopped = true;
@@ -1792,9 +2151,20 @@ export function createControls({ open, isClosed, close, queue, store }) {
       current.notify();
     },
     backgroundTasks: async (toolUseId) => {
-      live();
+      const current = live();
+      if (current.backgroundDisabled) throw new Error('Background tasks are disabled for this session.');
       if (toolUseId !== undefined && typeof toolUseId !== 'string') throw new TypeError('toolUseId must be a string.');
-      return false;
+      const moving = [...current.foreground.values()]
+        .filter((entry) => toolUseId === undefined || entry.toolUseId === toolUseId);
+      for (const entry of moving) {
+        current.foreground.delete(entry.toolUseId);
+        const taskId = nextId(current, 'task');
+        startBackground(current, { taskId, toolUseId: entry.toolUseId, description: entry.description });
+        current.outbox.push(backgroundTasksChanged(sessionView(current), backgroundListOf(current)));
+        entry.resolve({ taskId });
+      }
+      if (moving.length > 0) current.notify();
+      return moving.length > 0;
     },
     close: () => {
       close();
@@ -1811,15 +2181,23 @@ function endOfSession() {
  * Creates the mock Query for one call of query(). Nothing is opened until the first pull or control call, so open
  * errors (a missing resume target, for example) surface through the iterator, as the SDK reports them.
  * @param {{prompt: string|AsyncIterable<SDKUserMessage>, options?: SdkOptions, store: MockStore, delayMs: number,
- *   log?: Logger}} args
+ *   log?: Logger, fileSettings?: Record<string, unknown>, backgroundDisabled?: boolean,
+ *   backgroundTiming?: BackgroundTiming}} args `fileSettings` are the settings the user's files define;
+ *   `backgroundDisabled` mirrors CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
  * @returns {SdkQuery}
  */
-export function createMockQuery({ prompt, options = {}, store, delayMs, log }) {
+export function createMockQuery({ prompt, options = {}, store, delayMs, log, fileSettings = {},
+  backgroundDisabled = false, backgroundTiming = {} }) {
   validateOptions(options);
   if (typeof prompt !== 'string' && !(isObject(prompt) && typeof prompt[Symbol.asyncIterator] === 'function')) {
     throw new TypeError('prompt must be a string or an async iterable of user messages.');
   }
   if (!Number.isInteger(delayMs) || delayMs < 0) throw new RangeError('delayMs must be a non-negative integer.');
+  for (const [name, ms] of Object.entries(backgroundTiming)) {
+    if (!Number.isInteger(ms) || ms < 0) {
+      throw new RangeError(`backgroundTiming.${name} must be a non-negative integer.`);
+    }
+  }
 
   const queue = new InputQueue();
   /** @type {SessionCore|null} */
@@ -1837,7 +2215,8 @@ export function createMockQuery({ prompt, options = {}, store, delayMs, log }) {
   const open = () => {
     if (core !== null) return core;
     const record = openRecord({ store, options, cwd: options.cwd ?? process.cwd(), now: Date.now() });
-    const created = createCore({ record, options, store, delayMs, log });
+    const created = createCore({ record, options, store, delayMs, log, fileSettings, backgroundDisabled,
+      backgroundTiming });
     core = created;
     const external = options.abortController?.signal;
     if (external !== undefined) {

@@ -39,6 +39,7 @@ import { render as renderWeb } from './web.js';
  *   cwd: string | null,
  *   renderChildren: (entries: unknown[]) => HTMLElement,
  *   open: boolean,
+ *   background?: (toolUseId: string) => Promise<void>,
  * }} ToolContext
  */
 

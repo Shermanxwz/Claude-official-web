@@ -6,6 +6,7 @@
 import { h } from '../../dom.js';
 import { formatDuration, formatTokens } from '../format.js';
 import {
+  backgroundAction,
   chip,
   copyButton,
   errorBlock,
@@ -39,6 +40,8 @@ export function render(card, ctx) {
   }
   const session = remoteSessionLink(structured, t);
   if (session) actions.push(session);
+  const background = backgroundAction(card, ctx);
+  if (background) actions.push(background);
   return toolShell({
     iconName: 'bot',
     title: card.name,

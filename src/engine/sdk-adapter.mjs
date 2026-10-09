@@ -17,6 +17,7 @@ import {
   listSubagents,
   query,
   renameSession,
+  resolveSettings,
   tagSession,
 } from '@anthropic-ai/claude-agent-sdk';
 
@@ -60,5 +61,6 @@ export function createSdkAdapter({ config, log }) {
     deleteSession: (sessionId, options) => deleteSession(sessionId, options),
     listSubagents: (sessionId) => listSubagents(sessionId),
     getSubagentMessages: (sessionId, agentId) => getSubagentMessages(sessionId, agentId),
+    resolveSettings: (options) => resolveSettings(options),
   };
 }
