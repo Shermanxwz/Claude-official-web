@@ -224,6 +224,7 @@ export const SESSION_COOKIE = 'caw_session';
  *   closes the live query, marks the session locked and returns the release function
  * @property {(sessionId: string) => LiveInfo|null} liveInfo
  * @property {() => LiveInfo[]} allLive
+ * @property {() => string|null} lastClaudeCodeVersion   version from the most recent init message, kept after close
  * @property {(now?: number) => Promise<number>} sweepIdle   closes idle sessions, returns how many were closed
  * @property {() => Promise<void>} shutdown
  */

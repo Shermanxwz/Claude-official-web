@@ -1,0 +1,27 @@
+# systemd user unit template for claude-official-web. scripts/install-linux.sh fills in the path placeholders below and installs the
+# result to ~/.config/systemd/user/. Edit the rendered copy only through the installer, never by hand.
+[Unit]
+Description=Claude Official Web (self-hosted Web host for the Claude Agent SDK)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT_ROOT__
+ExecStart="__NODE_BIN__" "__PROJECT_ROOT__/src/server.mjs"
+Environment=NODE_ENV=production
+Environment="PATH=__NODE_BIN_DIR__:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=__ENV_FILE__
+Restart=on-failure
+RestartSec=3
+# Exit status 2 is a configuration error (see src/config.mjs). Restarting cannot fix it, so systemd stops instead.
+RestartPreventExitStatus=2
+KillMode=control-group
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

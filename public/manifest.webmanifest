@@ -1,0 +1,19 @@
+{
+  "name": "Agent Web",
+  "short_name": "Agent Web",
+  "description": "A graphical web host for the official agent SDK runtime.",
+  "lang": "en",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#fbfbfa",
+  "theme_color": "#fbfbfa",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -1,0 +1,290 @@
+/*
+ * Terminal panel (public/js/terminal.js). Colors, type and spacing come only from the tokens defined in app.css, so the
+ * panel follows light and dark themes without its own palette.
+ */
+
+/* The panel is sized by its own --terminal-h (drag or keyboard resize). The shell gives the slot a fixed share of the
+   window, which would clip a taller panel, so the slot grows to whatever the panel needs. */
+.app-terminal-slot:empty {
+  display: none;
+}
+
+.app-terminal-slot:has(> .terminal-panel) {
+  height: auto;
+}
+
+.terminal-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: var(--terminal-h, 320px);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-sunken);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+}
+
+/* Scoped to real controls: xterm's hidden helper textarea lives inside the screen and must not get a ring. */
+.terminal-panel button:focus-visible,
+.terminal-ime:focus-visible,
+.terminal-resizer:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ---- Resize handle ------------------------------------------------------ */
+.terminal-resizer {
+  position: relative;
+  flex: none;
+  height: 8px;
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.terminal-resizer::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 40px;
+  height: 3px;
+  margin: -1.5px 0 0 -20px;
+  border-radius: var(--radius-sm);
+  background: var(--border-strong);
+}
+
+.terminal-resizer:hover::before,
+.terminal-resizer:focus-visible::before {
+  background: var(--fg-muted);
+}
+
+/* ---- Header ------------------------------------------------------------- */
+.terminal-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.terminal-header > .btn {
+  flex: none;
+}
+
+.terminal-title {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.terminal-title > .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--fg-muted);
+}
+
+.terminal-target {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-status {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-status[data-tone='ok'] {
+  color: var(--success);
+}
+
+.terminal-status[data-tone='error'] {
+  color: var(--danger);
+}
+
+/* Icon-only buttons on narrow screens; the label stays available to assistive technology. */
+.terminal-btn-label {
+  white-space: nowrap;
+}
+
+@media (max-width: 479.98px) {
+  .terminal-btn-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    border: 0;
+  }
+}
+
+/* ---- Locked-session banner ---------------------------------------------- */
+.terminal-banner {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--warning-soft);
+  color: var(--fg);
+  font-size: var(--fs-xs);
+}
+
+.terminal-banner > .icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  color: var(--fg-muted);
+}
+
+.terminal-banner-body {
+  min-width: 0;
+}
+
+.terminal-banner-text,
+.terminal-banner-note {
+  margin: 0;
+}
+
+.terminal-banner-note {
+  margin-top: var(--space-1);
+  color: var(--fg-muted);
+}
+
+/* ---- Screen (xterm mounts here) ----------------------------------------- */
+/* No padding on purpose: the fit addon measures this element and padding would make it overflow. */
+.terminal-screen {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-sunken);
+}
+
+/* ---- Touch keys (coarse pointers only) ---------------------------------- */
+.terminal-keys {
+  display: none;
+  flex: none;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2) calc(var(--space-2) + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.terminal-key-row {
+  display: flex;
+  gap: var(--space-1);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.terminal-key-row::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-key {
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: 1;
+  white-space: nowrap;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.terminal-key:active {
+  background: var(--accent-soft);
+}
+
+/* 16px keeps iOS Safari from zooming in when the field is focused. */
+.terminal-ime {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 16px;
+}
+
+.terminal-ime::placeholder {
+  color: var(--fg-muted);
+}
+
+@media (pointer: coarse) {
+  .terminal-keys {
+    display: flex;
+  }
+
+  .terminal-resizer {
+    height: 20px;
+  }
+
+  .terminal-header .btn {
+    --btn-h: 44px;
+    min-width: var(--btn-h);
+  }
+}
+
+/* ---- Narrow screens: full-screen overlay -------------------------------- */
+@media (max-width: 767.98px) {
+  .app-terminal-slot:has(> .terminal-panel) {
+    border-top: 0;
+    background: none;
+  }
+
+  .terminal-panel {
+    position: fixed;
+    top: var(--terminal-vtop, 0px);
+    right: 0;
+    left: 0;
+    z-index: 41;
+    height: 100vh;
+    height: var(--terminal-vh, 100dvh);
+    padding-top: env(safe-area-inset-top);
+    padding-right: env(safe-area-inset-right);
+    padding-left: env(safe-area-inset-left);
+    overscroll-behavior: contain;
+  }
+
+  .terminal-resizer {
+    display: none;
+  }
+}
