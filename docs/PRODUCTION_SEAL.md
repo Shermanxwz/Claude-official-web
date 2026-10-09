@@ -14,7 +14,7 @@ The seal runs these gates in order and stops at the first failure:
 | 2 | `check` | Static rules hold across the tree: no `TODO`, `FIXME` or `XXX` markers; no `console.*` in `src/`; every backend module starts with `// @ts-check`; no `eval`, `new Function`, `shell: true` or shell-based `exec` in `src/`; no `innerHTML`, `outerHTML`, `insertAdjacentHTML` or `document.write` in browser code; no inline scripts or inline event handlers in HTML; LF line endings, no trailing whitespace, no tab indentation and a final newline; valid JSON; every module passes `node --check`; relative imports resolve; no file over 300 KiB; no symbolic links. |
 | 3 | `typecheck` | `tsc -p jsconfig.json` passes with JSDoc types checked, including the scripts. |
 | 4 | `test` | Unit and integration tests pass with no network access, temporary directories and random ports. Integration tests use the mock engine. |
-| 5 | `test:e2e` | The browser suite passes in Chromium, driving the real interface against the mock engine. |
+| 5 | `test:e2e` | The 22 browser tests pass in Chromium, driving the real interface against the mock engine. |
 
 The seal uses the deterministic mock engine. It proves the gateway, the wire protocol, the access rules and the browser
 interface behave as specified. It does not prove that a real model answers correctly, and it does not prove that Claude
@@ -86,9 +86,11 @@ This command uses model usage on the account you are logged in with.
 ### `npm run smoke:gateway`
 
 Validates a deployed gateway over the network. It needs `CAW_GATEWAY_URL` and `CAW_GATEWAY_TOKEN`, and optionally
-`CAW_GATEWAY_ORIGIN`. It checks:
+`CAW_GATEWAY_ORIGIN`. The token is the one you saved when the installer printed it, or the one from `--rotate-token`. The
+configuration file holds only its hash by default, so enter the token at the prompt shown in the deployment guide rather
+than on the command line. It checks:
 
-- `/healthz` responds;
+- `/healthz` responds through the public URL, so a proxy that rewrites the `Host` header fails here with 421;
 - the unauthenticated session probe reports that authentication is required;
 - login sets the session cookie with HttpOnly, SameSite=Strict and, over HTTPS, Secure;
 - a write with a foreign Origin is rejected with `ORIGIN_REJECTED`;
@@ -108,6 +110,7 @@ cannot prove:
 - that Claude Code is logged in on a particular host;
 - the deployed configuration: the TLS certificate, the tunnel or proxy, Cloudflare Access or Tailscale rules, and the
   `CAW_PUBLIC_ORIGIN` value;
+- that the proxy forwards the `Host` header unchanged and, with `CAW_TRUST_PROXY=1`, sets the client address header itself;
 - that node-pty compiles on the target host;
 - that systemd user services and lingering behave as expected on the target host;
 - the usage limits and billing of the account in use.
@@ -118,9 +121,20 @@ Those are covered by `smoke:runtime`, `smoke:gateway` and the deployment steps i
 
 1. Make sure the working tree contains only the intended changes, and that `CHANGELOG.md` describes them.
 2. Update `version` in `package.json` if the release changes it, and make the matching entry in `CHANGELOG.md`.
-3. Run `npm ci`, then `npm run manifest`, then `npm run seal`. Keep the `SEALED` line and the receipt with the release
+3. Run `npm ci`. If the interface changed, run `npm run screenshots` and review the three PNG files in `docs/screenshots/`
+   (section 6). Then run `npm run manifest`, then `npm run seal`. Keep the `SEALED` line and the receipt with the release
    record.
 4. Confirm that the CI workflow passes on the release commit.
 5. On the deployment host, update the code, run `scripts/install-linux.sh`, then `npm run smoke:runtime -- --with-tools` and
    `npm run smoke:gateway`. Keep the `RUNTIME_VALIDATED` and `GATEWAY_VALIDATED` output with the release record.
 6. Tag the commit with the version number, and publish the release notes from `CHANGELOG.md`.
+
+## 6. Screenshots (not a gate)
+
+`npm run screenshots` renders the desktop light, desktop dark and phone screenshots that the README shows. It uses the
+mock engine with login off, on a demo workspace in the system temporary directory. It needs Chromium
+(`npx playwright-core install chromium`) and writes the images to `docs/screenshots/`.
+
+The screenshots are not a gate. Review them by eye before a release, because a rendering change is visible to users but
+changes no protocol or access rule. The images are part of the source manifest, so run `npm run manifest` after they
+change, and before the seal.

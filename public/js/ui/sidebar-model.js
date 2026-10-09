@@ -70,6 +70,38 @@ export function sessionTitle(session, untitled) {
 }
 
 /**
+ * Store patch after the runtime auto-titles a session (`session_title_changed`). The title goes to the session summary
+ * (the display title) and to any live title already present, because the header prefers the live title. A custom
+ * title (rename) stays what the user sees, so only the summary changes then.
+ * @param {{sessions?: any[], live?: Record<string, any>}} state
+ * @param {string} sessionId
+ * @param {unknown} title
+ * @returns {{sessions?: any[], live?: Record<string, any>} | null} null when nothing changes
+ */
+export function retitledState(state, sessionId, title) {
+  if (typeof title !== 'string' || title.trim() === '') return null;
+  const next = title.trim();
+  const sessions = state.sessions ?? [];
+  const entry = sessions.find((session) => session.sessionId === sessionId) ?? null;
+  const renamed = Boolean(entry?.customTitle);
+  /** @type {{sessions?: any[], live?: Record<string, any>}} */
+  const patch = {};
+  if (entry) {
+    patch.sessions = sessions.map((session) => {
+      if (session.sessionId !== sessionId) return session;
+      const updated = { ...session, summary: next };
+      if (!renamed && typeof session.live?.title === 'string') updated.live = { ...session.live, title: next };
+      return updated;
+    });
+  }
+  const live = state.live?.[sessionId];
+  if (live && !renamed && typeof live.title === 'string') {
+    patch.live = { ...state.live, [sessionId]: { ...live, title: next } };
+  }
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
+/**
  * Timestamp used for ordering: last modification of the transcript, else the live activity time.
  * @param {SessionLike} session
  * @returns {number}

@@ -15,7 +15,7 @@ import { closeAllDialogs, hasOpenDialog } from './dialog.js';
 import { closeMenu } from './menu.js';
 import { closePanel, hasOpenSheet, openPanel, refreshSessionList, renameSessionDialog } from './panels.js';
 import { openNewSessionDialog } from './new-session.js';
-import { formatClock } from './sidebar-model.js';
+import { formatClock, retitledState } from './sidebar-model.js';
 import { createTimeline } from '../timeline/view.js';
 import { openForkDialog, openRewindDialog } from '../timeline/rewind.js';
 import { createTerminalPanel } from '../terminal.js';
@@ -498,10 +498,28 @@ export function createAppShell({ root, api, store, t }) {
     toast(localized !== key ? localized : String(data.message ?? ''), level);
   }
 
+  /**
+   * The runtime auto-titled a session. The title shows at once (the sidebar row and the header read the store), then a
+   * debounced list refresh picks up the stored title. Other clients learn of it from sessions_changed.
+   * @param {string} sessionId
+   * @param {unknown} title
+   */
+  function onSessionTitleChanged(sessionId, title) {
+    const patch = retitledState(store.get(), sessionId, title);
+    if (patch) store.set(patch);
+    scheduleSessionsRefresh();
+  }
+
   /** @param {any} data */
   function onSdk(data) {
     const { sessionId, msg } = data;
-    if (!msg || sessionId !== currentSessionId()) return;
+    if (!msg) return;
+    // Titles apply to whichever session the stream reports, so this runs before the current-session check.
+    if (msg.type === 'system' && msg.subtype === 'session_title_changed') {
+      onSessionTitleChanged(sessionId, msg.title);
+      return;
+    }
+    if (sessionId !== currentSessionId()) return;
     switch (msg.type) {
       case 'rate_limit_event':
         rateLimit = msg.rate_limit_info ?? null;

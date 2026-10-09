@@ -29,6 +29,13 @@ First release of claude-official-web, a self-hosted graphical Web host for the o
   `npm run smoke:gateway` for a deployed gateway, a Linux installer that creates a hardened systemd user service, and a
   CI workflow.
 - English and Simplified Chinese documentation.
+- Folder trust, as in Claude Code's own trust dialog: an untrusted folder runs with user settings only. Trusting a folder
+  from the new-session notice or from a session banner loads its project settings, hooks, skills, CLAUDE.md and MCP
+  servers. Endpoints `GET /api/fs/trust` and `POST /api/fs/trust`.
+- Installer that stores the login token as a SHA-256 hash by default (`CAW_TOKEN_SHA256`) and prints the token once.
+  `--plain-token` keeps the plaintext `CAW_TOKEN` form, and `--rotate-token` issues a new token. The existing configuration
+  is checked before any dependency is installed.
+- A 22-test browser suite that is part of `npm run seal`, and `npm run screenshots` to render the README screenshots.
 
 ### Security
 
@@ -44,3 +51,14 @@ First release of claude-official-web, a self-hosted graphical Web host for the o
 - Attachment and body size limits, path containment for every file operation, and cleanup of gateway-created uploads.
 - systemd unit with `NoNewPrivileges`, `UMask=0077` and control-group kill semantics; the installer keeps the
   configuration file at mode 600.
+- Host check: a request whose `Host` header is neither a loopback name nor the host of `CAW_PUBLIC_ORIGIN` is refused
+  with `421 HOST_REJECTED`.
+- The login token is stored as a SHA-256 hash by default. Sessions in that mode are signed with a random secret that ends
+  at restart. Logout revocations persist across restarts.
+- Event streams are limited to 64 open at once and 16 per client address (`429 TOO_MANY_STREAMS`). A request body that
+  stops arriving for 30 seconds is closed, and control calls to Claude Code time out after 10 seconds.
+- `CAW_TRUST_PROXY` takes the client address from `CF-Connecting-IP`, then `X-Real-IP`, then the last `X-Forwarded-For`
+  entry.
+- "Always allow" saves only allow rules by default. Directory grants and mode changes need an explicit tick.
+- Rejected Claude Code credentials are reported to the session with the `ENGINE_UNAVAILABLE` code.
+- `bypassPermissions`, including as the default permission mode, requires `CAW_ALLOW_BYPASS=1` and the `full` profile.

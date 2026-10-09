@@ -45,6 +45,7 @@ import {
   mergeLive,
   projectName,
   queryTerms,
+  retitledState,
   sessionActivity,
   sessionCwd,
   sessionTitle,
@@ -836,7 +837,7 @@ describe('preferences and the application store', () => {
     assert.deepEqual([...THEMES], ['system', 'light', 'dark']);
     assert.deepEqual([...FONT_SIZES], ['sm', 'md', 'lg']);
     assert.deepEqual(defaultPrefs(), {
-      theme: 'system', locale: null, fontSize: 'md', notify: false, sidebarOpen: true,
+      theme: 'system', locale: null, fontSize: 'md', notify: false, showRuntimeEvents: false, sidebarOpen: true,
     });
   });
 
@@ -847,14 +848,15 @@ describe('preferences and the application store', () => {
   });
 
   it('keeps valid stored values and normalizes the locale tag', () => {
-    assert.deepEqual(normalizePrefs({ theme: 'dark', locale: 'zh_TW', fontSize: 'lg', notify: true }), {
-      theme: 'dark', locale: 'zh-CN', fontSize: 'lg', notify: true, sidebarOpen: true,
-    });
+    assert.deepEqual(
+      normalizePrefs({ theme: 'dark', locale: 'zh_TW', fontSize: 'lg', notify: true, showRuntimeEvents: true }),
+      { theme: 'dark', locale: 'zh-CN', fontSize: 'lg', notify: true, showRuntimeEvents: true, sidebarOpen: true },
+    );
   });
 
   it('replaces invalid stored values with the base values', () => {
     assert.deepEqual(
-      normalizePrefs({ theme: 'blue', locale: 'fr-FR', fontSize: 'xl', notify: 'yes' }),
+      normalizePrefs({ theme: 'blue', locale: 'fr-FR', fontSize: 'xl', notify: 'yes', showRuntimeEvents: 'on' }),
       defaultPrefs(),
     );
   });
@@ -865,7 +867,7 @@ describe('preferences and the application store', () => {
   });
 
   it('fills missing fields from the supplied base', () => {
-    const base = { theme: 'light', locale: 'en', fontSize: 'sm', notify: true, sidebarOpen: true };
+    const base = { theme: 'light', locale: 'en', fontSize: 'sm', notify: true, showRuntimeEvents: false, sidebarOpen: true };
     assert.deepEqual(normalizePrefs({ theme: 'dark' }, base), { ...base, theme: 'dark' });
   });
 
@@ -883,6 +885,47 @@ describe('preferences and the application store', () => {
     assert.equal(store.get().prefs.fontSize, 'lg');
     store.set({ prefs: before });
     assert.equal(store.get().prefs.fontSize, before.fontSize);
+  });
+});
+
+describe('retitledState', () => {
+  const state = () => ({
+    sessions: [
+      { sessionId: 'a', summary: 'Old title', live: { title: null, state: 'idle' } },
+      { sessionId: 'b', summary: 'Named', customTitle: 'Mine', live: { title: 'Mine', state: 'idle' } },
+      { sessionId: 'c', summary: 'Other', live: { title: 'Live', state: 'running' } },
+    ],
+    live: {
+      a: { title: null, state: 'idle' },
+      c: { title: 'Live', state: 'running' },
+    },
+  });
+
+  it('writes the auto title to the summary and leaves an unset live title alone', () => {
+    const patch = retitledState(state(), 'a', '  Refactor the parser  ');
+    assert.equal(sessionTitle(patch.sessions[0], 'U'), 'Refactor the parser');
+    assert.equal(patch.sessions[1].summary, 'Named');
+    assert.equal(patch.live, undefined);
+  });
+
+  it('moves a live title that is already set, in the rows and in the live map', () => {
+    const patch = retitledState(state(), 'c', 'Fixing the build');
+    assert.equal(sessionTitle(patch.sessions[2], 'U'), 'Fixing the build');
+    assert.equal(patch.live.c.title, 'Fixing the build');
+    assert.equal(patch.live.c.state, 'running');
+    assert.equal(patch.live.a.title, null);
+  });
+
+  it('keeps a custom title visible', () => {
+    const patch = retitledState(state(), 'b', 'Auto title');
+    assert.equal(sessionTitle(patch.sessions[1], 'U'), 'Mine');
+    assert.equal(patch.live, undefined);
+  });
+
+  it('returns null when there is nothing to change', () => {
+    assert.equal(retitledState(state(), 'a', '   '), null);
+    assert.equal(retitledState(state(), 'a', 42), null);
+    assert.equal(retitledState(state(), 'missing', 'Title'), null);
   });
 });
 

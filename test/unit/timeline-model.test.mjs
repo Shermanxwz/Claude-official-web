@@ -996,12 +996,16 @@ test('an inline notice with no open turn starts one, and a notice after a finish
   assert.deepEqual(kinds(model), ['notice', 'user', 'result', 'notice']);
 });
 
-test('a permission suggestion starts checked only when it adds an allow rule', () => {
+test('a permission suggestion starts checked when it allows a rule or switches the mode for this session only', () => {
   assert.equal(isDefaultChecked({ type: 'addRules', behavior: 'allow', rules: [], destination: 'localSettings' }), true);
   assert.equal(isDefaultChecked({ type: 'replaceRules', behavior: 'allow', rules: [] }), true);
   assert.equal(isDefaultChecked({ type: 'addRules', behavior: 'deny', rules: [] }), false, 'a deny rule is never applied by default');
   assert.equal(isDefaultChecked({ type: 'addDirectories', directories: ['/home/u/.ssh'], destination: 'session' }), false);
-  assert.equal(isDefaultChecked({ type: 'setMode', mode: 'acceptEdits', destination: 'session' }), false);
+  assert.equal(isDefaultChecked({ type: 'setMode', mode: 'acceptEdits', destination: 'session' }), true,
+    'the mode change a Write request offers');
+  assert.equal(isDefaultChecked({ type: 'setMode', mode: 'acceptEdits', destination: 'userSettings' }), false,
+    'a mode change kept in settings');
+  assert.equal(isDefaultChecked({ type: 'setMode', mode: 'auto', destination: 'localSettings' }), false);
   assert.equal(isDefaultChecked({ type: 'removeRules', behavior: 'allow', rules: [] }), false);
   assert.equal(isDefaultChecked(null), false);
 });
@@ -1033,4 +1037,85 @@ test('checked suggestions give the indexes that an always-allow answer sends, an
   assert.equal(ruleText({ toolName: 'Bash', ruleContent: 'npm test:*' }), 'Bash(npm test:*)');
   assert.equal(ruleText({ toolName: 'WebFetch' }), 'WebFetch');
   assert.equal(ruleText({ toolName: '  ' }), '');
+});
+
+test('command_lifecycle moves a message from queued to sent and adds no row', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'first'));
+  model.addOptimistic({ clientMessageId: uuid(11), text: 'later' });
+  assert.equal(find(model, 'user')[1].status, 'queued');
+  model.applyLiveEvent({ type: 'command_lifecycle', command_uuid: uuid(11), state: 'queued', session_id: SESSION });
+  assert.equal(find(model, 'user')[1].status, 'queued');
+  model.applyLiveEvent({ type: 'command_lifecycle', command_uuid: uuid(11), state: 'started', session_id: SESSION });
+  const users = find(model, 'user');
+  assert.equal(users.length, 2, 'the message is listed once, in the running turn');
+  assert.equal(users[1].status, 'sent');
+  assert.equal(users[1].uuid, uuid(11));
+  assert.equal(model.getEntries().filter((entry) => entry.status === 'queued').length, 0);
+  assert.deepEqual(model.getUserMessages().map((message) => message.uuid), [uuid(1), uuid(11)],
+    'the message sits in its turn, so rewind can target it');
+  model.applyLiveEvent({ type: 'command_lifecycle', command_uuid: uuid(11), state: 'completed', session_id: SESSION });
+  assert.deepEqual(kinds(model), ['user', 'user'], 'lifecycle reports add no row');
+  assert.equal(find(model, 'user')[1].status, 'sent');
+});
+
+test('a queued report marks a message the browser sent to an idle session as queued until the runtime starts it', () => {
+  const model = createModel();
+  model.addOptimistic({ clientMessageId: uuid(13), text: 'sent while idle' });
+  assert.equal(find(model, 'user')[0].status, 'sending');
+  model.applyLiveEvent({ type: 'command_lifecycle', command_uuid: uuid(13), state: 'queued', session_id: SESSION });
+  assert.equal(find(model, 'user')[0].status, 'queued');
+  model.applyLiveEvent({ type: 'command_lifecycle', command_uuid: uuid(13), state: 'started', session_id: SESSION });
+  assert.equal(find(model, 'user')[0].status, 'sent');
+  assert.equal(find(model, 'user').length, 1, 'still one message');
+});
+
+test('command_lifecycle leaves a failed message alone and ignores a command it does not know', () => {
+  const model = createModel();
+  model.addOptimistic({ clientMessageId: uuid(12), text: 'oops' });
+  model.markFailed(uuid(12), 'network down');
+  model.applyLiveEvent({ type: 'command_lifecycle', command_uuid: uuid(12), state: 'started', session_id: SESSION });
+  model.applyLiveEvent({ type: 'command_lifecycle', command_uuid: uuid(99), state: 'completed', session_id: SESSION });
+  model.applyLiveEvent({ type: 'command_lifecycle', state: 'queued', session_id: SESSION });
+  const [message] = find(model, 'user');
+  assert.equal(message.status, 'failed');
+  assert.equal(message.error, 'network down');
+  assert.equal(model.getEntries().length, 1);
+});
+
+test('runtime status lines add no row; a task summary shows as the running activity until the turn ends', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'go'));
+  const rows = kinds(model);
+  model.applyLiveEvent({ type: 'system', subtype: 'task_summary', uuid: uuid(2), session_id: SESSION, detail: '  Reading src/server.js  ' });
+  model.applyLiveEvent({ type: 'system', subtype: 'post_turn_summary', uuid: uuid(3), session_id: SESSION, summarizes_uuid: uuid(1),
+    status_category: 'review_ready', status_detail: '**Done**', needs_action: '' });
+  model.applyLiveEvent({ type: 'system', subtype: 'session_title_changed', uuid: uuid(4), session_id: SESSION, title: 'Server work' });
+  model.applyLiveEvent({ type: 'active_goal', uuid: uuid(5), session_id: SESSION, value: null });
+  model.applyLiveEvent({ type: 'autocompact_state', uuid: uuid(6), session_id: SESSION,
+    value: { enabled: true, effective_window: 480000, threshold: 384000, enforced: true, source: 'clientdata' } });
+  assert.deepEqual(kinds(model), rows, 'none of these adds a row');
+  assert.equal(model.getRunState().running, true);
+  assert.equal(model.getRunState().activity, 'Reading src/server.js');
+  model.applyLiveEvent(live.result(7));
+  assert.equal(model.getRunState().activity, null, 'the result clears the activity');
+  model.applyLiveEvent({ type: 'system', subtype: 'task_summary', uuid: uuid(8), session_id: SESSION, detail: 'Late summary' });
+  assert.equal(model.getRunState().running, false);
+  assert.equal(model.getRunState().activity, null, 'a summary that arrives after the turn closed has no turn to show beside');
+  model.applyLiveEvent(live.user(9, 'next'));
+  assert.equal(model.getRunState().running, true);
+  assert.equal(model.getRunState().activity, null, 'the next turn does not inherit an earlier activity');
+});
+
+test('an unknown message type or subtype is kept as a diagnostic entry; a documented row keeps its own', () => {
+  const model = createModel();
+  model.applyLiveEvent({ type: 'mystery_event', uuid: uuid(30), session_id: SESSION, detail: 'x' });
+  model.applyLiveEvent(live.system(31, 'mystery_subtype', { detail: 'y' }));
+  model.applyLiveEvent(live.system(32, 'informational', { content: 'Note.', level: 'info' }));
+  const generic = find(model, 'generic');
+  assert.deepEqual(generic.map((entry) => entry.label), ['mystery_event', 'system/mystery_subtype']);
+  assert.ok(generic.every((entry) => entry.diagnostic === true));
+  const [notice] = find(model, 'notice');
+  assert.equal(notice.diagnostic, undefined, 'a documented subtype is a notice, not a diagnostic entry');
+  assert.equal(notice.text, 'Note.');
 });

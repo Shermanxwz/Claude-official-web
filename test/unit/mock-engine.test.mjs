@@ -583,8 +583,7 @@ describe('interrupt, abort and close', () => {
     const query = adapterAt(tempDir(t)).query({ prompt: channel.stream, options: { cwd: projectDir(t) } });
     assert.deepEqual(await query.interrupt(), { still_queued: [] });
     const messages = await collect(query);
-    assert.equal(messages.length, 1);
-    assert.equal(messages[0].subtype, 'init');
+    assert.deepEqual(messages.map((m) => m.subtype ?? m.type), ['init', 'autocompact_state', 'active_goal']);
   });
 
   test('an abortController aborted mid-turn ends the stream without a result, and the query then rejects calls', async (t) => {
@@ -627,6 +626,15 @@ describe('interrupt, abort and close', () => {
   });
 });
 
+/**
+ * Whether a message ends a turn: the idle state that the turn yields last, after its result and trailing messages.
+ * @param {any} message
+ * @returns {boolean}
+ */
+function isTurnEnd(message) {
+  return message.type === 'system' && message.subtype === 'session_state_changed' && message.state === 'idle';
+}
+
 /** Resolves after a short pause, so that consecutive sessions get distinct timestamps. */
 function pause(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -649,7 +657,8 @@ async function pullUntil(query, until) {
 }
 
 /**
- * A query whose prompt stream stays open, with its init message already consumed. It is closed when the test ends.
+ * A query whose prompt stream stays open, with its init message and the two settings messages after it already
+ * consumed. It is closed when the test ends.
  * @param {import('node:test').TestContext} t
  * @param {string} stateDir
  * @param {string} cwd
@@ -663,6 +672,9 @@ async function openQuery(t, stateDir, cwd, options = {}) {
     query.close();
   });
   const init = await query.next();
+  const settings = [await query.next(), await query.next()];
+  assert.deepEqual(settings.map((next) => next.value.type), ['autocompact_state', 'active_goal'],
+    'init is followed by the autocompact and goal settings');
   return { query, channel, init: init.value };
 }
 
@@ -1127,6 +1139,20 @@ describe('store files', () => {
     });
   });
 
+  test('a record written before generated titles existed lists under its first prompt', async (t) => {
+    const stateDir = tempDir(t);
+    const cwd = projectDir(t);
+    const prompt = 'Please tell me something about the project and the tests';
+    const messages = await runSingle(adapterAt(stateDir), cwd, prompt);
+    const file = join(stateDir, 'mock-sessions', `${messages[0].session_id}.json`);
+    const record = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(record.generatedTitle, 'Please tell me something about the project and');
+    delete record.generatedTitle;
+    writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
+    const [listed] = await adapterAt(stateDir).listSessions({ dir: cwd });
+    assert.equal(listed.summary, prompt);
+  });
+
   test('store arguments are checked, and unknown ids answer empty or undefined', async (t) => {
     assert.throws(() => createMockStore(''), /createMockStore needs a directory/);
     const store = createMockStore(join(tempDir(t), 'nested', 'store'));
@@ -1326,6 +1352,196 @@ describe('turn linkage', () => {
     assertLinked(messages, [result.user_message_uuid]);
     const stored = await adapter.getSessionMessages(messages[0].session_id, { dir: cwd });
     assert.equal(stored[0].uuid, result.user_message_uuid);
+  });
+});
+
+describe('runtime messages around each turn', () => {
+  test('a prompt goes queued, started and completed around its turn', async (t) => {
+    const uuid = randomUUID();
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Tell me something', {}, uuid);
+    const lifecycle = messages.filter((m) => m.type === 'command_lifecycle');
+    assert.deepEqual(lifecycle.map((m) => m.state), ['queued', 'started', 'completed']);
+    assert.ok(lifecycle.every((m) => m.command_uuid === uuid), 'every state names the prompt');
+    const indexOf = (/** @type {(message: any) => boolean} */ predicate) => messages.findIndex(predicate);
+    const queued = indexOf((m) => m.type === 'command_lifecycle' && m.state === 'queued');
+    const started = indexOf((m) => m.type === 'command_lifecycle' && m.state === 'started');
+    const reply = indexOf((m) => m.type === 'assistant');
+    const result = indexOf((m) => m.type === 'result');
+    const completed = indexOf((m) => m.type === 'command_lifecycle' && m.state === 'completed');
+    assert.ok(queued < started && started < reply, 'queued, then started, then the reply');
+    assert.ok(result < completed, 'completed comes after the result');
+  });
+
+  test('a batch of prompts is queued one by one, started together and completed after the result', async (t) => {
+    const channel = promptChannel();
+    const [first, second] = [randomUUID(), randomUUID()];
+    channel.push(userPrompt('Tell me something', first));
+    channel.push(userPrompt('Tell me more', second));
+    channel.end();
+    const query = adapterAt(tempDir(t)).query({ prompt: channel.stream, options: { cwd: projectDir(t) } });
+    const messages = await collect(query);
+    const states = messages.filter((m) => m.type === 'command_lifecycle').map((m) => [m.state, m.command_uuid]);
+    assert.deepEqual(states, [
+      ['queued', first],
+      ['queued', second],
+      ['started', first],
+      ['started', second],
+      ['completed', first],
+      ['completed', second],
+    ]);
+    assert.equal(messages.filter((m) => m.type === 'result').length, 1, 'one turn answers both prompts');
+  });
+
+  test('a prompt that does not query is queued, started and completed without a turn of its own', async (t) => {
+    const channel = promptChannel();
+    const [first, note] = [randomUUID(), randomUUID()];
+    channel.push(userPrompt('Tell me something', first));
+    channel.push({ ...userPrompt('Keep this note', note), shouldQuery: false });
+    channel.end();
+    const query = adapterAt(tempDir(t)).query({ prompt: channel.stream, options: { cwd: projectDir(t) } });
+    const messages = await collect(query);
+    const noteStates = messages
+      .filter((m) => m.type === 'command_lifecycle' && m.command_uuid === note)
+      .map((m) => m.state);
+    assert.deepEqual(noteStates, ['queued', 'started', 'completed']);
+    assert.equal(messages.filter((m) => m.type === 'result').length, 1);
+  });
+
+  test('each tool that runs is announced by one task_summary before its result', async (t) => {
+    const cases = [
+      ['run the tool', { canUseTool: allowAll }, ['Running ls -la']],
+      ['edit the server file', { canUseTool: allowAll }, ['Reading src/app.js', 'Editing src/app.js']],
+      ['ask me a question', { canUseTool: pickFirstAnswers }, ['Asking 2 questions']],
+      ['make a plan', { canUseTool: allowAll }, ['Presenting the plan for approval']],
+      ['track the todo list', {}, ['Updating the todo list']],
+      ['use an agent for this', {}, ['Running the Explore agent']],
+      ['search the web', {}, ['Searching the web for "claude agent sdk session files"',
+        'Fetching https://example.com/docs']],
+      ['check mcp issues', { canUseTool: allowAll }, ['Searching GitHub issues']],
+      ['run a hook first', {}, ['Running git status --short']],
+    ];
+    for (const [text, options, details] of cases) {
+      const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), text, options);
+      const summaries = messages.filter((m) => m.type === 'system' && m.subtype === 'task_summary');
+      assert.deepEqual(summaries.map((m) => m.detail), details, text);
+      const answered = messages
+        .filter((m) => m.type === 'user' && m.parent_tool_use_id === null && Array.isArray(m.message.content))
+        .flatMap((m) => m.message.content)
+        .filter((block) => block.type === 'tool_result' && block.is_error !== true);
+      assert.equal(answered.length, summaries.length, `${text}: one summary per tool that runs`);
+      for (const summary of summaries) {
+        const earlier = messages.slice(0, messages.indexOf(summary));
+        assert.ok(earlier.some((m) => m.type === 'assistant' && m.message.content.some((b) => b.type === 'tool_use')),
+          `${text}: the summary follows the tool call`);
+      }
+    }
+  });
+
+  test('each result is followed by a post_turn_summary that names the last assistant message', async (t) => {
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Tell me something about the project');
+    const summaries = messages.filter((m) => m.type === 'system' && m.subtype === 'post_turn_summary');
+    assert.equal(summaries.length, 1);
+    const [summary] = summaries;
+    const last = messages.filter((m) => m.type === 'assistant' && m.parent_tool_use_id === null).at(-1);
+    assert.equal(summary.summarizes_uuid, last.uuid);
+    assert.equal(summary.status_category, 'review_ready');
+    assert.equal(summary.needs_action, '');
+    assert.equal(summary.status_detail, 'This reply comes from the deterministic mock engine.');
+    assert.ok(messages.indexOf(summary) > messages.findIndex((m) => m.type === 'result'), 'it follows the result');
+  });
+
+  test('interrupted and failed turns each get a status line of their own', async (t) => {
+    const channel = promptChannel();
+    channel.push(userPrompt('answer slowly'));
+    channel.end();
+    const query = adapterAt(tempDir(t), 5).query({
+      prompt: channel.stream,
+      options: { cwd: projectDir(t), includePartialMessages: true },
+    });
+    const interrupted = [];
+    let deltas = 0;
+    for await (const message of query) {
+      interrupted.push(message);
+      if (message.type === 'stream_event' && message.event.type === 'content_block_delta') {
+        deltas += 1;
+        if (deltas === 3) await query.interrupt();
+      }
+    }
+    const aborted = interrupted.find((m) => m.type === 'assistant' && m.aborted === true);
+    const cut = interrupted.find((m) => m.type === 'system' && m.subtype === 'post_turn_summary');
+    assert.equal(cut.status_detail, 'Turn was interrupted.');
+    assert.equal(cut.summarizes_uuid, aborted.uuid);
+
+    const failed = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'produce an error');
+    const failure = failed.find((m) => m.type === 'system' && m.subtype === 'post_turn_summary');
+    assert.equal(failure.status_detail, 'Turn failed: Mock failure requested.');
+    assert.equal(failure.summarizes_uuid, failed.find((m) => m.type === 'result').uuid,
+      'a turn with no assistant message names its result');
+
+    const rejected = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'check the auth token');
+    const rejection = rejected.find((m) => m.type === 'system' && m.subtype === 'post_turn_summary');
+    assert.equal(rejection.status_detail, 'Turn failed: Invalid API key · Please run /login.');
+  });
+
+  test('the first turn names a session without a custom title, and later turns leave the name alone', async (t) => {
+    const stateDir = tempDir(t);
+    const cwd = projectDir(t);
+    const { query, channel } = await openQuery(t, stateDir, cwd);
+    channel.push(userPrompt('Please tell me something about the project and the tests'));
+    const first = await pullUntil(query, isTurnEnd);
+    const titles = first.filter((m) => m.type === 'system' && m.subtype === 'session_title_changed');
+    assert.deepEqual(titles.map((m) => m.title), ['Please tell me something about the project and']);
+    const listed = await adapterAt(stateDir).listSessions({ dir: cwd });
+    assert.equal(listed[0].summary, titles[0].title, 'the listing shows the title');
+
+    channel.push(userPrompt('Tell me more'));
+    const second = await pullUntil(query, isTurnEnd);
+    assert.equal(second.some((m) => m.type === 'system' && m.subtype === 'session_title_changed'), false);
+  });
+
+  test('a session with a custom title keeps it, and no title message is sent', async (t) => {
+    const stateDir = tempDir(t);
+    const cwd = projectDir(t);
+    const { query, channel } = await openQuery(t, stateDir, cwd, { title: 'Named by the host' });
+    channel.push(userPrompt('Tell me something'));
+    const turn = await pullUntil(query, isTurnEnd);
+    assert.equal(turn.some((m) => m.type === 'system' && m.subtype === 'session_title_changed'), false);
+    const listed = await adapterAt(stateDir).listSessions({ dir: cwd });
+    assert.equal(listed[0].summary, 'Named by the host');
+  });
+
+  test('autocompact_state and active_goal come once each, right after init', async (t) => {
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Tell me something');
+    assert.deepEqual(messages.slice(0, 3).map((m) => m.type), ['system', 'autocompact_state', 'active_goal']);
+    assert.deepEqual(messages[1].value, {
+      enabled: true,
+      effective_window: 200000,
+      threshold: 167000,
+      enforced: true,
+      source: 'clientdata',
+    });
+    assert.equal(messages[2].value, null);
+    assert.equal(messages.filter((m) => m.type === 'autocompact_state').length, 1);
+    assert.equal(messages.filter((m) => m.type === 'active_goal').length, 1);
+  });
+
+  test('status messages name the prompts of their turn, and a notice between turns names none', async (t) => {
+    const compactUuid = randomUUID();
+    const compact = await runSingle(adapterAt(tempDir(t)), projectDir(t), '/compact', {}, compactUuid);
+    const compacting = compact.filter((m) => m.type === 'system' && m.subtype === 'status');
+    assert.equal(compacting.length, 2);
+    for (const status of compacting) assert.deepEqual(status.user_message_uuids, [compactUuid]);
+
+    const planUuid = randomUUID();
+    const plan = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'make a plan',
+      { canUseTool: allowAll }, planUuid);
+    const planning = plan.filter((m) => m.type === 'system' && m.subtype === 'status');
+    assert.deepEqual(planning.map((m) => m.permissionMode), ['plan']);
+    assert.deepEqual(planning[0].user_message_uuids, [planUuid]);
+
+    const { query } = await openQuery(t, tempDir(t), projectDir(t));
+    await query.setPermissionMode('acceptEdits');
+    assert.deepEqual((await query.next()).value.user_message_uuids, []);
   });
 });
 

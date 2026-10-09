@@ -178,7 +178,12 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
    - `auth_status`: banner.
    - `result`: turn footer (duration, turns, error subtype + `errors[]` in red for error results, permission denials).
      A result whose `terminal_reason` starts with `aborted` is shown as a neutral "Interrupted" footer, not an error.
-   - Any other type/subtype → collapsed generic row showing the JSON (never throw).
+   - Runtime bookkeeping messages observed from Claude Code 2.1.x render no row: `command_lifecycle` updates the
+     status of the user message whose uuid equals `command_uuid` (queued → sent); `system/task_summary` sets the live
+     activity text beside the running indicator; `system/post_turn_summary`, `system/session_title_changed` (the shell
+     updates the title), `active_goal` and `autocompact_state` are state only.
+   - Any other type/subtype is kept as a diagnostic generic entry (never thrown away, never throws) and rendered as a
+     collapsed JSON row only when Settings → "Show runtime events" (`prefs.showRuntimeEvents`) is on.
 
 ## Tool renderers (`public/js/timeline/tools/`)
 

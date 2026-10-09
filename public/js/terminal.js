@@ -66,7 +66,6 @@ export function createTerminalPanel({ container, api, store, t }) {
   let view = null;
   /** @type {HTMLElement | null} */
   let returnFocus = null;
-  const unsubscribeLocale = onLocaleChange(() => view?.applyLabels());
   const unsubscribeStore = store.subscribe((next) => view?.refreshActivity(next));
 
   /** @param {TerminalTarget} target */
@@ -109,7 +108,6 @@ export function createTerminalPanel({ container, api, store, t }) {
     destroy() {
       close();
       unsubscribeStore();
-      unsubscribeLocale();
     },
   };
 }
@@ -159,6 +157,9 @@ class TerminalView {
     window.addEventListener('resize', this.onWindowResize);
     window.visualViewport?.addEventListener('resize', this.onViewportChange);
     window.visualViewport?.addEventListener('scroll', this.onViewportChange);
+    // Visible text follows the locale in place. The socket and the xterm session are not touched, so a language
+    // change never closes a running terminal.
+    this.unsubscribeLocale = onLocaleChange(() => this.applyLabels());
   }
 
   onWindowResize = () => {
@@ -547,6 +548,7 @@ class TerminalView {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    this.unsubscribeLocale();
     const socket = this.socket;
     this.socket = null;
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {

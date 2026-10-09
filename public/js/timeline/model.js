@@ -26,7 +26,8 @@
  *  - result:         { subtype, durationMs, durationApiMs, numTurns, isError, interrupted, errors,
  *                      permissionDenials: [{toolName}], terminalReason, totalCostUsd }
  *  - request:        { request }   (PendingRequest, placed after the active turn)
- *  - generic:        { label, raw }   (unknown types, shown as collapsed JSON)
+ *  - generic:        { label, raw, diagnostic: true }   (unknown message types or subtypes, kept for diagnostics; the view
+ *                      shows them only while the runtime-events preference is on)
  *
  * Inputs are kept in an operation log, so an older transcript page can be prepended (prependTranscript) and the
  * state rebuilt. Pending requests and the session state are applied on top of the replayed state.
@@ -92,7 +93,7 @@ const INTERRUPT_NOTICES = new Map([
  *   getUserMessages: () => Array<{uuid: string, text: string, index: number}>,
  *   getPendingUserMessages: () => Array<{clientMessageId: string, text: string, attachments: Array<Record<string, any>>,
  *                                        accepted: boolean, status: string, error: string|null}>,
- *   getRunState: () => {running: boolean, status: string|null, compactResult: string|null}
+ *   getRunState: () => {running: boolean, status: string|null, compactResult: string|null, activity: string|null}
  * }}
  */
 export function createModel() {
@@ -134,6 +135,8 @@ export function createModel() {
   /** @type {Map<string, Record<string, any>>} user entries by clientMessageId and by uuid */
   let userEntries = new Map();
   let runStatus = { status: null, compactResult: null };
+  /** @type {string|null} the runtime's one-line activity for the running turn (system/task_summary) */
+  let activity = null;
   /** @type {Array<{request: Record<string, any>, version: number}>} */
   let pending = [];
   /** @type {string|null} */
@@ -398,6 +401,7 @@ export function createModel() {
     if (state.closed) return;
     state.closed = true;
     state.sendPending = false;
+    activity = null;
     if (state.main) {
       syncFlow(state.main);
       pruneLocals(state.main);
@@ -608,7 +612,7 @@ export function createModel() {
       text = typeof raw.type === 'string' ? raw.type : 'unknown';
       if (typeof raw.subtype === 'string') text += `/${raw.subtype}`;
     }
-    pushEntry(flow, { kind: 'generic', key: nextKey('g', uuid), label: text || 'unknown', raw });
+    pushEntry(flow, { kind: 'generic', key: nextKey('g', uuid), label: text || 'unknown', raw, diagnostic: true });
     return flow;
   };
 
@@ -895,6 +899,16 @@ export function createModel() {
       case 'session_state_changed':
         if (raw.state === 'idle' && live) endIdle();
         return null;
+      case 'task_summary':
+        // The runtime's one-line activity for the running turn: it shows beside the working indicator, not as a row. A
+        // summary that arrives after the turn closed has no turn to show beside, so it is dropped rather than carried on.
+        if (live && current && !current.state.closed) {
+          activity = typeof raw.detail === 'string' && raw.detail.trim() ? raw.detail.trim() : null;
+        }
+        return null;
+      case 'post_turn_summary':
+      case 'session_title_changed':
+        return null;
       case 'memory_recall': {
         const flow = live ? liveFlow() : baseFlow();
         const count = Array.isArray(raw.memories) ? raw.memories.length : 0;
@@ -1151,6 +1165,9 @@ export function createModel() {
       case 'tool_progress': return live ? onToolProgress(raw) : null;
       case 'tool_use_summary': return live ? onSummary(raw) : null;
       case 'conversation_reset': return onReset(raw);
+      case 'command_lifecycle': return applyCommandState(raw);
+      case 'active_goal':
+      case 'autocompact_state':
       case 'keep_alive':
       case 'rate_limit_event':
       case 'prompt_suggestion':
@@ -1223,6 +1240,7 @@ export function createModel() {
     locals = [];
     userEntries = new Map();
     runStatus = { status: null, compactResult: null };
+    activity = null;
   };
 
   const relinkPending = () => {
@@ -1362,6 +1380,26 @@ export function createModel() {
   };
 
   /**
+   * Moves a message that waited in the queued list into the running turn, or starts a turn for it when none runs.
+   * @param {Record<string, any>} entry
+   * @returns {Flow}
+   */
+  const joinRunningTurn = (entry) => {
+    const waiting = queued.indexOf(entry);
+    if (waiting >= 0) queued.splice(waiting, 1);
+    let turn;
+    if (turnRunning() && current) {
+      turn = current;
+    } else {
+      turn = newTurn();
+      markLive(turn.state);
+    }
+    placeUser(turn, entry);
+    bump();
+    return turn;
+  };
+
+  /**
    * A live user message that echoes a message sent from this browser (same uuid, or the same text when the echo has
    * no uuid we know) updates that message instead of adding a second bubble.
    * @param {string|null} uuid
@@ -1379,21 +1417,36 @@ export function createModel() {
     if (!entry) return null;
     if (images.length > 0 && entry.images.length === 0) setField(entry, 'images', images);
     let turn = containerOf.get(entry);
-    if (!turn) {
-      // Still queued: the SDK has started the message, so it joins the running turn.
-      const waiting = queued.indexOf(entry);
-      if (waiting >= 0) queued.splice(waiting, 1);
-      if (turnRunning() && current) {
-        turn = current;
-      } else {
-        turn = newTurn();
-        markLive(turn.state);
-      }
-      placeUser(turn, entry);
-      bump();
-    }
+    // Still queued: the SDK has started the message, so it joins the running turn.
+    if (!turn) turn = joinRunningTurn(entry);
     confirmLocal(entry, uuid);
     return turn;
+  };
+
+  /**
+   * The runtime's report on a message the user sent (command_lifecycle): queued behind a running turn, started or
+   * completed. It sets the message's status and adds no row. A message still waiting in the queued list moves into the
+   * running turn when the runtime starts it, so it is never listed twice. A failed message keeps its error.
+   * @param {Record<string, any>} raw
+   * @returns {null}
+   */
+  const applyCommandState = (raw) => {
+    const id = typeof raw.command_uuid === 'string' ? raw.command_uuid : '';
+    const entry = id ? userEntries.get(id) : undefined;
+    if (!entry || entry.status === 'failed') return null;
+    if (raw.state === 'queued' && entry.status !== 'sent') {
+      setField(entry, 'accepted', true);
+      setField(entry, 'status', 'queued');
+    } else if (raw.state === 'started' || raw.state === 'completed') {
+      setField(entry, 'accepted', true);
+      if (entry.local) {
+        if (!containerOf.has(entry) && queued.includes(entry)) joinRunningTurn(entry);
+        confirmLocal(entry, id);
+      } else {
+        setField(entry, 'status', 'sent');
+      }
+    }
+    return null;
   };
 
   /** @param {string} clientMessageId */
@@ -1625,9 +1678,17 @@ export function createModel() {
       return found;
     },
 
-    /** @returns {{running: boolean, status: string|null, compactResult: string|null}} */
+    /**
+     * @returns {{running: boolean, status: string|null, compactResult: string|null, activity: string|null}}
+     *   activity: the runtime's one-line activity of the running turn, null when none is reported
+     */
     getRunState() {
-      return { running: turnRunning(), status: runStatus.status, compactResult: runStatus.compactResult };
+      return {
+        running: turnRunning(),
+        status: runStatus.status,
+        compactResult: runStatus.compactResult,
+        activity: turnRunning() ? activity : null,
+      };
     },
 
     /**

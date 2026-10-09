@@ -934,6 +934,12 @@ function settingsPanel({ body, api, store, t, actions }) {
     notifyControl.sync(true);
   });
 
+  const runtimeEventsControl = switchControl(t('shell.settings.runtimeEvents'), prefs().showRuntimeEvents === true,
+    (next) => {
+      setPrefs({ showRuntimeEvents: next });
+      runtimeEventsControl.sync(next);
+    });
+
   const signOut = h('button', {
     class: 'btn btn-danger btn-block',
     attrs: { type: 'button' },
@@ -964,6 +970,11 @@ function settingsPanel({ body, api, store, t, actions }) {
         h('span', { class: 'settings-label', text: t('shell.settings.notifications') }),
         notifyControl.el),
       h('p', { class: 'field-hint', text: t('shell.settings.notificationsHint') })),
+    section(t('shell.settings.troubleshooting'),
+      h('div', { class: 'settings-row' },
+        h('span', { class: 'settings-label', text: t('shell.settings.runtimeEvents') }),
+        runtimeEventsControl.el),
+      h('p', { class: 'field-hint', text: t('shell.settings.runtimeEventsHint') })),
     section(t('shell.settings.about'),
       kvRow(t('shell.settings.app'), meta.appName ?? auth.appName ?? null),
       kvRow(t('shell.settings.version'), meta.version ?? auth.version ?? null, { mono: true }),
@@ -979,6 +990,7 @@ function settingsPanel({ body, api, store, t, actions }) {
     themeControl.sync(state.prefs.theme);
     fontControl.sync(state.prefs.fontSize);
     notifyControl.sync(state.prefs.notify === true);
+    runtimeEventsControl.sync(state.prefs.showRuntimeEvents === true);
   });
   return unsubscribe;
 }

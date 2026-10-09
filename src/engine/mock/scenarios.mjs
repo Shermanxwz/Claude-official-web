@@ -85,6 +85,7 @@ export class ScenarioFailure extends Error {
  * @property {string} model
  * @property {string} userText
  * @property {string} userMessageUuid
+ * @property {string[]} userMessageUuids     every prompt the turn answers, in consumption order
  * @property {number} delayMs
  * @property {boolean} streamPartials        whether text is streamed as stream_event messages
  * @property {number} turnIndex              zero-based turn number inside the session
@@ -100,9 +101,10 @@ export class ScenarioFailure extends Error {
  */
 
 /**
- * What the message builders read: the envelope of a new message, the clock and the model. Session-level control
- * messages (outside any turn) are built from this shape, so the builders never need a turn.
- * @typedef {Pick<TurnContext, 'envelope' | 'now' | 'model'>} SessionView
+ * What the message builders read: the envelope of a new message, the clock, the model and the prompts of the turn in
+ * progress (none between turns). Session-level control messages are built from this shape, so the builders never need
+ * a turn.
+ * @typedef {Pick<TurnContext, 'envelope' | 'now' | 'model' | 'userMessageUuids'>} SessionView
  */
 
 /**
@@ -235,13 +237,145 @@ export function usageOf({ input, output, cacheRead = 0, cacheCreate = 0, webSear
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
+ * A status notice. It carries the uuids of the prompts its turn answers, so a client can attach it to that turn; a
+ * notice sent between turns carries an empty list.
  * @param {SessionView} ctx
  * @param {'compacting'|'requesting'|null} status
  * @param {{permissionMode?: PermissionMode, compact_result?: 'success'|'failed'}} [extra]
- * @returns {SDKStatusMessage}
+ * @returns {SDKStatusMessage & {user_message_uuids: string[]}}
  */
 export function statusMessage(ctx, status, extra = {}) {
-  return { type: 'system', subtype: 'status', status, ...extra, ...ctx.envelope() };
+  return {
+    type: 'system',
+    subtype: 'status',
+    status,
+    ...extra,
+    user_message_uuids: [...ctx.userMessageUuids],
+    ...ctx.envelope(),
+  };
+}
+
+/**
+ * Messages the runtime sends that the SDK typings do not declare yet. Each shape is typed here and cast to SDKMessage
+ * at the builder boundary, so the rest of the mock treats them like any other message.
+ * @typedef {{type: 'command_lifecycle', command_uuid: string, state: 'queued'|'started'|'completed', uuid: string,
+ *   session_id: string}} CommandLifecycleMessage
+ * @typedef {{type: 'system', subtype: 'task_summary', detail: string, uuid: string,
+ *   session_id: string}} TaskSummaryMessage
+ * @typedef {{type: 'system', subtype: 'post_turn_summary', summarizes_uuid: string,
+ *   status_category: 'review_ready', status_detail: string, needs_action: string, uuid: string,
+ *   session_id: string}} PostTurnSummaryMessage
+ * @typedef {{type: 'system', subtype: 'session_title_changed', title: string, uuid: string,
+ *   session_id: string}} SessionTitleChangedMessage
+ * @typedef {{type: 'autocompact_state', value: {enabled: boolean, effective_window: number, threshold: number,
+ *   enforced: boolean, source: string}, uuid: string, session_id: string}} AutocompactStateMessage
+ * @typedef {{type: 'active_goal', value: null, uuid: string, session_id: string}} ActiveGoalMessage
+ * @typedef {CommandLifecycleMessage | TaskSummaryMessage | PostTurnSummaryMessage | SessionTitleChangedMessage |
+ *   AutocompactStateMessage | ActiveGoalMessage} RuntimeMessage
+ */
+
+/** Context tokens at which the runtime compacts the conversation by itself. */
+export const AUTOCOMPACT_THRESHOLD_TOKENS = 167000;
+
+/**
+ * @param {RuntimeMessage} message
+ * @returns {SDKMessage}
+ */
+function asSdk(message) {
+  return /** @type {SDKMessage} */ (/** @type {unknown} */ (message));
+}
+
+/**
+ * The lifecycle of one prompt: queued when it is accepted, started when its turn begins, completed after its result.
+ * @param {SessionView} ctx
+ * @param {string} commandUuid uuid of the prompt message
+ * @param {'queued'|'started'|'completed'} state
+ * @returns {SDKMessage}
+ */
+export function commandLifecycle(ctx, commandUuid, state) {
+  return asSdk({ type: 'command_lifecycle', command_uuid: commandUuid, state, ...ctx.envelope() });
+}
+
+/**
+ * A one-line description of a tool that is about to run. Subagent tool calls get none, because their progress is
+ * reported in task_progress.
+ * @param {SessionView} ctx
+ * @param {string} detail
+ * @returns {SDKMessage}
+ */
+export function taskSummary(ctx, detail) {
+  return asSdk({ type: 'system', subtype: 'task_summary', detail, ...ctx.envelope() });
+}
+
+/**
+ * The one-line result of a turn, sent after its result message.
+ * @param {SessionView} ctx
+ * @param {{summarizes: string, detail: string}} summary  summarizes: uuid of the turn's last assistant message
+ * @returns {SDKMessage}
+ */
+export function postTurnSummary(ctx, { summarizes, detail }) {
+  return asSdk({
+    type: 'system',
+    subtype: 'post_turn_summary',
+    summarizes_uuid: summarizes,
+    status_category: 'review_ready',
+    status_detail: detail,
+    needs_action: '',
+    ...ctx.envelope(),
+  });
+}
+
+/**
+ * The title that the first turn gives a session without a custom title.
+ * @param {SessionView} ctx
+ * @param {string} title
+ * @returns {SDKMessage}
+ */
+export function sessionTitleChanged(ctx, title) {
+  return asSdk({ type: 'system', subtype: 'session_title_changed', title, ...ctx.envelope() });
+}
+
+/**
+ * The autocompact settings, sent once after init.
+ * @param {SessionView} ctx
+ * @returns {SDKMessage}
+ */
+export function autocompactState(ctx) {
+  return asSdk({
+    type: 'autocompact_state',
+    value: {
+      enabled: true,
+      effective_window: CONTEXT_MAX_TOKENS,
+      threshold: AUTOCOMPACT_THRESHOLD_TOKENS,
+      enforced: true,
+      source: 'clientdata',
+    },
+    ...ctx.envelope(),
+  });
+}
+
+/**
+ * The goal state, sent once after init. The mock never sets a goal, so the value is null.
+ * @param {SessionView} ctx
+ * @returns {SDKMessage}
+ */
+export function activeGoal(ctx) {
+  return asSdk({ type: 'active_goal', value: null, ...ctx.envelope() });
+}
+
+/**
+ * The first sentence of the first prose paragraph of a reply, for a one-line summary. Headings, quotes and code
+ * fences are skipped, and the sentence is cut at 160 characters.
+ * @param {string} text
+ * @returns {string} empty when the reply has no prose
+ */
+export function sentenceOf(text) {
+  const paragraphs = text.split(/\n\s*\n/).map((part) => part.trim()).filter((part) => part !== '');
+  const prose = paragraphs.find((part) => !/^(#|>|```)/.test(part)) ?? '';
+  const flat = prose.replace(/\s+/g, ' ');
+  const match = /^(.*?[.!?])(\s|$)/.exec(flat);
+  const points = Array.from(match ? match[1] : flat);
+  return points.length > 160 ? `${points.slice(0, 157).join('')}...` : points.join('');
 }
 
 /**
@@ -913,6 +1047,7 @@ async function* bashScenario(ctx) {
     yield* modelResponse(ctx, [{ type: 'text', text: "Understood, I won't run that command." }]);
     return;
   }
+  yield taskSummary(ctx, `Running ${input.command}`);
   yield toolProgress(ctx, toolUseId, 'Bash', 1);
   yield* ctx.pause(ctx.delayMs);
   yield toolResult(ctx, {
@@ -940,6 +1075,7 @@ async function* editScenario(ctx) {
     { type: 'text', text: 'I will read the server entry point first.' },
     { type: 'tool_use', id: readId, name: 'Read', input: { file_path: filePath } },
   ], { stopReason: 'tool_use' });
+  yield taskSummary(ctx, 'Reading src/app.js');
   yield toolResult(ctx, {
     toolUseId: readId,
     content: numberLines(APP_LINES),
@@ -971,6 +1107,7 @@ async function* editScenario(ctx) {
     yield* modelResponse(ctx, [{ type: 'text', text: "I'll leave the file unchanged." }]);
     return;
   }
+  yield taskSummary(ctx, 'Editing src/app.js');
   yield toolResult(ctx, {
     toolUseId: editId,
     content: `The file ${filePath} has been updated successfully.`,
@@ -1045,6 +1182,7 @@ async function* questionScenario(ctx) {
     answers[item.question] = text === '' ? '(no answer)' : text;
   }
   const pairs = questions.map((item) => `"${item.question}"="${answers[item.question]}"`).join(', ');
+  yield taskSummary(ctx, `Asking ${questions.length} questions`);
   yield toolResult(ctx, {
     toolUseId,
     content: `User has answered your questions: ${pairs}. You can now continue with the user's answers in mind.`,
@@ -1083,6 +1221,7 @@ async function* planScenario(ctx) {
     yield* modelResponse(ctx, [{ type: 'text', text: "Understood — I'll revise the plan." }]);
     return;
   }
+  yield taskSummary(ctx, 'Presenting the plan for approval');
   yield toolResult(ctx, {
     toolUseId,
     content: 'User has approved your plan. You can now start coding.',
@@ -1104,6 +1243,7 @@ async function* todoScenario(ctx) {
     { type: 'text', text: 'I will track the work in a checklist.' },
     { type: 'tool_use', id: toolUseId, name: 'TodoWrite', input: { todos } },
   ], { stopReason: 'tool_use' });
+  yield taskSummary(ctx, 'Updating the todo list');
   yield toolResult(ctx, {
     toolUseId,
     content: 'Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable',
@@ -1125,6 +1265,7 @@ async function* agentScenario(ctx) {
     { type: 'text', text: 'I will ask an Explore agent to find the routes.' },
     { type: 'tool_use', id: toolUseId, name: 'Agent', input: { description, prompt, subagent_type: 'Explore' } },
   ], { stopReason: 'tool_use' });
+  yield taskSummary(ctx, 'Running the Explore agent');
   yield taskStarted(ctx, { taskId: agentId, toolUseId, description, subagentType: 'Explore' });
 
   const nested = { parentToolUseId: toolUseId, agentId };
@@ -1201,6 +1342,7 @@ async function* webScenario(ctx) {
     { type: 'text', text: 'I will search for the current documentation first.' },
     { type: 'tool_use', id: searchId, name: 'WebSearch', input: { query } },
   ], { stopReason: 'tool_use' });
+  yield taskSummary(ctx, `Searching the web for "${query}"`);
   yield toolProgress(ctx, searchId, 'WebSearch', 1);
   yield* ctx.pause(ctx.delayMs);
   yield toolResult(ctx, {
@@ -1226,6 +1368,7 @@ async function* webScenario(ctx) {
     { type: 'text', text: 'Let me read the documentation page.' },
     { type: 'tool_use', id: fetchId, name: 'WebFetch', input: { url, prompt } },
   ], { stopReason: 'tool_use' });
+  yield taskSummary(ctx, `Fetching ${url}`);
   yield toolProgress(ctx, fetchId, 'WebFetch', 1);
   yield* ctx.pause(ctx.delayMs);
   yield toolResult(ctx, {
@@ -1267,6 +1410,7 @@ async function* mcpScenario(ctx) {
     yield* modelResponse(ctx, [{ type: 'text', text: 'Okay, I will not query GitHub.' }]);
     return;
   }
+  yield taskSummary(ctx, 'Searching GitHub issues');
   yield toolProgress(ctx, toolUseId, name, 1);
   yield* ctx.pause(ctx.delayMs);
   yield toolResult(ctx, {
@@ -1338,6 +1482,7 @@ async function* hookScenario(ctx) {
   yield hookStarted(ctx, hook);
   yield hookProgress(ctx, { ...hook, stdout: 'Checking the command against the policy...\n' });
   yield hookResponse(ctx, { ...hook, stdout: 'Policy check passed.\n' });
+  yield taskSummary(ctx, `Running ${input.command}`);
   yield toolProgress(ctx, toolUseId, 'Bash', 1);
   yield* ctx.pause(ctx.delayMs);
   yield toolResult(ctx, {

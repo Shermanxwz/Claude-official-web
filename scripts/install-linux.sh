@@ -2,12 +2,14 @@
 #
 # Installs claude-official-web as a systemd user service on Linux.
 #
-#   scripts/install-linux.sh [--allow-root] [--show-token]   install, or update an existing installation
-#   scripts/install-linux.sh --uninstall [--purge]           stop and remove the service
+#   scripts/install-linux.sh [--allow-root] [--show-token] [--plain-token]   install, or update an installation
+#   scripts/install-linux.sh --rotate-token [--plain-token] [--allow-root]   issue a new login token
+#   scripts/install-linux.sh --uninstall [--purge] [--allow-root]            stop and remove the service
 #   scripts/install-linux.sh --help
 #
 # Re-running is safe: dependencies are reinstalled, the unit is rendered again, and the existing configuration and login
-# token are kept. Only the configuration overrides listed in --help are written to the configuration file.
+# token are kept. A running service is restarted to apply the configuration. In the default hash mode that ends the
+# browser sessions, because the session secret exists only in memory.
 set -euo pipefail
 umask 077
 
@@ -24,12 +26,16 @@ readonly TEMPLATE="${ROOT}/deploy/${UNIT_NAME}"
 
 ALLOW_ROOT=0
 SHOW_TOKEN=0
+PLAIN_TOKEN=0
+ROTATE_TOKEN=0
 UNINSTALL=0
 PURGE=0
 NODE_BIN=""
 NODE_BIN_DIR=""
-TOKEN=""
-GENERATED_TOKEN=0
+TOKEN_STATE=""
+TOKEN_ACTION=""
+ISSUED_TOKEN=""
+KEPT_PLAIN_TOKEN=""
 UNIT_TMP=""
 LOCAL_URL=""
 OVERRIDES=()
@@ -50,15 +56,20 @@ die() {
 usage() {
   cat <<EOF
 Usage:
-  scripts/install-linux.sh [--allow-root] [--show-token]   install, or update an existing installation
-  scripts/install-linux.sh --uninstall [--purge]           stop and remove the service
+  scripts/install-linux.sh [--allow-root] [--show-token] [--plain-token]   install, or update an existing installation
+  scripts/install-linux.sh --rotate-token [--plain-token] [--allow-root]   issue a new login token
+  scripts/install-linux.sh --uninstall [--purge] [--allow-root]            stop and remove the service
   scripts/install-linux.sh --help
 
 Options:
-  --allow-root   permit running as root (the service still runs as the invoking user, which is not recommended)
-  --show-token   print the login token once after installation. The token is never printed otherwise.
-  --uninstall    stop, disable and remove the unit. The configuration file and its token are kept.
-  --purge        with --uninstall, also remove the configuration file and its token
+  --allow-root    permit running as root (the service still runs as the invoking user, which is not recommended)
+  --show-token    print the login token when it can be shown: a token issued by this run, or a plaintext CAW_TOKEN
+  --plain-token   store a newly issued login token as plaintext (CAW_TOKEN). The default stores only its SHA-256 hash.
+  --rotate-token  issue a new login token and restart the service. Every browser must sign in again.
+  --uninstall     stop, disable and remove the unit. The configuration file and its token are kept.
+  --purge         with --uninstall, also remove the configuration file and its token
+
+A newly issued token is printed once. Save it immediately: the default configuration stores only its hash.
 
 Configuration overrides, written to ${ENV_FILE} when set in the environment:
   CAW_PUBLIC_ORIGIN  CAW_PORT  CAW_HOST  CAW_WORKSPACE_ROOTS  CAW_TERMINAL
@@ -92,10 +103,12 @@ is_canonical_origin() {
   ' "$1"
 }
 
-# Prints the unquoted value of NAME from the configuration file (the last assignment wins).
+# Prints the unquoted value of NAME from the configuration file (the last assignment wins). Empty when absent.
 env_value() {
-  local name="$1" line
-  line="$(grep -E "^${name}=" "$ENV_FILE" | tail -n 1 || true)"
+  local name="$1" line=""
+  if [[ -f "$ENV_FILE" ]]; then
+    line="$(grep -E "^${name}=" "$ENV_FILE" | tail -n 1 || true)"
+  fi
   line="${line#"${name}="}"
   line="${line#\"}"
   line="${line%\"}"
@@ -116,6 +129,18 @@ set_env() {
   {
     grep -v -E "^${name}=" "$ENV_FILE" || true
     printf '%s=%s\n' "$name" "$(quote_env "$value")"
+  } >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$ENV_FILE"
+}
+
+# Removes every assignment of NAME. Other lines are kept byte for byte.
+unset_env() {
+  local name="$1" tmp
+  [[ -f "$ENV_FILE" ]] || return 0
+  tmp="$(mktemp "${CONFIG_DIR}/.env.XXXXXX")"
+  {
+    grep -v -E "^${name}=" "$ENV_FILE" || true
   } >"$tmp"
   chmod 600 "$tmp"
   mv -f "$tmp" "$ENV_FILE"
@@ -176,7 +201,58 @@ validate_overrides() {
   fi
 }
 
-# Writes the configuration file: defaults for missing keys, then the overrides, then the token.
+# Checks the existing configuration before any dependency is installed, so that a refused configuration costs nothing.
+validate_existing_config() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local require engine plain hash
+  require="$(env_value CAW_REQUIRE_AUTH)"
+  engine="$(env_value CAW_ENGINE)"
+  if [[ -n "$require" && "$require" != "1" ]]; then
+    die "${ENV_FILE} must keep CAW_REQUIRE_AUTH=1 for the production service"
+  fi
+  if [[ -n "$engine" && "$engine" != "sdk" ]]; then
+    die "${ENV_FILE} must use CAW_ENGINE=sdk for the production service (the mock engine is for demos)"
+  fi
+  # --rotate-token replaces the stored token entirely, so the old value is not checked.
+  [[ "$ROTATE_TOKEN" -eq 0 ]] || return 0
+  plain="$(env_value CAW_TOKEN)"
+  hash="$(env_value CAW_TOKEN_SHA256)"
+  if [[ -n "$plain" && -n "$hash" ]]; then
+    die "${ENV_FILE} sets both CAW_TOKEN and CAW_TOKEN_SHA256, and the gateway accepts only one. Remove one of them, or run with --rotate-token."
+  fi
+  if [[ -n "$plain" && "${#plain}" -lt 16 ]]; then
+    die "CAW_TOKEN in ${ENV_FILE} is shorter than 16 characters; replace it, or run with --rotate-token"
+  fi
+  if [[ -n "$hash" && ! "$hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    die "CAW_TOKEN_SHA256 in ${ENV_FILE} must be 64 hexadecimal characters (the SHA-256 of the login token)"
+  fi
+}
+
+# Issues a new login token. Node.js generates and hashes it, so the token never appears on a command line. Only the
+# hash is written unless --plain-token was given; any other token setting is removed, so one setting remains.
+issue_token() {
+  local pair token digest
+  pair="$("$NODE_BIN" -e '
+    const crypto = require("node:crypto");
+    const token = crypto.randomBytes(32).toString("base64url");
+    const digest = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+    process.stdout.write(`${token} ${digest}`);
+  ')"
+  read -r token digest <<<"$pair"
+  if [[ "$PLAIN_TOKEN" -eq 1 ]]; then
+    unset_env CAW_TOKEN_SHA256
+    set_env CAW_TOKEN "$token"
+    TOKEN_STATE="plain"
+  else
+    unset_env CAW_TOKEN
+    set_env CAW_TOKEN_SHA256 "$digest"
+    TOKEN_STATE="hash"
+  fi
+  TOKEN_ACTION="issued"
+  ISSUED_TOKEN="$token"
+}
+
+# Writes the configuration file: defaults for missing keys, then the overrides, then the login token.
 configure() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$UNIT_DIR"
   chmod 700 "$CONFIG_DIR" "$STATE_DIR"
@@ -204,20 +280,23 @@ configure() {
   apply_override CAW_APP_NAME
   apply_override CAW_CLAUDE_BIN
 
-  if [[ "$(env_value CAW_REQUIRE_AUTH)" != "1" ]]; then
-    die "${ENV_FILE} must keep CAW_REQUIRE_AUTH=1 for the production service"
+  local plain hash
+  plain="$(env_value CAW_TOKEN)"
+  hash="$(env_value CAW_TOKEN_SHA256)"
+  if [[ "$ROTATE_TOKEN" -eq 1 ]]; then
+    issue_token
+  elif [[ -n "$plain" ]]; then
+    TOKEN_STATE="plain"
+    TOKEN_ACTION="kept"
+    KEPT_PLAIN_TOKEN="$plain"
+  elif [[ -n "$hash" ]]; then
+    TOKEN_STATE="hash"
+    TOKEN_ACTION="kept"
+  else
+    issue_token
   fi
-  if [[ "$(env_value CAW_ENGINE)" != "sdk" ]]; then
-    die "${ENV_FILE} must use CAW_ENGINE=sdk for the production service (the mock engine is for demos)"
-  fi
-
-  TOKEN="$(env_value CAW_TOKEN)"
-  if [[ -z "$TOKEN" ]]; then
-    TOKEN="$("$NODE_BIN" -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64url"))')"
-    set_env CAW_TOKEN "$TOKEN"
-    GENERATED_TOKEN=1
-  elif [[ "${#TOKEN}" -lt 16 ]]; then
-    die "CAW_TOKEN in ${ENV_FILE} is shorter than 16 characters; replace it, or remove the line to generate a new token"
+  if [[ "$PLAIN_TOKEN" -eq 1 && "$TOKEN_ACTION" == "kept" ]]; then
+    warn "--plain-token applies only to a newly issued token, so the stored token was kept. Use --rotate-token --plain-token to change how the token is stored."
   fi
 
   if [[ -z "$(env_value CAW_PUBLIC_ORIGIN)" ]]; then
@@ -356,6 +435,57 @@ check_linger() {
   fi
 }
 
+# Prints a newly issued token once, with instructions to store it.
+print_token_block() {
+  say ""
+  say "Login token (shown once; save it now in a password manager):"
+  say ""
+  say "  $1"
+  say ""
+  if [[ "$TOKEN_STATE" == "hash" ]]; then
+    say "The configuration file keeps only a SHA-256 hash of this token. If you lose the token, run"
+    say "  scripts/install-linux.sh --rotate-token"
+    say "to issue a new one. Anyone who has this token can sign in to the gateway."
+  else
+    say "The configuration file keeps this token in plaintext (CAW_TOKEN). Anyone who can read that file can sign in."
+  fi
+}
+
+report_token() {
+  case "${TOKEN_ACTION}:${TOKEN_STATE}" in
+    issued:hash)
+      say "Login token:   issued; the configuration file stores only its SHA-256 hash (CAW_TOKEN_SHA256)"
+      print_token_block "$ISSUED_TOKEN"
+      ;;
+    issued:plain)
+      say "Login token:   issued; the configuration file stores it in plaintext (CAW_TOKEN)"
+      if [[ "$SHOW_TOKEN" -eq 1 || "$ROTATE_TOKEN" -eq 1 ]]; then
+        print_token_block "$ISSUED_TOKEN"
+      else
+        say "                Print it with --show-token, or read it from the configuration file."
+      fi
+      ;;
+    kept:plain)
+      say "Login token:   kept; the configuration file stores it in plaintext (CAW_TOKEN)"
+      if [[ "$SHOW_TOKEN" -eq 1 ]]; then
+        say "Token value:   ${KEPT_PLAIN_TOKEN}"
+        say "                Store it in a password manager. Anyone who has it can use this gateway."
+      else
+        say "                Print it with --show-token, or run --rotate-token to store only a hash."
+      fi
+      ;;
+    kept:hash)
+      say "Login token:   kept; the configuration file stores only its SHA-256 hash, so the token cannot be shown again"
+      if [[ "$SHOW_TOKEN" -eq 1 ]]; then
+        warn "--show-token cannot print a hashed token. Run with --rotate-token to issue a new one."
+      fi
+      ;;
+  esac
+  if [[ "$ROTATE_TOKEN" -eq 1 ]]; then
+    say "Every browser session has ended with the restart. Sign in again with the new token."
+  fi
+}
+
 uninstall() {
   systemctl --user disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
   rm -f -- "$UNIT_FILE"
@@ -365,9 +495,9 @@ uninstall() {
   if [[ "$PURGE" -eq 1 ]]; then
     rm -f -- "$ENV_FILE"
     rmdir "$CONFIG_DIR" 2>/dev/null || true
-    say "Purged ${ENV_FILE}. The login token is gone; a new install generates a new one."
+    say "Purged ${ENV_FILE}. The login token is gone; a new install issues a new one."
   else
-    say "Kept ${ENV_FILE}, which contains the login token. Use --purge to remove it."
+    say "Kept ${ENV_FILE}, which contains the login token (or its hash). Use --purge to remove it."
   fi
   say "Conversation files in ~/.claude and the state directory ${STATE_DIR} were not touched."
 }
@@ -383,6 +513,8 @@ while (($# > 0)); do
   case "$1" in
     --allow-root) ALLOW_ROOT=1 ;;
     --show-token) SHOW_TOKEN=1 ;;
+    --plain-token) PLAIN_TOKEN=1 ;;
+    --rotate-token) ROTATE_TOKEN=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
     -h | --help)
@@ -395,7 +527,9 @@ while (($# > 0)); do
 done
 
 if [[ "$PURGE" -eq 1 && "$UNINSTALL" -eq 0 ]]; then die "--purge requires --uninstall"; fi
-if [[ "$SHOW_TOKEN" -eq 1 && "$UNINSTALL" -eq 1 ]]; then die "--show-token applies only to an installation"; fi
+if [[ "$UNINSTALL" -eq 1 && ("$SHOW_TOKEN" -eq 1 || "$PLAIN_TOKEN" -eq 1 || "$ROTATE_TOKEN" -eq 1) ]]; then
+  die "--show-token, --plain-token and --rotate-token apply only to an installation"
+fi
 if [[ "$(uname -s)" != "Linux" ]]; then
   die "this installer manages systemd user services and runs only on Linux. Elsewhere, run npm start (see docs/DEPLOYMENT.md)."
 fi
@@ -428,6 +562,7 @@ require_unit_safe_path "configuration file" "$ENV_FILE"
 if [[ ! -f "$TEMPLATE" ]]; then die "the unit template is missing: ${TEMPLATE}"; fi
 
 validate_overrides
+validate_existing_config
 install_dependencies
 configure
 install_unit
@@ -442,16 +577,8 @@ systemctl --user --no-pager --lines=0 status "$UNIT_NAME" || true
 say ""
 say "claude-official-web is running."
 say "Local URL:     ${LOCAL_URL}"
-say "Configuration: ${ENV_FILE} (mode 600; it holds the login token)"
-if [[ "$GENERATED_TOKEN" -eq 1 ]]; then
-  say "Login token:   generated and stored in the configuration file"
-else
-  say "Login token:   kept from the existing configuration file"
-fi
-if [[ "$SHOW_TOKEN" -eq 1 ]]; then
-  say "Token value:   ${TOKEN}"
-  say "                Store it in a password manager. Anyone who has it can use this gateway."
-fi
+say "Configuration: ${ENV_FILE} (mode 600)"
+report_token
 if [[ "${#OVERRIDES[@]}" -gt 0 ]]; then
   say "Applied overrides: ${OVERRIDES[*]}"
 fi

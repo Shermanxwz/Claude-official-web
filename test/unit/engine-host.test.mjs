@@ -2564,3 +2564,56 @@ describe('EngineHost limits and version', () => {
     assert.equal(h.host.lastClaudeCodeVersion(), '2.1.295');
   });
 });
+
+/** @param {string} sessionId @param {unknown} title */
+function titleChange(sessionId, title) {
+  return { type: 'system', subtype: 'session_title_changed', title, uuid: randomUUID(), session_id: sessionId };
+}
+
+describe('EngineHost session titles', () => {
+  test('a title the runtime reports replaces the session title and is published to every client', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h, { cwd: CWD, title: 'Typed by the user' });
+    query.emit(titleChange(sessionId, 'Fix the login redirect'));
+    await flush();
+    assert.equal(h.host.liveInfo(sessionId).title, 'Fix the login redirect');
+    const states = ofType(h.events, 'session_state');
+    assert.equal(states.filter((event) => event.data.live?.title === 'Fix the login redirect').length, 1);
+    const announced = ofType(h.events, 'sessions_changed').filter((event) => event.data.reason === 'title');
+    assert.deepEqual(announced.map((event) => event.data), [{ reason: 'title', sessionId }]);
+    assert.equal((await h.host.getSession(sessionId)).live.title, 'Fix the login redirect');
+    const listed = await h.host.listSessions({ cwd: CWD });
+    assert.equal(listed[0].summary, 'Fix the login redirect');
+  });
+
+  test('an empty, blank or non-string title changes nothing and announces nothing', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h, { cwd: CWD, title: 'Typed by the user' });
+    const before = h.events.length;
+    for (const title of ['', '   \n ', undefined, 42, null]) query.emit(titleChange(sessionId, title));
+    await flush();
+    const later = h.events.slice(before);
+    assert.equal(h.host.liveInfo(sessionId).title, 'Typed by the user');
+    assert.equal(ofType(later, 'session_state').length, 0);
+    assert.equal(ofType(later, 'sessions_changed').length, 0);
+  });
+
+  test('a reported title is trimmed and capped like a title the user typed', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h, { cwd: CWD });
+    query.emit(titleChange(sessionId, `  ${'t'.repeat(250)}  `));
+    await flush();
+    assert.equal(h.host.liveInfo(sessionId).title, 't'.repeat(200));
+  });
+
+  test('a title reported for a resumed session is applied the same way', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    query.emit(titleChange(S1, 'Resumed title'));
+    await flush();
+    assert.equal(h.host.liveInfo(S1).title, 'Resumed title');
+    const announced = ofType(h.events, 'sessions_changed').filter((event) => event.data.reason === 'title');
+    assert.deepEqual(announced.map((event) => event.data), [{ reason: 'title', sessionId: S1 }]);
+  });
+});

@@ -23,6 +23,7 @@
     "seal": "node scripts/seal.mjs",
     "smoke:runtime": "node scripts/runtime-smoke.mjs",
     "smoke:gateway": "node scripts/gateway-smoke.mjs",
+    "screenshots": "node scripts/screenshots.mjs",
     "maintenance:prune": "node scripts/prune-state.mjs"
   },
   "dependencies": {

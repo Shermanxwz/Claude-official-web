@@ -14,6 +14,7 @@ import { normalizeLocale } from './i18n.js';
  * @property {string|null} locale       null = follow the browser (see i18n.js)
  * @property {FontSize} fontSize
  * @property {boolean} notify           browser notifications for requests and finished turns
+ * @property {boolean} showRuntimeEvents  raw runtime messages the UI does not render natively (for troubleshooting)
  * @property {boolean} sidebarOpen      not persisted: desktop sidebar visibility / mobile drawer state
  */
 
@@ -24,7 +25,9 @@ const PREFS_KEY = 'caw.prefs';
 
 /** @returns {Prefs} */
 export function defaultPrefs() {
-  return { theme: 'system', locale: null, fontSize: 'md', notify: false, sidebarOpen: true };
+  return {
+    theme: 'system', locale: null, fontSize: 'md', notify: false, showRuntimeEvents: false, sidebarOpen: true,
+  };
 }
 
 /**
@@ -42,6 +45,9 @@ export function normalizePrefs(raw, base = defaultPrefs()) {
       ? /** @type {FontSize} */ (input.fontSize)
       : base.fontSize,
     notify: typeof input.notify === 'boolean' ? input.notify : base.notify,
+    showRuntimeEvents: typeof input.showRuntimeEvents === 'boolean'
+      ? input.showRuntimeEvents
+      : base.showRuntimeEvents,
     sidebarOpen: base.sidebarOpen,
   };
 }

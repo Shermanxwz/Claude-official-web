@@ -37,8 +37,7 @@ const SESSION_KEY_LABEL = 'caw-session-v1';
 const REVOCATION_STATE = 'revoked-sessions';
 
 /**
- * SHA-256 digest of the login token. The same token given as CAW_TOKEN or as CAW_TOKEN_SHA256 yields the same bytes,
- * so sessions and their signing secret do not depend on the configuration form.
+ * SHA-256 digest of the login token, used to derive the plaintext-mode signing secret.
  * @param {Config} config
  * @returns {Buffer}
  */
@@ -54,6 +53,19 @@ function tokenDigest(config) {
  */
 function sessionSigningSecret(digest) {
   return crypto.createHmac('sha256', digest).update(SESSION_KEY_LABEL).digest();
+}
+
+/**
+ * Session-signing secret for this process. With a plaintext CAW_TOKEN the secret is derived from the token so sessions
+ * survive restarts. With CAW_TOKEN_SHA256 the digest sits in the service's environment file, which the agent's OS user
+ * can read; deriving the secret from it would let anyone holding that file forge sessions without knowing the token.
+ * Hash mode therefore signs with a random secret that exists only in memory, and sessions end when the gateway restarts.
+ * @param {Config} config
+ * @returns {Buffer}
+ */
+function sessionSecretFor(config) {
+  if (config.tokenSha256 !== '') return crypto.randomBytes(32);
+  return sessionSigningSecret(tokenDigest(config));
 }
 
 /**
@@ -84,7 +96,7 @@ export async function createAuth(config, { log, bootId, now = Date.now, stateSto
   const failures = new SlidingWindowCounter({ max: LOGIN_MAX_FAILURES, windowMs: LOGIN_WINDOW_MS, now });
   /** Null when authentication is disabled: no cookie is issued or checked then. */
   const sessions = config.requireAuth
-    ? new SessionStore({ secret: sessionSigningSecret(tokenDigest(config)), ttlMs: config.sessionTtlMs, now })
+    ? new SessionStore({ secret: sessionSecretFor(config), ttlMs: config.sessionTtlMs, now })
     : null;
   if (sessions && stateStore) {
     const stored = /** @type {{entries?: unknown}|null} */ (await stateStore.read(REVOCATION_STATE, null));

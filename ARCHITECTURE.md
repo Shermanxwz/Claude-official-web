@@ -44,8 +44,10 @@ Engine adapter: src/engine/sdk-adapter.mjs (real)  |  src/engine/mock/ (determin
 - Everything the SDK can express has a graphical surface (see `docs/FEATURES.md`). Terminal-only commands
   (`/theme`, `/terminal-setup`, `!` shell mode, TUI pickers) are reachable through the optional terminal tab, which
   attaches to the same session while the GUI pauses writing (single writer).
-- Unknown SDK message types are rendered by a generic card, never dropped, so new runtime features remain visible
-  before the UI learns them.
+- Unknown SDK message types are kept as diagnostic entries, never dropped; Settings → "Show runtime events" renders
+  them as generic cards, so new runtime features remain inspectable before the UI learns them.
+- Folder trust mirrors Claude Code's trust dialog: only trusted folders load project settings, hooks, skills, MCP
+  servers and CLAUDE.md (`settingSources` includes `project` and `local`); untrusted folders run with user settings.
 
 ## Process model
 
@@ -57,7 +59,10 @@ message.
 ## Trust boundaries
 
 - The Web token authenticates only this gateway. It and every `CAW_*` variable are removed from the Claude Code child
-  environment.
+  environment. With `CAW_TOKEN_SHA256` only a digest is stored and sessions are signed with an in-memory secret, so
+  an agent that can read the service's files still cannot mint a session and approve its own requests.
+- Requests must carry an allowed `Host` (loopback or the public origin's host) and, for writes and the terminal
+  upgrade, the exact `Origin`; this blocks CSRF, cross-site WebSocket hijacking and DNS rebinding.
 - The gateway never reads Claude credentials (`~/.claude/.credentials.json`, keychains) and never edits settings or
   history files directly; all such changes go through SDK calls.
 - Model output is untrusted: Markdown is sanitized with DOMPurify, tool output is rendered as text, and no

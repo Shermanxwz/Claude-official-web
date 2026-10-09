@@ -51,6 +51,7 @@ export const RECORD_VERSION = 1;
  * @property {number} createdAt
  * @property {number} lastModified
  * @property {string|null} firstPrompt
+ * @property {string|null} generatedTitle   title the first turn gave a session without a custom title
  * @property {MockEntry[]} transcript
  * @property {Record<string, MockEntry[]>} subagents
  * @property {Record<string, number>} counters   per-session id counters used by the scenarios
@@ -99,6 +100,7 @@ function isRecord(data, key) {
     isNullableString(data.customTitle) &&
     isNullableString(data.tag) &&
     isNullableString(data.firstPrompt) &&
+    (data.generatedTitle === undefined || isNullableString(data.generatedTitle)) &&
     Number.isFinite(data.createdAt) &&
     Number.isFinite(data.lastModified) &&
     Array.isArray(data.transcript) && data.transcript.every(isEntry) &&
@@ -129,6 +131,8 @@ function parseRecord(raw, key) {
     throw invalidFile(key);
   }
   if (!isRecord(data, key)) throw invalidFile(key);
+  // Files written before generated titles existed have no such field.
+  if (data.generatedTitle === undefined) data.generatedTitle = null;
   return data;
 }
 
@@ -167,12 +171,13 @@ function pageOf(options) {
 }
 
 /**
- * The SDK summary: custom title, otherwise the first prompt. Empty when neither exists yet.
+ * The SDK summary: the custom title, otherwise the title the first turn gave, otherwise the first prompt. Empty when
+ * none exists yet.
  * @param {MockSessionRecord} record
  * @returns {string}
  */
 export function summaryOf(record) {
-  return record.customTitle || record.firstPrompt || '';
+  return record.customTitle || record.generatedTitle || record.firstPrompt || '';
 }
 
 /**
@@ -240,6 +245,7 @@ export function newRecord({ sessionId, cwd, customTitle = null, now = Date.now()
     createdAt: now,
     lastModified: now,
     firstPrompt: null,
+    generatedTitle: null,
     transcript: [],
     subagents: {},
     counters: {},

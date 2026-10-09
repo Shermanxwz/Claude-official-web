@@ -45,6 +45,8 @@ export function createTimeline({ container, api, store, t, actions }) {
     forceStick: true,
     renderedVersion: -1,
     destroyed: false,
+    /** whether the last render showed the diagnostic rows of unknown message types */
+    runtimeShown: false,
   };
   const listStore = new Map();
   /** The open or closed state the user chose per details element (tool, work group, thinking), kept across renders. */
@@ -74,6 +76,14 @@ export function createTimeline({ container, api, store, t, actions }) {
     });
   };
 
+  // The runtime-events preference shows or hides the diagnostic rows. The store reports every change, and the timeline
+  // re-renders only when its reading of the preference actually changed.
+  const unsubscribePrefs = store && typeof store.subscribe === 'function'
+    ? store.subscribe(() => {
+      if (runtimeEventsShown(env) !== state.runtimeShown) scheduleRender();
+    })
+    : null;
+
   /** The newest request card sticks above the composer on phones; the jump pill sits above that card (--tl-dock). */
   /** @type {Element|null} */
   let dockSlot = null;
@@ -92,7 +102,8 @@ export function createTimeline({ container, api, store, t, actions }) {
   const render = () => {
     if (state.destroyed) return;
     const stick = state.forceStick || isNearBottom(refs.scroller);
-    const entries = state.model.getEntries();
+    state.runtimeShown = runtimeEventsShown(env);
+    const entries = state.model.getEntries().filter((entry) => state.runtimeShown || !isDiagnostic(entry));
     const items = entries.map((entry) => ({ key: entry.key, version: entry.version ?? 0, value: entry }));
     reconcile(refs.list, items, listStore, (entry, previous) => buildEntry(ui, entry, previous));
     markLatestRequest(refs.list);
@@ -328,6 +339,7 @@ export function createTimeline({ container, api, store, t, actions }) {
     refs.jump.removeEventListener('click', onJump);
     window.removeEventListener(TIMELINE_RELOAD_EVENT, onReload);
     dockSize?.disconnect();
+    unsubscribePrefs?.();
     clear(container);
   };
 
@@ -428,7 +440,8 @@ function renderSlots(refs, state, ui, entryCount) {
     const label = run.status === 'compacting' ? t('cards.running.compacting') : t('cards.running.working');
     refs.tail.append(h('div', { class: 'tl-running', attrs: { role: 'status' } },
       h('span', { class: 'tl-running-dot', attrs: { 'aria-hidden': 'true' } }),
-      h('span', { class: 'shimmer', text: label })));
+      h('span', { class: 'shimmer', text: label }),
+      run.activity ? h('span', { class: 'tl-running-activity', attrs: { title: run.activity }, text: run.activity }) : null));
   }
 }
 
@@ -1029,6 +1042,24 @@ function genericEl(label, raw, ui) {
       h('span', { class: 'generic-label', text: String(label) }),
       h('span', { class: 'generic-hint', text: t('cards.generic.hint') })),
     h('pre', { class: 'generic-body', text: json }));
+}
+
+/**
+ * Whether the user chose to see runtime diagnostics: the rows of message types and subtypes the timeline does not know.
+ * @param {Env} env
+ * @returns {boolean}
+ */
+function runtimeEventsShown(env) {
+  try {
+    return env.store.get()?.prefs?.showRuntimeEvents === true;
+  } catch {
+    return false;
+  }
+}
+
+/** @param {Record<string, any>} entry @returns {boolean} true for an unknown type or subtype kept for diagnostics */
+function isDiagnostic(entry) {
+  return entry.kind === 'generic' && entry.diagnostic === true;
 }
 
 /** @param {Env} env @param {string|null} sessionId */

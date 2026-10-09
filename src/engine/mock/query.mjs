@@ -14,12 +14,18 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { EFFORT_LEVELS, isUuid, PERMISSION_MODES } from '../../contracts.mjs';
 import {
+  activeGoal,
+  autocompactState,
+  commandLifecycle,
   CONTEXT_MAX_TOKENS,
   interruptedMessage,
   permissionDenied,
+  postTurnSummary,
   promptSuggestion,
   ScenarioFailure,
   selectScenario,
+  sentenceOf,
+  sessionTitleChanged,
   stateChanged,
   statusMessage,
   syntheticUser,
@@ -171,15 +177,17 @@ function sleep(ms, signal) {
  */
 class InputQueue {
   constructor() {
-    /** @type {SDKUserMessage[]} */
+    /** @type {LinkedPrompt[]} */
     this.items = [];
     /** @type {number} */
     this.open = 0;
-    /** @type {Array<(result: IteratorResult<SDKUserMessage, void>) => void>} */
+    /** @type {Array<(result: IteratorResult<LinkedPrompt, void>) => void>} */
     this.takers = [];
+    /** @type {unknown} */
+    this.failure = undefined;
   }
 
-  /** @param {SDKUserMessage} message */
+  /** @param {LinkedPrompt} message */
   push(message) {
     const taker = this.takers.shift();
     if (taker) taker({ done: false, value: message });
@@ -209,13 +217,13 @@ class InputQueue {
 
   /**
    * Removes and returns every prompt that is already waiting, without waiting for more.
-   * @returns {SDKUserMessage[]}
+   * @returns {LinkedPrompt[]}
    */
   drainWaiting() {
     return this.items.splice(0);
   }
 
-  /** @returns {Promise<IteratorResult<SDKUserMessage, void>>} */
+  /** @returns {Promise<IteratorResult<LinkedPrompt, void>>} */
   take() {
     if (this.failure !== undefined) return Promise.reject(this.failure);
     const next = this.items.shift();
@@ -298,6 +306,7 @@ async function* singlePrompt(text) {
  * @property {Set<string>} dynamicServers           servers set through setMcpServers
  * @property {Map<string, {toolUseId: string, stopped: boolean}>} tasks
  * @property {Set<string>} stoppedToolUseIds        tool_use ids whose task was stopped
+ * @property {string[]} userMessageUuids            prompts the turn in progress answers; empty between turns
  * @property {boolean} closed
  */
 
@@ -349,19 +358,21 @@ export async function* waitFor(core, promise, signal) {
 }
 
 /**
- * Pumps one prompt source into the queue. The source counts as open until it ends or the session stops.
+ * Pumps one prompt source into the queue. Each prompt passes through `accept` first, which links it and announces it.
+ * The source counts as open until it ends or the session stops.
  * @param {InputQueue} queue
  * @param {AsyncIterable<unknown>} source
  * @param {AbortSignal} signal
+ * @param {(message: SDKUserMessage) => LinkedPrompt} accept
  * @returns {Promise<void>}
  */
-async function pumpSource(queue, source, signal) {
+async function pumpSource(queue, source, signal, accept) {
   queue.attach();
   try {
     for await (const message of source) {
       if (signal.aborted) break;
       if (!isUserMessage(message)) throw new TypeError('The prompt must yield SDK user messages.');
-      queue.push(message);
+      queue.push(accept(message));
     }
   } finally {
     queue.detach();
@@ -447,6 +458,7 @@ export function openRecord({ store, options, cwd, now }) {
       now,
     });
     forked.firstPrompt = source.firstPrompt;
+    forked.generatedTitle = source.generatedTitle;
     forked.transcript = cut.transcript;
     forked.subagents = cut.subagents;
     forked.counters = { ...source.counters };
@@ -508,6 +520,7 @@ export function createCore({ record, options, store, delayMs, log }) {
     ]),
     tasks: new Map(),
     stoppedToolUseIds: new Set(),
+    userMessageUuids: [],
     closed: false,
   };
   return core;
@@ -590,6 +603,8 @@ export class TurnObserver {
     this.pendingStop = null;
     /** @type {string|null} */
     this.stopReason = null;
+    /** @type {string|null} uuid of the last top-level assistant message, which the turn summary names */
+    this.lastAssistantUuid = null;
     this.finalText = '';
   }
 
@@ -659,6 +674,7 @@ export class TurnObserver {
       if (topLevel && block.type === 'text') this.finalText = block.text;
     }
     if (topLevel) {
+      this.lastAssistantUuid = message.uuid;
       this.stopReason = announced ?? this.pendingStop ?? this.stopReason;
       this.pendingStop = null;
     }
@@ -703,7 +719,7 @@ function userBlocks(message) {
  * @property {SDKPermissionDenial[]} denials                  denied tool calls of this turn
  * @property {number} startedAt
  * @property {string} userMessageUuid                         uuid of the last prompt of the turn's batch, as the SDK reports it
- * @property {string[]} userMessageUuids                      uuids of every prompt the turn answers, in consumption order
+ * @property {string[]} userMessageUuids                      every prompt the turn answers, in consumption order
  */
 
 /**
@@ -770,7 +786,12 @@ export function describeSessionOf(core) {
  * @returns {SessionView}
  */
 export function sessionView(core) {
-  return { envelope: () => envelopeOf(core), now: () => Date.now(), model: core.model };
+  return {
+    envelope: () => envelopeOf(core),
+    now: () => Date.now(),
+    model: core.model,
+    userMessageUuids: [...core.userMessageUuids],
+  };
 }
 
 /**
@@ -863,6 +884,7 @@ export function turnContextOf({ core, turn, userText, streamPartials }) {
     model: core.model,
     userText,
     userMessageUuid: turn.userMessageUuid,
+    userMessageUuids: [...turn.userMessageUuids],
     delayMs: core.delayMs,
     streamPartials,
     turnIndex: core.turnIndex,
@@ -1056,16 +1078,15 @@ const INTERRUPTED_TOOL_TEXT = '[Request interrupted by user for tool use]';
 
 /**
  * Closes an interrupted turn: the partial text gets an aborted message, open tool calls and running tasks get their
- * terminal messages, the interruption marker is written and one error result ends the turn.
+ * terminal messages and the interruption marker is written. The caller then yields the error result.
  * @param {SessionCore} core
  * @param {TurnContext} ctx
  * @param {TurnState} turn
  * @param {TurnObserver} observer
- * @param {TurnStop} stop
  * @param {(message: SDKMessage) => SDKMessage} seen
  * @returns {Generator<SDKMessage, void, unknown>}
  */
-export function* closeInterruptedTurn(core, ctx, turn, observer, stop, seen) {
+export function* closeInterruptedTurn(core, ctx, turn, observer, seen) {
   for (const draft of observer.openDrafts()) {
     yield seen(interruptedMessage(ctx, { id: draft.id, text: draft.text, parentToolUseId: draft.parentToolUseId,
       agentId: draft.agentId }));
@@ -1093,7 +1114,6 @@ export function* closeInterruptedTurn(core, ctx, turn, observer, stop, seen) {
     }));
   }
   yield seen(syntheticUser(ctx, '[Request interrupted by user]'));
-  yield seen(resultOf(core, turn, observer, { error: 'Interrupted', terminalReason: stop.terminalReason }));
 }
 
 /**
@@ -1107,6 +1127,7 @@ export function* closeInterruptedTurn(core, ctx, turn, observer, stop, seen) {
  */
 export async function* runTurn(core, options, prompts, streamPartials) {
   const turn = beginTurn(core, options, prompts.map((prompt) => prompt.uuid));
+  core.userMessageUuids = [...turn.userMessageUuids];
   const observer = new TurnObserver();
   const text = prompts.map((prompt) => promptText(prompt)).join('\n\n');
   const scenario = selectScenario(text);
@@ -1125,7 +1146,10 @@ export async function* runTurn(core, options, prompts, streamPartials) {
     persistIfNeeded(core, message);
     return message;
   };
+  for (const prompt of prompts) yield seen(commandLifecycle(ctx, prompt.uuid, 'started'));
   yield seen(stateChanged(ctx, 'running'));
+  /** @type {SDKResultMessage} */
+  let result;
   try {
     for await (const message of scenario.run(ctx)) {
       const parent = parentToolUseIdOf(message);
@@ -1134,25 +1158,66 @@ export async function* runTurn(core, options, prompts, streamPartials) {
     }
     addUsage(core, observer);
     core.turnIndex += 1;
-    yield seen(resultOf(core, turn, observer, { error: null, terminalReason: null }));
-    yield seen(promptSuggestion(ctx, SUGGESTIONS[core.turnIndex % SUGGESTIONS.length]));
+    result = resultOf(core, turn, observer, { error: null, terminalReason: null });
   } catch (error) {
     if (error instanceof SessionClosed || core.sessionAbort.signal.aborted) return;
     if (error instanceof TurnStop) {
       addUsage(core, observer);
       core.turnIndex += 1;
-      yield* closeInterruptedTurn(core, ctx, turn, observer, error, seen);
+      yield* closeInterruptedTurn(core, ctx, turn, observer, seen);
+      result = resultOf(core, turn, observer, { error: 'Interrupted', terminalReason: error.terminalReason });
     } else if (error instanceof ScenarioFailure) {
       addUsage(core, observer);
       core.turnIndex += 1;
-      yield seen(resultOf(core, turn, observer, { error: error.message, terminalReason: 'model_error' }));
+      result = resultOf(core, turn, observer, { error: error.message, terminalReason: 'model_error' });
     } else {
       throw error;
     }
   } finally {
     core.turnAbort = null;
+    core.userMessageUuids = [];
+  }
+  yield seen(result);
+  yield seen(postTurnSummary(ctx, {
+    summarizes: observer.lastAssistantUuid ?? result.uuid,
+    detail: statusDetailOf(result),
+  }));
+  for (const prompt of prompts) yield seen(commandLifecycle(ctx, prompt.uuid, 'completed'));
+  const title = generatedTitleOf(core);
+  if (title !== null) {
+    persist(core, (record) => {
+      record.generatedTitle = title;
+    });
+    yield seen(sessionTitleChanged(ctx, title));
+  }
+  if (result.subtype === 'success') {
+    yield seen(promptSuggestion(ctx, SUGGESTIONS[core.turnIndex % SUGGESTIONS.length]));
   }
   yield seen(stateChanged(ctx, 'idle'));
+}
+
+/**
+ * The one-line status of a finished turn: the first sentence of its reply, or why the turn did not finish.
+ * @param {SDKResultMessage} result
+ * @returns {string}
+ */
+function statusDetailOf(result) {
+  if (result.subtype === 'success') return sentenceOf(result.result) || 'Turn completed.';
+  if (result.terminal_reason === 'model_error') return `Turn failed: ${result.errors[0]}.`;
+  return 'Turn was interrupted.';
+}
+
+/**
+ * The title a session takes from its first prompt when it has neither a custom title nor a generated one: the first
+ * eight words, at most 60 characters. Null when there is nothing to name yet.
+ * @param {SessionCore} core
+ * @returns {string|null}
+ */
+function generatedTitleOf(core) {
+  const record = core.store.read(core.sessionId);
+  if (!record || record.customTitle || record.generatedTitle || record.firstPrompt === null) return null;
+  const words = Array.from(record.firstPrompt.split(' ').slice(0, 8).join(' '));
+  return words.length > 60 ? `${words.slice(0, 57).join('')}...` : words.join('');
 }
 
 /**
@@ -1189,7 +1254,6 @@ export const AGENTS = [
   { name: 'Plan', description: 'Software architect agent for designing implementation plans' },
 ];
 
-/** @type {ModelInfo[]} */
 /**
  * The model aliases a client can pick. `resolvedModel` is the wire id each alias stands for, so a host can match the
  * model of the init message against the alias row.
@@ -1291,9 +1355,24 @@ function linkedPrompt(core, prompt) {
 }
 
 /**
- * The session generator: init first, then one turn per batch of prompts, until the prompts end or the session closes.
- * A batch is the prompt that was taken plus every prompt already waiting behind it, so prompts sent close together are
- * answered by one turn. Control messages are yielded while the session waits for its next prompt.
+ * Accepts one prompt into the session's queue. The prompt gets its uuid, and its queued state waits in the outbox like
+ * every control message, so the consumer sees it on its next pull.
+ * @param {SessionCore} core
+ * @param {SDKUserMessage} message
+ * @returns {LinkedPrompt}
+ */
+function acceptPrompt(core, message) {
+  const prompt = linkedPrompt(core, message);
+  core.outbox.push(commandLifecycle(sessionView(core), prompt.uuid, 'queued'));
+  core.notify();
+  return prompt;
+}
+
+/**
+ * The session generator: init, the autocompact and goal settings, then one turn per batch of prompts, until the prompts
+ * end or the session closes. A batch is the prompt that was taken plus every prompt already waiting behind it, so
+ * prompts sent close together are answered by one turn. Control messages are yielded while the session waits for its
+ * next prompt.
  * @param {SessionCore} core
  * @param {InputQueue} queue
  * @param {SdkOptions} options
@@ -1301,18 +1380,27 @@ function linkedPrompt(core, prompt) {
  */
 export async function* sessionLoop(core, queue, options) {
   try {
+    const view = sessionView(core);
     yield initMessage(core);
+    yield autocompactState(view);
+    yield activeGoal(view);
     for (;;) {
       const next = yield* waitFor(core, queue.take(), core.sessionAbort.signal);
       if (next.done === true) break;
       // One macrotask lets the pump deliver the prompts the host already pushed.
       yield* waitFor(core, new Promise((resolveTick) => setImmediate(resolveTick)), core.sessionAbort.signal);
-      const batch = [next.value, ...queue.drainWaiting()].map((prompt) => linkedPrompt(core, prompt));
+      const batch = [next.value, ...queue.drainWaiting()];
       /** @type {LinkedPrompt[]} */
       const answered = [];
       for (const prompt of batch) {
         persistPrompt(core, prompt);
-        if (prompt.shouldQuery !== false) answered.push(prompt);
+        if (prompt.shouldQuery !== false) {
+          answered.push(prompt);
+        } else {
+          // A prompt that does not query has no turn, so it starts and completes at once.
+          yield commandLifecycle(view, prompt.uuid, 'started');
+          yield commandLifecycle(view, prompt.uuid, 'completed');
+        }
       }
       if (answered.length === 0) continue;
       yield* runTurn(core, options, answered, options.includePartialMessages === true);
@@ -1684,7 +1772,7 @@ export function createControls({ open, isClosed, close, queue, store }) {
       if (!isObject(stream) || typeof stream[Symbol.asyncIterator] !== 'function') {
         throw new TypeError('streamInput needs an async iterable of user messages.');
       }
-      await pumpSource(queue, stream, current.sessionAbort.signal);
+      await pumpSource(queue, stream, current.sessionAbort.signal, (message) => acceptPrompt(current, message));
     },
     stopTask: async (taskId) => {
       const current = live();
@@ -1757,7 +1845,8 @@ export function createMockQuery({ prompt, options = {}, store, delayMs, log }) {
       else external.addEventListener('abort', () => created.sessionAbort.abort(new SessionClosed()), { once: true });
     }
     const source = typeof prompt === 'string' ? singlePrompt(prompt) : prompt;
-    pumpSource(queue, source, created.sessionAbort.signal).catch((error) => queue.fail(error));
+    pumpSource(queue, source, created.sessionAbort.signal, (message) => acceptPrompt(created, message))
+      .catch((error) => queue.fail(error));
     log?.debug('mock session opened', { sessionId: created.sessionId, resumed: options.resume !== undefined });
     return created;
   };

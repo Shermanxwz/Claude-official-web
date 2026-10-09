@@ -1260,10 +1260,30 @@ export class EngineHost {
   }
 
   /**
+   * Keeps the title the runtime reports for a session after its first turn, then tells every client so the sidebars
+   * follow it. The title is trimmed and capped like a title the user typed; an empty one changes nothing.
+   * @param {LiveRecord} live
+   * @param {unknown} msg
+   */
+  #applyTitle(live, msg) {
+    const reported = isPlainObject(msg) ? msg.title : undefined;
+    const title = typeof reported === 'string' ? reported.trim().slice(0, TITLE_MAX) : '';
+    if (title === '') return;
+    live.title = title;
+    this.#sync(live);
+    this.#publishSessionsChanged('title', live.sessionId);
+  }
+
+  /**
    * @param {LiveRecord} live
    * @param {Extract<SDKMessage, {type: 'system'}>} msg
    */
   #applySystemMessage(live, msg) {
+    // The SDK types do not declare this subtype yet, so it is compared as a plain string.
+    if (/** @type {string} */ (msg.subtype) === 'session_title_changed') {
+      this.#applyTitle(live, msg);
+      return;
+    }
     switch (msg.subtype) {
       case 'init':
         live.init = msg;

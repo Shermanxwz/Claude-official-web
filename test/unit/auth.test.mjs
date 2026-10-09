@@ -484,21 +484,34 @@ describe('logout and session validity', () => {
     }
   });
 
-  it('gives the same session secret for CAW_TOKEN and for its CAW_TOKEN_SHA256 digest', async () => {
+  it('never derives hash-mode session secrets from the stored digest', async () => {
     const time = clock();
+    const digestConfig = configFor({ CAW_TOKEN: '', CAW_TOKEN_SHA256: sha256Hex(TOKEN) });
     const byToken = await createAuth(configFor(), { log: LOGGER, bootId: 'boot-t', now: time.now });
     const tokenServer = await startAuthServer(byToken);
-    const cookie = await loginCookie(tokenServer.port);
+    const tokenCookie = await loginCookie(tokenServer.port);
     await tokenServer.close();
 
-    const byDigest = await createAuth(configFor({ CAW_TOKEN: '', CAW_TOKEN_SHA256: sha256Hex(TOKEN) }), {
-      log: LOGGER, bootId: 'boot-d', now: time.now,
-    });
-    const digestServer = await startAuthServer(byDigest);
+    const firstDigest = await createAuth(digestConfig, { log: LOGGER, bootId: 'boot-d1', now: time.now });
+    const firstServer = await startAuthServer(firstDigest);
+    let digestCookie;
     try {
-      assert.equal((await call(digestServer.port, 'GET', '/whoami', { headers: { Cookie: cookie } })).status, 200);
+      assert.equal((await call(firstServer.port, 'GET', '/whoami', { headers: { Cookie: tokenCookie } })).status, 401,
+        'a cookie signed with the token-derived secret is not accepted in hash mode');
+      digestCookie = await loginCookie(firstServer.port);
+      assert.equal((await call(firstServer.port, 'GET', '/whoami', { headers: { Cookie: digestCookie } })).status,
+        200, 'logging in with the token still works in hash mode');
     } finally {
-      await digestServer.close();
+      await firstServer.close();
+    }
+
+    const restarted = await createAuth(digestConfig, { log: LOGGER, bootId: 'boot-d2', now: time.now });
+    const restartedServer = await startAuthServer(restarted);
+    try {
+      assert.equal((await call(restartedServer.port, 'GET', '/whoami', { headers: { Cookie: digestCookie } })).status,
+        401, 'hash-mode sessions end with the process, so a stored digest can never mint a valid cookie');
+    } finally {
+      await restartedServer.close();
     }
   });
 

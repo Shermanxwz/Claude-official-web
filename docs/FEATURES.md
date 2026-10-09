@@ -27,18 +27,19 @@ Terms used in the tables:
 | Queued input | A message sent during a turn shows as queued until the runtime echoes it | Input streaming: the runtime queues the user message; gateway event `message_accepted` |
 | Compaction | A "Context compacted" divider and status text | `system` `compact_boundary` and `status` messages |
 | API retries | A muted inline notice | `system` `api_retry` messages |
+| Rejected sign-in | A notice on the session when Claude Code reports that its credentials were rejected, and an error in the session's status | `system` `api_retry`, or an assistant `error` of an authentication class; gateway notice code `ENGINE_UNAVAILABLE` and `LiveInfo.error` |
 
 ## Permissions and questions
 
 | Capability | Web surface | Mechanism |
 |---|---|---|
 | Tool approvals | Permission card with allow once, allow always and deny (with an optional reason) | `canUseTool` callback creates a pending request; decision sent to `POST /api/sessions/:id/requests/:rid` |
-| Permission suggestions | "Allow always" saves the rules that Claude Code proposes; each suggestion can be unticked | `PermissionUpdate` suggestions and `suggestionIndexes` in the decision |
+| Permission suggestions | "Allow always" saves the allow rules that Claude Code proposes, which start ticked. Directory grants, mode changes, deny and ask rules start unticked and are saved only when ticked | `PermissionUpdate` suggestions and `suggestionIndexes` in the decision; when it is absent, only `addRules` and `replaceRules` with behavior `allow` are saved |
 | Questions | A question card with the offered options and free text (`AskUserQuestion`) | `canUseTool` for the `AskUserQuestion` tool; answers returned as `updatedInput.answers` |
 | Plan mode | A plan card to approve (choosing the next permission mode) or reject with feedback | `ExitPlanMode` through `canUseTool`; `setPermissionMode(nextMode)` after approval |
 | MCP elicitation | A form or link card asking an MCP server for input | `onElicitation` callback; accept, decline or cancel with content |
 | Permission modes | Mode picker: default, acceptEdits, plan, auto and dontAsk | `setPermissionMode(mode)`; `permissionMode` option when a session starts |
-| Bypass mode | Offered only when the operator enabled it | `bypassPermissions`; requires `CAW_ALLOW_BYPASS=1` and the `full` profile |
+| Bypass mode | Offered only when the operator enabled it | `bypassPermissions`; requires `CAW_ALLOW_BYPASS=1` and the `full` profile (`501 FEATURE_DISABLED` otherwise). The same rule applies to `CAW_DEFAULT_PERMISSION_MODE=bypassPermissions` |
 | Denials | A red row for each denied tool call | `system` `permission_denied` messages; `result.permission_denials` |
 
 ## Model, effort and context
@@ -81,11 +82,24 @@ Terms used in the tables:
 | Delete | A delete action for saved sessions (`full` profile; not for live sessions) | `deleteSession(sessionId)` |
 | Single writer | A session open in the terminal tab is read-only in the GUI | Gateway lock (`SESSION_LOCKED`); `terminal_state` events |
 
+## Workspaces and folder trust
+
+| Capability | Web surface | Mechanism |
+|---|---|---|
+| Directory browser | Lists the workspace roots and their sub-folders; project folders are marked | `GET /api/fs/dirs`; a folder counts as a project when it contains `.git`, `.claude`, `CLAUDE.md` or `package.json` |
+| Trust status | An untrusted session shows a banner, and the new-session dialog shows a notice for an untrusted folder | `GET /api/fs/trust`; `LiveInfo.trusted` |
+| Trust a folder | The new-session notice has a "Trust this folder" checkbox, which is ticked by default. The banner of an untrusted session has a "Trust folder" button. The session then restarts with project settings | `POST /api/fs/trust` with `trusted: true` (profile `standard` or higher); the session is reopened |
+| Sub-folders | Trusting a folder also trusts the folders inside it | A session is trusted when its folder, or one of its parents, is trusted; paths are resolved with `realpath` |
+| Revoking trust | Not offered in the interface. Read-profile viewers see the status but cannot change it | The API accepts `trusted: false` |
+
+Trusted folders are kept in the state directory. A trust change applies to sessions opened afterwards, which is why the
+interface closes and reopens the current session.
+
 ## Extensions and configuration
 
 | Capability | Web surface | Mechanism |
 |---|---|---|
-| CLAUDE.md, settings, permission rules, hooks, skills, commands, plugins, MCP servers and subagents | Load exactly as they do in the terminal; the capabilities panel lists what was loaded | `systemPrompt` and `tools` presets (`claude_code`); `settingSources` `user`, `project` and `local` |
+| CLAUDE.md, settings, permission rules, hooks, skills, commands, plugins, MCP servers and subagents | Load as they do in the terminal once the folder is trusted. For an untrusted folder, only user-level files load. The capabilities panel lists what was loaded | `systemPrompt` and `tools` presets (`claude_code`); `settingSources` `['user', 'project', 'local']` for a trusted folder and `['user']` otherwise |
 | MCP server status | An MCP panel with the state of each server and its tools | `mcpServerStatus()` |
 | MCP toggle and reconnect | Switch a server on or off, or reconnect it | `toggleMcpServer(name, enabled)`; `reconnectMcpServer(name)` |
 | Reload plugins and skills | A reload action after you install or change them | `reloadPlugins()` |
@@ -102,6 +116,10 @@ Terms used in the tables:
 
 The terminal is equivalent to a shell as the service user. It is disabled by default. While it is attached to a session,
 the graphical interface cannot write to that session, and it resumes writing when the terminal detaches.
+
+The terminal runs the executable from `CAW_CLAUDE_BIN` when that is set, with no fallback. Otherwise it runs the native
+binary that the SDK ships for the platform, and only when that is missing, the first executable `claude` on `PATH`. The
+chat passes `CAW_CLAUDE_BIN` to the SDK only when it is set.
 
 ## Terminal-only commands
 

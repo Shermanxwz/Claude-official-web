@@ -43,16 +43,18 @@ This is an overview. The complete map, with the SDK call or message behind each 
   for edits), subagents nested in their parent card, background tasks, interrupts, queued messages, compaction and
   context usage.
 - **Approvals:** permission cards (allow once, allow always, or deny with a reason), answers to AskUserQuestion, plan
-  approval, MCP elicitation, permission modes, and model and effort switching.
+  approval, MCP elicitation, permission modes, and model and effort switching. Allow always saves the allow rules that
+  Claude Code proposes; other suggestions are saved only when you tick them.
 - **Sessions:** start, resume, rename, tag, fork, rewind code or conversation, delete, paged history, and a session list
   grouped by project.
 - **Input:** slash commands from Claude Code (skills, custom commands and MCP prompts, plus the built-in commands that work
   without a terminal), `@` file mentions, image and file attachments, and prompt suggestions.
-- **Workspaces:** allowed roots with a directory browser. Every path is checked against those roots.
+- **Workspaces and folder trust:** allowed roots with a directory browser. Every path is checked against those roots. A
+  folder's project settings, hooks, skills, CLAUDE.md and MCP servers load only after you trust the folder.
 - **Extensions:** MCP server status, toggle and reconnect; reload of plugins and skills; CLAUDE.md, settings, hooks and
-  plugins loaded as they are in the terminal.
-- **Operations:** a token login, a health endpoint, structured logs, a systemd service installer, and a verification
-  suite (`npm run seal`).
+  plugins loaded as they are in the terminal, once the folder is trusted.
+- **Operations:** a token login (stored as a hash by default), a health endpoint, structured logs, a systemd service
+  installer, and a verification suite (`npm run seal`).
 - **Terminal fallback (optional):** a terminal tab for the commands that exist only in the terminal.
 
 ## Requirements
@@ -88,25 +90,44 @@ Open <http://127.0.0.1:4180>. The demo has no login, so run it only on your own 
    CAW_PUBLIC_ORIGIN=https://claude.example.com scripts/install-linux.sh
    ```
 
-The installer checks Node.js, installs the production dependencies, creates the configuration file with a generated
-login token, installs and starts a systemd user service, and waits for its health check. Running it again is safe. It
-keeps your configuration and token.
+The installer checks Node.js, installs the production dependencies, creates the configuration file, installs and starts a
+systemd user service, and waits for its health check. Running it again is safe: it keeps your configuration and your login
+token, and it updates the dependencies and the unit. It also restarts a running service to apply the configuration. In the
+default hash mode, that signs every browser out.
 
-The configuration lives in `~/.config/claude-official-web/env` (mode 600). It contains the login token, so treat that
-file like a password. After you change it, run `systemctl --user restart claude-official-web`.
+**The login token is printed once.** A new installation generates a token and stores only its SHA-256 hash, as
+`CAW_TOKEN_SHA256`, in the configuration file. Save the token in a password manager when the installer prints it. The file
+cannot show the token again. If you lose it, run `scripts/install-linux.sh --rotate-token`. Run the installer in your own
+terminal rather than through Claude Code, so that the printed token never reaches a session transcript.
+
+The configuration lives in `~/.config/claude-official-web/env` (mode 600). After you change it, run
+`systemctl --user restart claude-official-web`.
 
 ```bash
 systemctl --user status claude-official-web
 systemctl --user restart claude-official-web
 journalctl --user -u claude-official-web -f
 loginctl enable-linger "$USER"                 # keep the service running after you log out
+scripts/install-linux.sh --rotate-token        # issue a new login token; every browser signs in again
 scripts/install-linux.sh --uninstall           # remove the service and keep the configuration
 scripts/install-linux.sh --uninstall --purge   # also remove the configuration and the token
 ```
 
-The installer also accepts `--show-token` (print the token once; it is never printed otherwise), `--allow-root` (not
-recommended) and `--help`. The deployment guide in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers the whole server
-setup, updates and backups.
+The installer also accepts these options:
+
+- `--plain-token` stores a newly issued token as plaintext (`CAW_TOKEN`) instead of a hash. Use it only when the file must
+  be able to show the token.
+- `--rotate-token` issues a new token, stores it in the same way (or as plaintext with `--plain-token`), and restarts the
+  service. Every browser session ends.
+- `--show-token` prints a token issued by this run, or the plaintext token that is already stored. A stored hash cannot be
+  shown.
+- `--allow-root` (not recommended) and `--help`.
+
+Before it installs anything, the installer checks the existing configuration. It refuses a file that sets both token
+settings, a plaintext token shorter than 16 characters, a malformed hash, `CAW_REQUIRE_AUTH=0` or `CAW_ENGINE=mock`, and it
+names the setting to fix. `--rotate-token` skips the token checks, because it replaces the stored token.
+
+The deployment guide in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers the whole server setup, updates and backups.
 
 ## Remote access
 
@@ -119,7 +140,12 @@ Expose the gateway only over HTTPS, and never publish its port directly. Choose 
   examples in the deployment guide set that.
 
 Whichever you choose, set `CAW_PUBLIC_ORIGIN` to the exact origin that appears in the browser's address bar: scheme, host
-and port, without a path or a trailing slash. A request from any other origin is refused with `ORIGIN_REJECTED`.
+and port, without a path or a trailing slash. A write from any other origin is refused with `ORIGIN_REJECTED`. The gateway
+also accepts a request only when its `Host` header is that host or a loopback name, so the proxy must forward the `Host`
+header unchanged. Otherwise the gateway answers `421 HOST_REJECTED`.
+
+Behind a proxy or tunnel on the same host, set `CAW_TRUST_PROXY=1` so that each visitor has its own login and stream
+limits. Read the deployment guide before you do: it is safe only when the proxy sets the client address header itself.
 
 ## Configuration
 
@@ -129,27 +155,28 @@ The gateway reads every setting from the environment. The production service rea
 |---|---|---|
 | `CAW_HOST` | `127.0.0.1` | Address the gateway listens on. Keep it on loopback and publish through HTTPS. |
 | `CAW_PORT` | `4180` | Port the gateway listens on. |
-| `CAW_REQUIRE_AUTH` | `1` | `1` requires the login token. `0` is for the demo only. |
-| `CAW_TOKEN` | none | Login token, at least 16 characters, required when `CAW_REQUIRE_AUTH=1`. The installer generates one. |
+| `CAW_REQUIRE_AUTH` | `1` | `1` requires the login token. `0` turns login off and is accepted only with a loopback `CAW_HOST`; the installer refuses it. |
+| `CAW_TOKEN` | none | Login token in plaintext, 16 to 1024 characters. Use it or `CAW_TOKEN_SHA256`, not both. `--plain-token` writes it. |
+| `CAW_TOKEN_SHA256` | none | SHA-256 of the login token, as 64 hexadecimal characters. The installer writes this by default. |
 | `CAW_PUBLIC_ORIGIN` | unset | The canonical origin users open, for example `https://claude.example.com`. Set it behind any proxy or tunnel. |
-| `CAW_ACCESS_PROFILE` | `full` | `read` (viewing and login only), `standard` (everything except deleting sessions, the terminal and bypass mode) or `full`. |
+| `CAW_ACCESS_PROFILE` | `full` | `read` (viewing only), `standard` (everything except deleting sessions, the terminal and bypass mode) or `full`. |
 | `CAW_APP_NAME` | `Agent Web` | The product name shown in the interface. |
-| `CAW_WORKSPACE_ROOTS` | `$HOME` | Colon-separated directories that sessions may use. Every path is resolved and must stay inside one of them. |
-| `CAW_STATE_DIR` | `~/.local/state/claude-official-web` | The gateway's state directory. |
-| `CAW_ENGINE` | `sdk` | `sdk` runs Claude Code through the Agent SDK. `mock` selects the built-in demo engine. |
-| `CAW_CLAUDE_BIN` | unset (the SDK's bundled binary) | Path to a Claude Code executable to use instead of the bundled one. |
+| `CAW_WORKSPACE_ROOTS` | `$HOME` | Colon-separated existing directories where sessions may start and the directory browser looks. Prefer a projects directory. The roots limit sessions, not the agent. |
+| `CAW_STATE_DIR` | `~/.local/state/claude-official-web` | The gateway's state directory, which holds the session revocations and the trusted folders. |
+| `CAW_ENGINE` | `sdk` | `sdk` runs Claude Code through the Agent SDK. `mock` selects the built-in demo engine; the installer refuses it. |
+| `CAW_CLAUDE_BIN` | unset (the SDK's bundled binary) | Absolute path to a Claude Code executable, used for chat and terminal sessions instead of the bundled binary. There is no fallback when it is set. |
 | `CAW_DEFAULT_MODEL` | unset (Claude Code's default) | Model for new sessions. |
-| `CAW_DEFAULT_PERMISSION_MODE` | `default` | Permission mode for new sessions. |
+| `CAW_DEFAULT_PERMISSION_MODE` | `default` | Permission mode for new sessions. `bypassPermissions` needs `CAW_ALLOW_BYPASS=1` and the `full` profile. |
 | `CAW_DEFAULT_EFFORT` | unset (Claude Code's default) | Effort level for new sessions: `low`, `medium`, `high`, `xhigh` or `max`. |
 | `CAW_TERMINAL` | `0` | `1` enables the terminal tab. It needs the `full` profile and node-pty, and it is equivalent to shell access. |
-| `CAW_ALLOW_BYPASS` | `0` | `1` allows the `bypassPermissions` mode. It needs the `full` profile. |
+| `CAW_ALLOW_BYPASS` | `0` | `1` allows the `bypassPermissions` mode, including as the default mode. It needs the `full` profile. |
 | `CAW_IDLE_TIMEOUT_MS` | `1800000` (30 minutes) | Idle live sessions close after this time and resume when you send the next message. |
 | `CAW_MAX_LIVE_SESSIONS` | `4` | The maximum number of live Claude Code processes at once. |
 | `CAW_UPLOAD_MAX_BYTES` | `26214400` (25 MiB) | The largest accepted attachment. |
 | `CAW_IMAGE_MAX_BYTES` | `5242880` (5 MiB) | The largest accepted image attachment. |
 | `CAW_UPLOAD_RETENTION_DAYS` | `7` | Attachment batches created by the gateway are removed after this many days. |
 | `CAW_SESSION_TTL_HOURS` | `168` (7 days) | How long a web login session stays valid, in hours. |
-| `CAW_TRUST_PROXY` | `0` | `1` takes the client address from `X-Forwarded-For`. Use it only behind a proxy that overwrites that header. |
+| `CAW_TRUST_PROXY` | `0` | `1` takes the client address from `CF-Connecting-IP`, then `X-Real-IP`, then the last `X-Forwarded-For` entry. Use it only when the gateway is reachable only through a proxy that sets one of those headers itself. |
 | `CAW_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
 | `CAW_MOCK_DELAY_MS` | `12` | The delay between simulated output tokens. Mock engine only. |
 
@@ -157,8 +184,26 @@ The gateway reads every setting from the environment. The production service rea
 
 The full threat model and the list of controls are in [SECURITY.md](SECURITY.md). In brief:
 
-- One operator and one token. The token signs you in, and the session afterwards is an HttpOnly, SameSite=Strict cookie.
+- One operator and one login token. The token signs you in, and the session afterwards is an HttpOnly, SameSite=Strict
+  cookie. The installer stores only the token's SHA-256 hash, so the configuration file cannot be used to sign in. To hash
+  a token that you choose yourself, run these commands, then put the 64-character output in `CAW_TOKEN_SHA256`:
+
+  ```bash
+  read -r -s -p "Login token: " TOKEN && echo
+  printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1    # macOS: shasum -a 256 | cut -d' ' -f1
+  unset TOKEN
+  ```
+
+- Every request must name an allowed host: a loopback name (`127.0.0.1`, `localhost` or `[::1]`) or the host of
+  `CAW_PUBLIC_ORIGIN`. Any other host gets `421 HOST_REJECTED`, which blocks DNS-rebinding attacks.
 - Every write must come from the configured origin. This blocks cross-site requests and cross-site WebSocket hijacking.
+- In the default hash mode, sessions end when the gateway restarts, including after an installer run. With a plaintext
+  `CAW_TOKEN`, they survive restarts. A logout stays in effect across restarts in both modes.
+- Logins are throttled: ten failures per client address in ten minutes. Event streams are limited to 64 open at once and 16
+  per client address. A request body that stops arriving for 30 seconds is closed, and control calls to Claude Code time
+  out after 10 seconds.
+- Folder trust: an untrusted folder runs with your user settings only. Trust a folder only after you have read what is in
+  it.
 - The gateway never reads Claude credentials. It removes the login token and every `CAW_*` variable from the environment
   of Claude Code.
 - Model output is untrusted. Markdown is sanitized, and tool output is shown as text.
@@ -175,6 +220,9 @@ Enable it with `CAW_TERMINAL=1`. It needs the `full` profile, and node-pty must 
 and `python3`. The terminal is equivalent to a shell as the service user, so enable it only on a host that only you
 operate. While the terminal is attached to a session, the browser cannot write to that session. Detach the terminal to
 continue in the browser.
+
+The terminal runs the executable from `CAW_CLAUDE_BIN` when that is set, with no fallback. Otherwise it runs the native
+binary that the SDK ships for the platform, and only when that is missing, the first `claude` on `PATH`.
 
 ## Sessions and the terminal
 
@@ -212,7 +260,7 @@ What this means for you:
 npm ci
 npm run dev            # mock engine, restarts on change, no login
 npm test               # unit and integration tests
-npm run test:e2e       # browser tests; install Chromium first: npx playwright-core install chromium
+npm run test:e2e       # 22 browser tests; install Chromium first: npx playwright-core install chromium
 npm run typecheck      # tsc over the JSDoc types
 npm run check          # static rules over the whole tree
 npm run seal           # runs the checks above and verifies the source manifest; writes .state/seal-receipt.json
@@ -220,7 +268,8 @@ npm run seal           # runs the checks above and verifies the source manifest;
 
 The other scripts are `npm run manifest` and `npm run manifest:verify` (source manifest), `npm run smoke:runtime` and
 `npm run smoke:gateway` (real-engine and deployed-gateway validation, see
-[docs/PRODUCTION_SEAL.md](docs/PRODUCTION_SEAL.md)), and `npm run maintenance:prune` (removes expired attachments).
+[docs/PRODUCTION_SEAL.md](docs/PRODUCTION_SEAL.md)), `npm run screenshots` (renders the images in `docs/screenshots` with
+Chromium), and `npm run maintenance:prune` (removes expired attachments).
 
 The layout is:
 
@@ -239,11 +288,17 @@ decision.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ENGINE_UNAVAILABLE` (HTTP 503) | Claude Code is not logged in for the user that runs the gateway, or its binary cannot be found | Run `claude` as that user and complete `/login`, or set `CAW_CLAUDE_BIN`. Then restart the service. |
-| `SESSION_LOCKED` | The terminal tab holds the session | Exit the terminal session or detach it. The browser can write again. |
+| `ENGINE_UNAVAILABLE` (HTTP 503), or a notice with this code in a session | Claude Code is not logged in for the user that runs the gateway, its binary cannot be found, or its sign-in was rejected during a session | Run `claude` as that user and complete `/login`, then reopen the session. Set `CAW_CLAUDE_BIN` if the binary cannot be found. Restart the service after a configuration change. |
+| `HOST_REJECTED` (HTTP 421) | The `Host` header is neither a loopback name nor the host of `CAW_PUBLIC_ORIGIN`. Usually `CAW_PUBLIC_ORIGIN` is missing, or a proxy rewrites `Host` | Set `CAW_PUBLIC_ORIGIN` to the address in the browser, make the proxy forward `Host` unchanged (`proxy_set_header Host $host;` in nginx), then restart the service. |
 | `ORIGIN_REJECTED` | The browser's origin differs from `CAW_PUBLIC_ORIGIN`, which is common behind a proxy or tunnel | Set `CAW_PUBLIC_ORIGIN` to the exact origin in the address bar, then restart the service. |
-| `RATE_LIMITED` | Too many failed login attempts from one address | Wait for the `Retry-After` period, and check the token. |
+| `INVALID_TOKEN` (HTTP 401) | The login token does not match the configured token | Enter the token that the installer printed. If it is lost, run `scripts/install-linux.sh --rotate-token` in your own terminal. Every session ends. |
+| `RATE_LIMITED` (HTTP 429) | Too many failed login attempts from one client address | Wait for the `Retry-After` period. Behind a proxy without `CAW_TRUST_PROXY=1`, all visitors share one count. |
+| `TOO_MANY_STREAMS` (HTTP 429) | More than 16 event streams from one client address, or 64 in all | Close the other gateway tabs. Behind a proxy without `CAW_TRUST_PROXY=1`, all visitors share one limit. |
+| `SESSION_LOCKED` | The terminal tab holds the session | Exit the terminal session or detach it. The browser can write again. |
 | `TOO_MANY_SESSIONS` | Every live slot is busy | Wait for a session to go idle, or raise `CAW_MAX_LIVE_SESSIONS`. Each live session is a separate process. |
+| Browsers ask you to sign in again | The service restarted. In hash mode the session secret exists only in memory, so every restart, including an installer run, ends the sessions | Sign in again. A plaintext `CAW_TOKEN` keeps sessions across restarts. |
+| A session shows the untrusted-folder banner | The folder has not been trusted, so its project hooks, MCP servers and CLAUDE.md do not load | Trust the folder from the banner. The session restarts with project settings. |
+| The installer refuses the configuration | The file sets something the production service does not accept, such as both token settings | Fix the named setting in `~/.config/claude-official-web/env`. `--rotate-token` replaces the stored token settings. |
 | The terminal tab reports that node-pty is missing | node-pty was not compiled during installation | Install `build-essential` and `python3`, then run `scripts/install-linux.sh` again. |
 | Replies stop partway behind nginx | Response buffering or a short timeout on the event stream | Set `proxy_buffering off` and `proxy_read_timeout 3600s` for the gateway location. |
 | The service stops when you log out | Lingering is not enabled for the user | Run `loginctl enable-linger "$USER"`. |

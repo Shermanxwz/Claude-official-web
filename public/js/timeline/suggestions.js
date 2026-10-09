@@ -32,15 +32,16 @@ const MODE_KEYS = new Map([
 const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /**
- * Whether a suggestion starts checked. Only rules that allow something do: a directory grant or a mode change starts
- * unchecked, so "always allow" never applies one the user did not tick.
+ * Whether a suggestion starts checked: a rule that allows something, or a mode change for this session only (the one a
+ * Write request offers). A directory grant, a mode change kept in settings and a deny rule start unchecked, so "always
+ * allow" applies those only when the user ticks them.
  * @param {unknown} suggestion
  * @returns {boolean}
  */
 export function isDefaultChecked(suggestion) {
-  return isRecord(suggestion)
-    && (suggestion.type === 'addRules' || suggestion.type === 'replaceRules')
-    && suggestion.behavior === 'allow';
+  if (!isRecord(suggestion)) return false;
+  if (suggestion.type === 'addRules' || suggestion.type === 'replaceRules') return suggestion.behavior === 'allow';
+  return suggestion.type === 'setMode' && suggestion.destination === 'session';
 }
 
 /**
