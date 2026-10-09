@@ -7,9 +7,10 @@ no `eval`, no `innerHTML` with untrusted data (use `h()`/`textContent`; Markdown
 
 | Path | Purpose |
 |---|---|
-| `public/index.html` | shell: `<div id="app">`, loads `/css/app.css`, `/css/composer.css`, `/css/cards.css`, `/css/terminal.css`, `/js/main.js` |
+| `public/index.html` | shell: `<div id="app">`, loads `/css/app.css`, `/css/composer.css`, `/css/cards.css`, `/css/tools.css`, `/css/terminal.css`, `/js/main.js` |
 | `public/css/app.css` | design tokens (CSS variables, light/dark), layout, shell components |
-| `public/css/cards.css` | timeline, tool cards, request cards |
+| `public/css/cards.css` | timeline, bubbles, work groups, request cards |
+| `public/css/tools.css` | tool cards |
 | `public/css/terminal.css` | terminal panel |
 | `public/js/dom.js` | `h()`, `clear()`, `icon()` helpers (shared, already written) |
 | `public/js/api.js` | HTTP + SSE client |
@@ -131,8 +132,8 @@ actions = {
 
 Locale files per owner: `en.core.js`/`zh-CN.core.js` (shell: app-shell, sidebar, login, dialogs, panels, toasts),
 `en.composer.js`/`zh-CN.composer.js` (header + composer + palettes), `en.cards.js`/`zh-CN.cards.js` (timeline),
-`en.terminal.js`/`zh-CN.terminal.js`. `main.js` imports all of them. CSS per owner: `app.css` (shell), `composer.css`
-(header + composer), `cards.css` (timeline), `terminal.css`; `index.html` links all four.
+`en.tools.js`/`zh-CN.tools.js` (tool cards), `en.terminal.js`/`zh-CN.terminal.js`. `main.js` imports all of them. CSS per owner: `app.css` (shell), `composer.css`
+(header + composer), `cards.css` (timeline), `tools.css` (tool cards), `terminal.css`; `index.html` links all five.
 
 ## Timeline model rules (`public/js/timeline/model.js`)
 
@@ -175,18 +176,46 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
    - `prompt_suggestion`: suggestion chip above the composer (shell), latest only.
    - `auth_status`: banner.
    - `result`: turn footer (duration, turns, error subtype + `errors[]` in red for error results, permission denials).
+     A result whose `terminal_reason` starts with `aborted` is shown as a neutral "Interrupted" footer, not an error.
    - Any other type/subtype → collapsed generic row showing the JSON (never throw).
 
 ## Tool renderers (`public/js/timeline/tools/`)
 
 Each module exports `render(card, ctx) -> HTMLElement` where
-`card = { id, name, input, result?: { content, isError }, structured?, children?: Entry[], running: boolean }`.
+`card = { id, name, input, result?: { content, isError }, structured?, children?: Entry[], running: boolean,
+pendingRequestId?: string }` and
+`ctx = { t, renderMarkdown, sessionId, cwd, renderChildren(entries) -> HTMLElement, open: boolean }`.
+`tools/shell.js` exports `toolShell({ iconName, title, subtitle, status: 'running'|'done'|'error'|'waiting', body,
+open })` used by every family so all cards share one look (header row: icon, title, monospace subtitle, status
+badge; body collapsible via a `<details>` element). Tool cards are styled in `public/css/tools.css`; their strings
+live in `en.tools.js` / `zh-CN.tools.js`. The timeline (`view.js`) re-renders a card when its result arrives.
 Families: `bash.js` (Bash, BashOutput, KillShell/TaskStop, Monitor), `file.js` (Read, Write, Edit, MultiEdit,
 NotebookEdit — Edit/Write show a unified diff computed from `old_string`/`new_string` or `structuredPatch`),
 `search.js` (Grep, Glob, LS), `web.js` (WebFetch, WebSearch), `agent.js` (Agent/Task with nested children),
 `todo.js` (TodoWrite checklist), `plan.js` (ExitPlanMode, EnterPlanMode), `mcp.js` (`mcp__<server>__<tool>`),
 `generic.js` (fallback). `tools/index.js` exports `renderTool(card, ctx)` choosing the family by name.
 Tool inputs follow `node_modules/@anthropic-ai/claude-agent-sdk/sdk-tools.d.ts`.
+
+## Design tokens (defined once in `app.css`, used by every stylesheet)
+
+Colors: `--bg`, `--bg-elev` (cards, menus), `--bg-sunken` (code, inputs), `--bg-hover`, `--fg`, `--fg-muted`,
+`--fg-subtle`, `--border`, `--border-strong`, `--accent`, `--accent-fg` (text on accent), `--accent-soft`, `--danger`,
+`--danger-soft`, `--warning`, `--warning-soft`, `--success`, `--success-soft`, `--info`, `--info-soft`,
+`--diff-add-bg`, `--diff-del-bg`, `--focus-ring`.
+Shape and type: `--radius-sm` (6px), `--radius-md` (10px), `--radius-lg` (14px), `--shadow-sm`, `--shadow-md`,
+`--font-sans` (system UI stack + "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC"),
+`--font-mono` (ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace), `--fs-xs/sm/md/lg/xl`,
+`--space-1`…`--space-6` (4, 8, 12, 16, 24, 32 px), `--header-h` (52px), `--sidebar-w` (288px),
+`--content-max` (880px, timeline + composer width).
+Themes: `:root` = light, `:root[data-theme="dark"]` = dark, and `@media (prefers-color-scheme: dark)` applies dark
+when `data-theme="system"`. Neutral greys with a teal/indigo accent; never Anthropic's or Claude Code's brand colors.
+
+Icons: `icon(name)` renders `<span class="icon icon-NAME">`; `app.css` maps each name to
+`/img/icons/NAME.svg` via `mask-image` with `background-color: currentColor` (so icons follow text color). Available
+names: send, stop, plus, menu, close, chevron-right, chevron-down, search, folder, file, terminal, settings, sun, moon,
+monitor, copy, check, x, alert, info, edit, trash, fork, rewind, refresh, plug, cpu, shield, gauge, clock, user, bot,
+tool, image, paperclip, external, more, logout, globe, list, spark, layers, play, lock, unlock, brain, download,
+command, at.
 
 ## UX requirements
 

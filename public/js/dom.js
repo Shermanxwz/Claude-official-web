@@ -57,7 +57,7 @@ export function clear(el) {
 }
 
 /**
- * Decorative icon drawn by CSS (`.icon-<name>`).
+ * Decorative icon drawn by CSS (`.icon-<name>` → mask-image of /img/icons/<name>.svg, colored by currentColor).
  * @param {string} name
  * @returns {HTMLElement}
  */
