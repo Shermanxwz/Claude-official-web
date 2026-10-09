@@ -9,10 +9,14 @@ import { AppError } from '../../src/contracts.mjs';
 import { createAuth } from '../../src/auth.mjs';
 import { loadConfig } from '../../src/config.mjs';
 import { sendError, sendJson } from '../../src/http.mjs';
+import { sha256Hex } from '../../src/security.mjs';
 
 const TOKEN = 'correct-horse-battery';
 const BOOT = 'boot-under-test';
 const LOGGER = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+const REVOCATIONS = 'revoked-sessions';
+
+/** @typedef {Awaited<ReturnType<typeof createAuth>>} Auth */
 
 /** @type {string} */
 let root = '';
@@ -53,8 +57,30 @@ function clock(start = 2000000000000) {
 }
 
 /**
+ * In-memory stand-in for the state store: same read/write contract, JSON copies on both sides.
+ */
+function memoryStore() {
+  /** @type {Map<string, string>} */
+  const files = new Map();
+  return {
+    files,
+    /** @param {string} name */
+    async read(name, /** @type {unknown} */ fallback) {
+      return files.has(name) ? JSON.parse(/** @type {string} */ (files.get(name))) : fallback;
+    },
+    /**
+     * @param {string} name
+     * @param {unknown} value
+     */
+    async write(name, value) {
+      files.set(name, JSON.stringify(value));
+    },
+  };
+}
+
+/**
  * Starts a server exposing the auth module the way app.mjs uses it.
- * @param {ReturnType<typeof createAuth>} auth
+ * @param {Auth} auth
  * @returns {Promise<{port: number, close: () => Promise<void>}>}
  */
 function startAuthServer(auth) {
@@ -67,7 +93,7 @@ function startAuthServer(auth) {
       } else if (req.method === 'POST' && req.url === '/api/logout') {
         if (!auth.authenticate(req)) throw new AppError(401, 'UNAUTHENTICATED', 'Sign in to continue');
         auth.checkOrigin(req);
-        auth.logout(req, res);
+        await auth.logout(req, res);
       } else if (req.method === 'GET' && req.url === '/whoami') {
         const actor = auth.authenticate(req);
         if (!actor) throw new AppError(401, 'UNAUTHENTICATED', 'Sign in to continue');
@@ -155,9 +181,27 @@ function pairOf(setCookie) {
   return setCookie.split(';')[0];
 }
 
+/**
+ * @param {string} pair caw_session=<value>
+ * @returns {string} the cookie value
+ */
+function valueOf(pair) {
+  return pair.slice('caw_session='.length);
+}
+
+/**
+ * Logs in through the HTTP surface and returns the name=value pair of the issued cookie.
+ * @param {number} port
+ */
+async function loginCookie(port) {
+  const login = await call(port, 'POST', '/api/login', { headers: ORIGIN, body: { token: TOKEN } });
+  assert.equal(login.status, 200);
+  return pairOf(setCookies(login.headers)[0]);
+}
+
 describe('sessionInfo', () => {
   it('describes an anonymous client when no session cookie is present', async () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
     const server = await startAuthServer(auth);
     try {
       const response = await call(server.port, 'GET', '/api/session');
@@ -177,7 +221,7 @@ describe('sessionInfo', () => {
 
 describe('login', () => {
   it('issues an HttpOnly, SameSite=Strict session cookie for the correct token', async () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
     const server = await startAuthServer(auth);
     try {
       const response = await call(server.port, 'POST', '/api/login', { headers: ORIGIN, body: { token: TOKEN } });
@@ -201,7 +245,7 @@ describe('login', () => {
 
   it('adds Secure to the cookie when the public origin is https', async () => {
     const config = configFor({ CAW_PUBLIC_ORIGIN: 'https://gw.example' });
-    const auth = createAuth(config, { log: LOGGER, bootId: BOOT });
+    const auth = await createAuth(config, { log: LOGGER, bootId: BOOT });
     const server = await startAuthServer(auth);
     try {
       const response = await call(server.port, 'POST', '/api/login', {
@@ -214,7 +258,7 @@ describe('login', () => {
   });
 
   it('rejects a wrong token with 401 and sets no cookie', async () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
     const server = await startAuthServer(auth);
     try {
       const response = await call(server.port, 'POST', '/api/login', { headers: ORIGIN, body: { token: 'nope' } });
@@ -227,7 +271,7 @@ describe('login', () => {
   });
 
   it('answers 400 for a missing, non-string or oversized token without counting it as a failure', async () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
     const server = await startAuthServer(auth);
     try {
       assert.equal((await call(server.port, 'POST', '/api/login', { headers: ORIGIN, body: {} })).status, 400);
@@ -243,7 +287,9 @@ describe('login', () => {
   });
 
   it('requires an Origin that matches the public origin, or the Host when none is configured', async () => {
-    const auth = createAuth(configFor({ CAW_PUBLIC_ORIGIN: 'https://gw.example' }), { log: LOGGER, bootId: BOOT });
+    const auth = await createAuth(configFor({ CAW_PUBLIC_ORIGIN: 'https://gw.example' }), {
+      log: LOGGER, bootId: BOOT,
+    });
     const server = await startAuthServer(auth);
     try {
       const missing = await call(server.port, 'POST', '/api/login', { body: { token: TOKEN } });
@@ -257,7 +303,7 @@ describe('login', () => {
       await server.close();
     }
 
-    const hostBased = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+    const hostBased = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
     const second = await startAuthServer(hostBased);
     try {
       const sameHost = await call(second.port, 'POST', '/api/login', {
@@ -275,7 +321,7 @@ describe('login', () => {
 
   it('throttles failed attempts: 10 per 10 minutes, then 429 with Retry-After until the window slides', async () => {
     const time = clock();
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: time.now });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: time.now });
     const server = await startAuthServer(auth);
     try {
       for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -296,7 +342,7 @@ describe('login', () => {
   });
 
   it('resets the failure count after a successful login', async () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: clock().now });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: clock().now });
     const server = await startAuthServer(auth);
     try {
       for (let round = 0; round < 2; round += 1) {
@@ -311,16 +357,19 @@ describe('login', () => {
     }
   });
 
-  it('counts failures per client address when a trusted proxy supplies X-Forwarded-For', async () => {
-    const auth = createAuth(configFor({ CAW_TRUST_PROXY: '1' }), { log: LOGGER, bootId: BOOT, now: clock().now });
+  it('counts failures per client address taken from the trusted proxy, not from a spoofed first hop', async () => {
+    const auth = await createAuth(configFor({ CAW_TRUST_PROXY: '1' }), {
+      log: LOGGER, bootId: BOOT, now: clock().now,
+    });
     const server = await startAuthServer(auth);
     try {
-      const forwarded = (/** @type {string} */ address) => ({ ...ORIGIN, 'X-Forwarded-For': `${address}, 10.0.0.1` });
+      // The client can prepend anything; the proxy appends the address it saw, which is the last hop.
+      const forwarded = (/** @type {string} */ address) => ({ ...ORIGIN, 'X-Forwarded-For': `10.9.9.9, ${address}` });
       for (let attempt = 0; attempt < 10; attempt += 1) {
         await call(server.port, 'POST', '/api/login', { headers: forwarded('203.0.113.9'), body: { token: 'bad' } });
       }
       assert.equal((await call(server.port, 'POST', '/api/login', {
-        headers: forwarded('203.0.113.9'), body: { token: TOKEN },
+        headers: { ...ORIGIN, 'X-Forwarded-For': `198.51.100.1, 203.0.113.9` }, body: { token: TOKEN },
       })).status, 429);
       assert.equal((await call(server.port, 'POST', '/api/login', {
         headers: forwarded('203.0.113.10'), body: { token: TOKEN },
@@ -332,7 +381,7 @@ describe('login', () => {
 
   it('skips token checks and returns ok without a cookie when authentication is disabled', async () => {
     const config = configFor({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN: '' });
-    const auth = createAuth(config, { log: LOGGER, bootId: BOOT });
+    const auth = await createAuth(config, { log: LOGGER, bootId: BOOT });
     const server = await startAuthServer(auth);
     try {
       const response = await call(server.port, 'POST', '/api/login', { headers: ORIGIN, body: { token: 'anything' } });
@@ -346,11 +395,31 @@ describe('login', () => {
       await server.close();
     }
   });
+
+  it('verifies logins against CAW_TOKEN_SHA256 without the plaintext token being configured', async () => {
+    const config = configFor({ CAW_TOKEN: '', CAW_TOKEN_SHA256: sha256Hex(TOKEN) });
+    const auth = await createAuth(config, { log: LOGGER, bootId: BOOT, now: clock().now });
+    const server = await startAuthServer(auth);
+    try {
+      assert.equal(config.token, '');
+      const wrong = await call(server.port, 'POST', '/api/login', {
+        headers: ORIGIN, body: { token: 'not-the-token' },
+      });
+      assert.equal(wrong.status, 401);
+      const right = await call(server.port, 'POST', '/api/login', { headers: ORIGIN, body: { token: TOKEN } });
+      assert.equal(right.status, 200);
+      assert.equal((await call(server.port, 'GET', '/whoami', {
+        headers: { Cookie: pairOf(setCookies(right.headers)[0]) },
+      })).status, 200);
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 describe('logout and session validity', () => {
   it('revokes the cookie and clears it on the client', async () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: clock().now });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: clock().now });
     const server = await startAuthServer(auth);
     try {
       const login = await call(server.port, 'POST', '/api/login', { headers: ORIGIN, body: { token: TOKEN } });
@@ -372,7 +441,7 @@ describe('logout and session validity', () => {
   });
 
   it('requires a session to log out and an allowed origin', async () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: clock().now });
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: clock().now });
     const server = await startAuthServer(auth);
     try {
       assert.equal((await call(server.port, 'POST', '/api/logout', { headers: ORIGIN })).status, 401);
@@ -389,13 +458,13 @@ describe('logout and session validity', () => {
 
   it('keeps sessions valid across restarts with the same token and rejects other tokens', async () => {
     const time = clock();
-    const first = createAuth(configFor(), { log: LOGGER, bootId: 'boot-a', now: time.now });
+    const first = await createAuth(configFor(), { log: LOGGER, bootId: 'boot-a', now: time.now });
     const server = await startAuthServer(first);
     const login = await call(server.port, 'POST', '/api/login', { headers: ORIGIN, body: { token: TOKEN } });
     const cookie = pairOf(setCookies(login.headers)[0]);
     await server.close();
 
-    const restarted = createAuth(configFor(), { log: LOGGER, bootId: 'boot-b', now: time.now });
+    const restarted = await createAuth(configFor(), { log: LOGGER, bootId: 'boot-b', now: time.now });
     const restartedServer = await startAuthServer(restarted);
     try {
       const decoys = `theme=dark; caw_session=v1.1.bogus.bogus; ${cookie}`;
@@ -404,7 +473,7 @@ describe('logout and session validity', () => {
       await restartedServer.close();
     }
 
-    const rotated = createAuth(configFor({ CAW_TOKEN: 'a-different-token-123' }), {
+    const rotated = await createAuth(configFor({ CAW_TOKEN: 'a-different-token-123' }), {
       log: LOGGER, bootId: 'boot-c', now: time.now,
     });
     const rotatedServer = await startAuthServer(rotated);
@@ -415,9 +484,110 @@ describe('logout and session validity', () => {
     }
   });
 
-  it('finds the session among several cookies and ignores look-alike names', () => {
+  it('gives the same session secret for CAW_TOKEN and for its CAW_TOKEN_SHA256 digest', async () => {
     const time = clock();
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: time.now });
+    const byToken = await createAuth(configFor(), { log: LOGGER, bootId: 'boot-t', now: time.now });
+    const tokenServer = await startAuthServer(byToken);
+    const cookie = await loginCookie(tokenServer.port);
+    await tokenServer.close();
+
+    const byDigest = await createAuth(configFor({ CAW_TOKEN: '', CAW_TOKEN_SHA256: sha256Hex(TOKEN) }), {
+      log: LOGGER, bootId: 'boot-d', now: time.now,
+    });
+    const digestServer = await startAuthServer(byDigest);
+    try {
+      assert.equal((await call(digestServer.port, 'GET', '/whoami', { headers: { Cookie: cookie } })).status, 200);
+    } finally {
+      await digestServer.close();
+    }
+  });
+
+  it('persists revocations so a logged-out cookie stays dead after a restart, without storing the cookie', async () => {
+    const time = clock();
+    const store = memoryStore();
+    const first = await createAuth(configFor(), { log: LOGGER, bootId: 'boot-a', now: time.now, stateStore: store });
+    const server = await startAuthServer(first);
+    const cookie = await loginCookie(server.port);
+    const logout = await call(server.port, 'POST', '/api/logout', { headers: { ...ORIGIN, Cookie: cookie } });
+    assert.equal(logout.status, 200);
+    await server.close();
+
+    const persisted = store.files.get(REVOCATIONS);
+    assert.ok(persisted, 'the revocation list is written on logout');
+    assert.equal(persisted.includes(valueOf(cookie)), false, 'the cookie value itself must not be stored');
+    assert.deepEqual(Object.keys(JSON.parse(persisted).entries), [sha256Hex(valueOf(cookie))]);
+
+    const restarted = await createAuth(configFor(), {
+      log: LOGGER, bootId: 'boot-b', now: time.now, stateStore: store,
+    });
+    const restartedServer = await startAuthServer(restarted);
+    try {
+      assert.equal((await call(restartedServer.port, 'GET', '/whoami', { headers: { Cookie: cookie } })).status, 401);
+    } finally {
+      await restartedServer.close();
+    }
+  });
+
+  it('applies persisted revocations to the matching cookie only, ignoring expired and malformed entries', async () => {
+    const time = clock();
+    const issuer = await createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: time.now });
+    const server = await startAuthServer(issuer);
+    const revoked = await loginCookie(server.port);
+    const expired = await loginCookie(server.port);
+    const live = await loginCookie(server.port);
+    await server.close();
+
+    const store = memoryStore();
+    store.files.set(REVOCATIONS, JSON.stringify({ entries: {
+      [sha256Hex(valueOf(revoked))]: time.now() + 60000,
+      [sha256Hex(valueOf(expired))]: time.now() - 1,
+      'not-a-digest': time.now() + 60000,
+      [sha256Hex(valueOf(live)).toUpperCase()]: time.now() + 60000,
+    } }));
+    const restored = await createAuth(configFor(), { log: LOGGER, bootId: 'boot-r', now: time.now, stateStore: store });
+    const restoredServer = await startAuthServer(restored);
+    try {
+      const check = (/** @type {string} */ cookie) => call(restoredServer.port, 'GET', '/whoami', {
+        headers: { Cookie: cookie },
+      });
+      assert.equal((await check(revoked)).status, 401);
+      assert.equal((await check(expired)).status, 200);
+      assert.equal((await check(live)).status, 200);
+    } finally {
+      await restoredServer.close();
+    }
+  });
+
+  it('starts normally from a corrupt revocation file', async () => {
+    const store = memoryStore();
+    store.files.set(REVOCATIONS, '"garbage"');
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: clock().now, stateStore: store });
+    assert.equal(auth.authenticate(/** @type {any} */ ({ headers: {}, socket: {} })), null);
+  });
+
+  it('still logs out in memory and reports the failure when the revocation cannot be written', async () => {
+    const errors = /** @type {string[]} */ ([]);
+    const logger = { ...LOGGER, error: (/** @type {string} */ message) => errors.push(message) };
+    const store = { read: async (/** @type {string} */ _name, /** @type {unknown} */ fallback) => fallback,
+      write: async () => {
+        throw new Error('disk full');
+      } };
+    const auth = await createAuth(configFor(), { log: logger, bootId: BOOT, now: clock().now, stateStore: store });
+    const server = await startAuthServer(auth);
+    try {
+      const cookie = await loginCookie(server.port);
+      const logout = await call(server.port, 'POST', '/api/logout', { headers: { ...ORIGIN, Cookie: cookie } });
+      assert.equal(logout.status, 200);
+      assert.deepEqual(errors, ['could not persist session revocations']);
+      assert.equal((await call(server.port, 'GET', '/whoami', { headers: { Cookie: cookie } })).status, 401);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('finds the session among several cookies and ignores look-alike names', async () => {
+    const time = clock();
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT, now: time.now });
     /** @param {string} cookie */
     const fake = (cookie) => /** @type {any} */ ({ headers: { cookie }, socket: { remoteAddress: '::1' } });
     assert.equal(auth.authenticate(fake('theme=dark')), null);
@@ -425,12 +595,13 @@ describe('logout and session validity', () => {
     assert.equal(auth.authenticate(fake('caw_session=v1.1.abc.def; caw_session=nonsense')), null);
   });
 
-  it('returns the configured profile for an authenticated request and null otherwise', () => {
-    const auth = createAuth(configFor({ CAW_ACCESS_PROFILE: 'standard' }), { log: LOGGER, bootId: BOOT });
+  it('returns the configured profile for an authenticated request and null otherwise', async () => {
+    const auth = await createAuth(configFor({ CAW_ACCESS_PROFILE: 'standard' }), { log: LOGGER, bootId: BOOT });
     assert.equal(auth.authenticate(/** @type {any} */ ({ headers: {}, socket: {} })), null);
-    assert.deepEqual(createAuth(configFor({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN: '', CAW_ACCESS_PROFILE: 'read' }), {
+    const open = await createAuth(configFor({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN: '', CAW_ACCESS_PROFILE: 'read' }), {
       log: LOGGER, bootId: BOOT,
-    }).authenticate(/** @type {any} */ ({ headers: {}, socket: {} })), { profile: 'read' });
+    });
+    assert.deepEqual(open.authenticate(/** @type {any} */ ({ headers: {}, socket: {} })), { profile: 'read' });
   });
 });
 
@@ -438,28 +609,34 @@ describe('checkOrigin', () => {
   /** @param {Record<string, string>} headers */
   const req = (headers) => /** @type {any} */ ({ headers, socket: { remoteAddress: '127.0.0.1' } });
 
-  it('requires an Origin header in every case', () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+  it('requires an Origin header in every case', async () => {
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
     assert.throws(() => auth.checkOrigin(req({ host: '127.0.0.1:4180' })),
       (error) => error instanceof AppError && error.status === 403 && error.code === 'ORIGIN_REJECTED');
   });
 
-  it('compares with the configured public origin when one is set', () => {
-    const auth = createAuth(configFor({ CAW_PUBLIC_ORIGIN: 'https://gw.example' }), { log: LOGGER, bootId: BOOT });
+  it('compares with the configured public origin when one is set', async () => {
+    const auth = await createAuth(configFor({ CAW_PUBLIC_ORIGIN: 'https://gw.example' }), {
+      log: LOGGER, bootId: BOOT,
+    });
     assert.doesNotThrow(() => auth.checkOrigin(req({ origin: 'https://gw.example', host: 'internal:4180' })));
     assert.throws(() => auth.checkOrigin(req({ origin: 'http://internal:4180', host: 'internal:4180' })),
       AppError);
   });
 
-  it('compares with the Host header when no public origin is set', () => {
-    const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+  it('compares with the Host header when no public origin is set', async () => {
+    const auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
     assert.doesNotThrow(() => auth.checkOrigin(req({ origin: 'http://127.0.0.1:4180', host: '127.0.0.1:4180' })));
     assert.throws(() => auth.checkOrigin(req({ origin: 'http://127.0.0.1:9999', host: '127.0.0.1:4180' })), AppError);
   });
 });
 
 describe('requireProfile', () => {
-  const auth = createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+  /** @type {Auth} */
+  let auth;
+  before(async () => {
+    auth = await createAuth(configFor(), { log: LOGGER, bootId: BOOT });
+  });
 
   it('orders read < standard < full and lets higher profiles satisfy lower requirements', () => {
     assert.doesNotThrow(() => auth.requireProfile('read', 'read'));
@@ -482,14 +659,12 @@ describe('requireProfile', () => {
 
 describe('clientAddress', () => {
   /**
-   * @param {Record<string, string>} extra
+   * @param {{trust?: string, headers?: Record<string, string>}} options
    */
-  async function addressFor(extra) {
-    const config = configFor({ CAW_TRUST_PROXY: extra.trust ?? '0' });
-    const auth = createAuth(config, { log: LOGGER, bootId: BOOT });
+  async function addressFor({ trust = '0', headers = {} }) {
+    const auth = await createAuth(configFor({ CAW_TRUST_PROXY: trust }), { log: LOGGER, bootId: BOOT });
     const server = await startAuthServer(auth);
     try {
-      const headers = extra.forwarded ? { 'X-Forwarded-For': extra.forwarded } : {};
       const response = await call(server.port, 'GET', '/client', { headers });
       return response.json.address;
     } finally {
@@ -497,20 +672,39 @@ describe('clientAddress', () => {
     }
   }
 
-  it('uses the socket address and ignores X-Forwarded-For unless the proxy is trusted', async () => {
-    assert.equal(await addressFor({ forwarded: '198.51.100.7' }), '127.0.0.1');
+  it('uses the socket address and ignores forwarding headers unless the proxy is trusted', async () => {
+    const headers = {
+      'X-Forwarded-For': '198.51.100.7', 'X-Real-IP': '198.51.100.8', 'CF-Connecting-IP': '198.51.100.9',
+    };
+    assert.equal(await addressFor({ headers }), '127.0.0.1');
   });
 
-  it('uses the first X-Forwarded-For hop when the proxy is trusted, and ignores malformed hops', async () => {
-    assert.equal(await addressFor({ trust: '1', forwarded: '198.51.100.7, 10.0.0.2' }), '198.51.100.7');
-    assert.equal(await addressFor({ trust: '1', forwarded: '2001:DB8::1' }), '2001:db8::1');
-    assert.equal(await addressFor({ trust: '1', forwarded: '<script>' }), '127.0.0.1');
+  it('prefers CF-Connecting-IP, then X-Real-IP, then the last X-Forwarded-For hop', async () => {
+    const all = {
+      'CF-Connecting-IP': '198.51.100.1', 'X-Real-IP': '198.51.100.2', 'X-Forwarded-For': '203.0.113.5, 198.51.100.9',
+    };
+    assert.equal(await addressFor({ trust: '1', headers: all }), '198.51.100.1');
+    const noCloudflare = { 'X-Real-IP': '198.51.100.2', 'X-Forwarded-For': '203.0.113.5, 198.51.100.9' };
+    assert.equal(await addressFor({ trust: '1', headers: noCloudflare }), '198.51.100.2');
+    const onlyForwarded = { 'X-Forwarded-For': '203.0.113.5, 198.51.100.9' };
+    assert.equal(await addressFor({ trust: '1', headers: onlyForwarded }), '198.51.100.9');
+  });
+
+  it('never uses the first X-Forwarded-For hop, and falls back past values that are not IP addresses', async () => {
+    assert.equal(await addressFor({ trust: '1', headers: { 'X-Forwarded-For': '198.51.100.7, 10.0.0.2' } }),
+      '10.0.0.2');
+    const junk = { 'X-Forwarded-For': '198.51.100.7, <script>' };
+    assert.equal(await addressFor({ trust: '1', headers: junk }), '127.0.0.1');
+    assert.equal(await addressFor({ trust: '1', headers: { 'CF-Connecting-IP': 'nope', 'X-Real-IP': '2001:DB8::1' } }),
+      '2001:db8::1');
+    assert.equal(await addressFor({ trust: '1', headers: { 'CF-Connecting-IP': '198.51.100.1, 10.0.0.2' } }),
+      '127.0.0.1');
   });
 });
 
 describe('authentication disabled', () => {
   it('treats every request as the configured profile and clears cookies on logout', async () => {
-    const auth = createAuth(configFor({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN: '', CAW_ACCESS_PROFILE: 'standard' }), {
+    const auth = await createAuth(configFor({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN: '', CAW_ACCESS_PROFILE: 'standard' }), {
       log: LOGGER, bootId: BOOT,
     });
     const server = await startAuthServer(auth);

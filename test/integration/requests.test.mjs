@@ -3,6 +3,7 @@
  * until the browser answers, including validation, cancellation and the answer each kind hands back to the engine.
  * The engine is wrapped so that the test can read the exact result the gateway returns to canUseTool.
  */
+import path from 'node:path';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { describe, it, before, after } from 'node:test';
@@ -126,7 +127,7 @@ describe('requests', { timeout: 120000 }, () => {
       assert.equal(request.title, 'Claude wants to run ls -la');
       assert.equal(request.displayName, 'Run command');
       assert.equal(typeof request.toolUseId, 'string');
-      assert.equal(request.suggestions.length, 1);
+      assert.equal(request.suggestions.length, 2);
       assert.equal(typeof request.createdAt, 'number');
 
       const waiting = (await api.get(`/api/sessions/${sessionId}`)).json;
@@ -195,37 +196,40 @@ describe('requests', { timeout: 120000 }, () => {
     }
   });
 
-  it('persists exactly the suggestions named by allow_always, and none when no index is given', async () => {
-    const { sessionId, events } = await openWatched();
-    try {
-      const expected = [{ type: 'addRules', rules: [{ toolName: 'Bash' }], behavior: 'allow',
-        destination: 'localSettings' }];
-      const answers = [
-        { indexes: [0], updated: expected },
-        { indexes: [], updated: undefined },
-        { indexes: undefined, updated: expected },
-      ];
-      for (const { indexes, updated } of answers) {
-        const mark = events.count();
-        const clientMessageId = await send(api, sessionId, 'Please run a tool');
-        const request = await nextRequest(events, sessionId, mark, 'permission');
-        const body = { decision: 'allow_always' };
-        if (indexes !== undefined) body.suggestionIndexes = indexes;
-        assert.equal((await api.post(`/api/sessions/${sessionId}/requests/${request.id}`, body)).status, 200);
-        await events.next(turnResult(sessionId, clientMessageId));
-        const result = answeredWith(request.id);
-        assert.equal(result.behavior, 'allow');
-        assert.deepEqual(request.suggestions, expected, 'the request offers one rule for Bash');
-        if (updated === undefined) {
-          assert.equal('updatedPermissions' in result, false, 'no suggestion was selected');
-        } else {
-          assert.deepEqual(result.updatedPermissions, updated);
+  it('persists exactly the suggestions named by allow_always, and only allow rules when no index is given',
+    async () => {
+      const { sessionId, events } = await openWatched();
+      try {
+        const rule = { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow',
+          destination: 'localSettings' };
+        const directory = { type: 'addDirectories', directories: [path.dirname(server.proj)], destination: 'session' };
+        const answers = [
+          { indexes: [0], updated: [rule] },
+          { indexes: [0, 1], updated: [rule, directory] },
+          { indexes: [], updated: undefined },
+          { indexes: undefined, updated: [rule] },
+        ];
+        for (const { indexes, updated } of answers) {
+          const mark = events.count();
+          const clientMessageId = await send(api, sessionId, 'Please run a tool');
+          const request = await nextRequest(events, sessionId, mark, 'permission');
+          const body = { decision: 'allow_always' };
+          if (indexes !== undefined) body.suggestionIndexes = indexes;
+          assert.equal((await api.post(`/api/sessions/${sessionId}/requests/${request.id}`, body)).status, 200);
+          await events.next(turnResult(sessionId, clientMessageId));
+          const result = answeredWith(request.id);
+          assert.equal(result.behavior, 'allow');
+          assert.deepEqual(request.suggestions, [rule, directory], 'the request offers a rule and a directory');
+          if (updated === undefined) {
+            assert.equal('updatedPermissions' in result, false, 'no suggestion was selected');
+          } else {
+            assert.deepEqual(result.updatedPermissions, updated);
+          }
         }
+      } finally {
+        events.close();
       }
-    } finally {
-      events.close();
-    }
-  });
+    });
 
   it('refuses a suggestion index that does not exist and keeps the request pending', async () => {
     const { sessionId, events } = await openWatched();
@@ -234,7 +238,7 @@ describe('requests', { timeout: 120000 }, () => {
       const clientMessageId = await send(api, sessionId, 'Please run a tool');
       const request = await nextRequest(events, sessionId, mark, 'permission');
       const pathname = `/api/sessions/${sessionId}/requests/${request.id}`;
-      assertError(await api.post(pathname, { decision: 'allow_always', suggestionIndexes: [1] }), 400, 'BAD_REQUEST');
+      assertError(await api.post(pathname, { decision: 'allow_always', suggestionIndexes: [2] }), 400, 'BAD_REQUEST');
       assertError(await api.post(pathname, { decision: 'allow_always', suggestionIndexes: [0, 0] }), 400,
         'BAD_REQUEST');
       assert.equal((await api.get(`/api/sessions/${sessionId}`)).json.pending.length, 1);

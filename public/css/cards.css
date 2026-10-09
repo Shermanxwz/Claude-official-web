@@ -1392,6 +1392,57 @@
   display: none;
 }
 
+/* "Always allow" suggestions: one checkbox per change the answer would save, with its destination under it. */
+.request-suggestions {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+}
+
+.request-suggestions-title {
+  padding: 0 var(--space-1);
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+}
+
+.request-suggestion {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-1) 0;
+  cursor: pointer;
+}
+
+.request-suggestion-check {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+}
+
+.request-suggestion-check:disabled {
+  cursor: not-allowed;
+}
+
+.request-suggestion-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.request-suggestion-meta {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+}
+
 .request-key {
   display: inline-grid;
   place-items: center;
@@ -1740,11 +1791,22 @@
     background: var(--bg);
   }
 
+  /* A lower cap keeps the transcript in view above the dock; the card scrolls, and its answer row stays at the bottom. */
   .request-slot.is-latest > .request-card {
-    max-height: min(64dvh, 560px);
+    max-height: min(52dvh, 440px);
     overflow-y: auto;
     overscroll-behavior: contain;
     box-shadow: var(--shadow-md);
+  }
+
+  .request-slot.is-latest .request-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 1;
+    margin: 0 calc(-1 * var(--space-3)) calc(-1 * var(--space-3));
+    padding: var(--space-3);
+    border-top: 1px solid var(--border);
+    background: var(--bg-elev);
   }
 }
 

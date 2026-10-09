@@ -47,6 +47,7 @@ registerMessages('en', {
   'composer.attach.imageTooLarge': 'Image larger than {max}',
   'composer.attach.disabled': 'Attachments are turned off on this server',
   'composer.attach.noCwd': 'This session has no folder to upload into',
+  'composer.attach.interrupted': 'Upload interrupted',
   'composer.attach.blocked': 'Wait for uploads to finish and remove failed files to send.',
   'composer.drop': 'Drop files to attach them',
   'composer.queued': 'Will be queued until the current turn finishes',

@@ -1,19 +1,21 @@
 // @ts-check
 /**
- * Authentication and authorization: token login with per-address throttling, HMAC-signed HttpOnly session cookies,
- * exact-Origin checks and access-profile gates.
+ * Authentication and authorization: token login with per-address throttling, HMAC-signed HttpOnly session cookies
+ * whose revocations survive restarts, exact-Origin checks and access-profile gates.
  */
 
 import crypto from 'node:crypto';
+import net from 'node:net';
 import { ACCESS_PROFILES, AppError, SESSION_COOKIE } from './contracts.mjs';
 import { readJson, sendJson } from './http.mjs';
-import { SessionStore, SlidingWindowCounter, safeEqualText, sameOrigin } from './security.mjs';
+import { SessionStore, SlidingWindowCounter, safeEqualText, sameOrigin, sha256Hex } from './security.mjs';
 
 /** @typedef {import('node:http').IncomingMessage} IncomingMessage */
 /** @typedef {import('node:http').ServerResponse} ServerResponse */
 /** @typedef {import('./contracts.mjs').Config} Config */
 /** @typedef {import('./contracts.mjs').Logger} Logger */
 /** @typedef {import('./contracts.mjs').AccessProfile} AccessProfile */
+/** @typedef {import('./state.mjs').StateStore} StateStore */
 
 /**
  * @typedef {Object} AuthApi
@@ -21,7 +23,7 @@ import { SessionStore, SlidingWindowCounter, safeEqualText, sameOrigin } from '.
  *   appName: string, version: string, bootId: string}} sessionInfo
  * @property {(req: IncomingMessage) => {profile: AccessProfile}|null} authenticate
  * @property {(req: IncomingMessage, res: ServerResponse) => Promise<void>} login
- * @property {(req: IncomingMessage, res: ServerResponse) => void} logout
+ * @property {(req: IncomingMessage, res: ServerResponse) => Promise<void>} logout
  * @property {(req: IncomingMessage) => void} checkOrigin
  * @property {(actual: AccessProfile|null, needed: AccessProfile) => void} requireProfile
  * @property {(req: IncomingMessage) => string} clientAddress
@@ -32,15 +34,26 @@ const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_BODY_LIMIT = 8192;
 const MAX_TOKEN_CHARS = 1024;
 const SESSION_KEY_LABEL = 'caw-session-v1';
-const FORWARDED_ADDRESS_RE = /^[0-9A-Fa-f:.]{2,45}$/;
+const REVOCATION_STATE = 'revoked-sessions';
 
 /**
- * Derives the session-signing key from the Web token, so sessions survive restarts and die when the token changes.
- * @param {string} token
+ * SHA-256 digest of the login token. The same token given as CAW_TOKEN or as CAW_TOKEN_SHA256 yields the same bytes,
+ * so sessions and their signing secret do not depend on the configuration form.
+ * @param {Config} config
  * @returns {Buffer}
  */
-function sessionSigningKey(token) {
-  return crypto.createHmac('sha256', token).update(SESSION_KEY_LABEL).digest();
+function tokenDigest(config) {
+  if (config.tokenSha256 !== '') return Buffer.from(config.tokenSha256, 'hex');
+  return crypto.createHash('sha256').update(config.token, 'utf8').digest();
+}
+
+/**
+ * Derives the session-signing secret from the token digest. Changing the token invalidates every session.
+ * @param {Buffer} digest
+ * @returns {Buffer}
+ */
+function sessionSigningSecret(digest) {
+  return crypto.createHmac('sha256', digest).update(SESSION_KEY_LABEL).digest();
 }
 
 /**
@@ -61,14 +74,39 @@ function sessionCookieValues(req) {
 
 /**
  * @param {Config} config
- * @param {{log: Logger, bootId: string, now?: () => number}} deps
- * @returns {AuthApi}
+ * @param {{log: Logger, bootId: string, now?: () => number, stateStore?: StateStore}} deps `stateStore` persists the
+ *   session revocations across restarts; without it they are kept in memory only.
+ * @returns {Promise<AuthApi>}
  */
-export function createAuth(config, { log, bootId, now = Date.now }) {
+export async function createAuth(config, { log, bootId, now = Date.now, stateStore }) {
   const secure = config.publicOrigin.startsWith('https://');
   const maxAgeSeconds = Math.floor(config.sessionTtlMs / 1000);
-  const sessions = new SessionStore({ secret: sessionSigningKey(config.token), ttlMs: config.sessionTtlMs, now });
   const failures = new SlidingWindowCounter({ max: LOGIN_MAX_FAILURES, windowMs: LOGIN_WINDOW_MS, now });
+  /** Null when authentication is disabled: no cookie is issued or checked then. */
+  const sessions = config.requireAuth
+    ? new SessionStore({ secret: sessionSigningSecret(tokenDigest(config)), ttlMs: config.sessionTtlMs, now })
+    : null;
+  if (sessions && stateStore) {
+    const stored = /** @type {{entries?: unknown}|null} */ (await stateStore.read(REVOCATION_STATE, null));
+    sessions.restore(stored?.entries);
+  }
+  /** Writes are chained so that the newest snapshot always lands last. */
+  let persisted = Promise.resolve();
+
+  /** @returns {Promise<void>} resolves once the current revocation list is on disk (or the failure is logged) */
+  function persistRevocations() {
+    if (!sessions || !stateStore) return Promise.resolve();
+    persisted = persisted.then(async () => {
+      try {
+        await stateStore.write(REVOCATION_STATE, { entries: sessions.revocations() });
+      } catch (error) {
+        log.error('could not persist session revocations', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+    return persisted;
+  }
 
   /**
    * @param {string} value
@@ -82,15 +120,23 @@ export function createAuth(config, { log, bootId, now = Date.now }) {
   }
 
   /**
+   * With trustProxy, the address comes from CF-Connecting-IP, then X-Real-IP, then the last X-Forwarded-For hop. The
+   * first hop is never used: the client sends it. Values that are not IP addresses are ignored.
    * @param {IncomingMessage} req
    * @returns {string}
    */
   function clientAddress(req) {
     if (config.trustProxy) {
+      for (const name of ['cf-connecting-ip', 'x-real-ip']) {
+        const value = req.headers[name];
+        const candidate = typeof value === 'string' ? value.trim() : '';
+        if (net.isIP(candidate)) return candidate.toLowerCase();
+      }
       const forwarded = req.headers['x-forwarded-for'];
       if (typeof forwarded === 'string') {
-        const first = forwarded.split(',')[0].trim();
-        if (FORWARDED_ADDRESS_RE.test(first)) return first.toLowerCase();
+        const hops = forwarded.split(',');
+        const last = hops[hops.length - 1].trim();
+        if (net.isIP(last)) return last.toLowerCase();
       }
     }
     return req.socket.remoteAddress || 'unknown';
@@ -158,7 +204,10 @@ export function createAuth(config, { log, bootId, now = Date.now }) {
       if (typeof body.token !== 'string' || body.token.length > MAX_TOKEN_CHARS) {
         throw new AppError(400, 'BAD_REQUEST', `Field token must be a string of at most ${MAX_TOKEN_CHARS} characters`);
       }
-      if (!safeEqualText(body.token, config.token)) {
+      const matches = config.tokenSha256 !== ''
+        ? safeEqualText(sha256Hex(body.token), config.tokenSha256)
+        : safeEqualText(body.token, config.token);
+      if (!matches) {
         failures.hit(address);
         log.warn('login rejected');
         throw new AppError(401, 'INVALID_TOKEN', 'The login token is not valid');
@@ -168,10 +217,11 @@ export function createAuth(config, { log, bootId, now = Date.now }) {
       sendJson(res, 200, { ok: true }, { 'Set-Cookie': cookieHeader(sessions.create()) });
     },
 
-    logout(req, res) {
-      if (config.requireAuth) {
+    async logout(req, res) {
+      if (sessions) {
         for (const token of sessionCookieValues(req)) sessions.revoke(token);
         log.info('session ended');
+        await persistRevocations();
       }
       sendJson(res, 200, { ok: true }, { 'Set-Cookie': cookieHeader('') });
     },

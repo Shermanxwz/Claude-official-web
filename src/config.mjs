@@ -24,6 +24,7 @@ export class ConfigError extends Error {
 
 const PACKAGE_JSON_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
 const HOST_RE = /^[A-Za-z0-9.:_[\]-]{1,255}$/;
+const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const DIGITS_RE = /^\d+$/;
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
@@ -187,11 +188,19 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
   }
 
   const token = env.CAW_TOKEN ?? '';
+  const tokenSha256Raw = optionalText(env.CAW_TOKEN_SHA256);
+  if (token !== '' && tokenSha256Raw !== null) {
+    throw new ConfigError('set either CAW_TOKEN or CAW_TOKEN_SHA256, not both');
+  }
   if (token !== '' && (token.length < 16 || token.length > 1024)) {
     throw new ConfigError('CAW_TOKEN must be between 16 and 1024 characters');
   }
-  if (requireAuth && token === '') {
-    throw new ConfigError('CAW_TOKEN is required when CAW_REQUIRE_AUTH=1 (at least 16 characters)');
+  if (tokenSha256Raw !== null && !SHA256_HEX_RE.test(tokenSha256Raw)) {
+    throw new ConfigError('CAW_TOKEN_SHA256 must be 64 hexadecimal characters (the SHA-256 of the login token)');
+  }
+  const tokenSha256 = tokenSha256Raw === null ? '' : tokenSha256Raw.toLowerCase();
+  if (requireAuth && token === '' && tokenSha256 === '') {
+    throw new ConfigError('CAW_TOKEN (at least 16 characters) or CAW_TOKEN_SHA256 is required when CAW_REQUIRE_AUTH=1');
   }
 
   const originRaw = optionalText(env.CAW_PUBLIC_ORIGIN);
@@ -217,8 +226,13 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
   const allowBypass = flag('CAW_ALLOW_BYPASS', env.CAW_ALLOW_BYPASS, false);
   const permissionMode = /** @type {import('./contracts.mjs').Config['defaults']['permissionMode']} */ (
     choice('CAW_DEFAULT_PERMISSION_MODE', env.CAW_DEFAULT_PERMISSION_MODE, PERMISSION_MODES, 'default'));
-  if (permissionMode === 'bypassPermissions' && !allowBypass) {
-    throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ALLOW_BYPASS=1');
+  if (permissionMode === 'bypassPermissions') {
+    if (!allowBypass) {
+      throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ALLOW_BYPASS=1');
+    }
+    if (profile !== 'full') {
+      throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ACCESS_PROFILE=full');
+    }
   }
   const effort = /** @type {import('./contracts.mjs').Config['defaults']['effort']} */ (
     choice('CAW_DEFAULT_EFFORT', env.CAW_DEFAULT_EFFORT, EFFORT_LEVELS, null));
@@ -230,6 +244,7 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
     port,
     requireAuth,
     token,
+    tokenSha256,
     publicOrigin: originRaw ?? '',
     profile,
     appName,

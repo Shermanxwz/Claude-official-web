@@ -30,6 +30,8 @@ const SESSION_RANDOM_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const SESSION_SIGNATURE_RE = /^[A-Za-z0-9_-]{43}$/;
 const ISSUED_AT_RE = /^\d{1,16}$/;
 const DEFAULT_MAX_REVOKED = 10000;
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const LOOPBACK_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$/;
 
 /**
  * Security headers applied to every response. Caller-supplied headers override the defaults.
@@ -115,6 +117,14 @@ export function randomToken(bytes = 32) {
 }
 
 /**
+ * @param {string} text
+ * @returns {string} lowercase hex SHA-256 of the UTF-8 bytes of `text`
+ */
+export function sha256Hex(text) {
+  return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+/**
  * @param {unknown} host
  * @returns {boolean} true for 127.0.0.1, ::1 and localhost
  */
@@ -124,9 +134,40 @@ export function isLoopbackHost(host) {
 }
 
 /**
+ * @param {string} origin
+ * @returns {string} lowercase host[:port] of an origin, or '' when it does not parse
+ */
+function hostOfOrigin(origin) {
+  try {
+    return new URL(origin).host.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Decides whether a Host header may reach the gateway (DNS-rebinding protection). Loopback names are accepted on any
+ * port; any other name must equal the host[:port] of the configured public origin exactly.
+ * @param {unknown} hostHeader the raw Host header
+ * @param {string} [publicOrigin] canonical public origin or ''
+ * @returns {boolean}
+ */
+export function isAllowedHost(hostHeader, publicOrigin = '') {
+  if (typeof hostHeader !== 'string' || hostHeader === '') return false;
+  const host = hostHeader.toLowerCase();
+  if (publicOrigin && host === hostOfOrigin(publicOrigin)) return true;
+  const match = LOOPBACK_HOST_RE.exec(host);
+  if (!match) return false;
+  if (match[1] === undefined) return true;
+  const port = Number(match[1]);
+  return port >= 1 && port <= 65535;
+}
+
+/**
  * Issues and verifies HMAC-SHA256 signed session tokens of the form `v1.<issuedAt>.<random>.<signature>`.
- * Tokens are stateless: they survive a restart as long as the signing secret is unchanged. Revocations are kept in
- * memory, bounded by `maxRevoked`, and each revocation is forgotten once the token would have expired anyway.
+ * Tokens are stateless: they survive a restart as long as the signing secret is unchanged. Revocations are keyed by
+ * the SHA-256 of the cookie value, bounded by `maxRevoked` and forgotten once the token would have expired anyway.
+ * The owner persists them with `revocations()` and loads them again with `restore()`.
  */
 export class SessionStore {
   /** @type {Buffer} */
@@ -137,7 +178,7 @@ export class SessionStore {
   #now;
   /** @type {number} */
   #maxRevoked;
-  /** @type {Map<string, number>} token -> expiry timestamp (ms) */
+  /** @type {Map<string, number>} sha256(token) -> expiry timestamp (ms) */
   #revoked = new Map();
 
   /**
@@ -198,30 +239,58 @@ export class SessionStore {
     if (issuedAt === null) return false;
     const now = this.#now();
     if (issuedAt > now || issuedAt + this.#ttlMs <= now) return false;
-    return !this.#revoked.has(/** @type {string} */ (token));
+    return !this.#revoked.has(sha256Hex(/** @type {string} */ (token)));
   }
 
   /**
-   * Revokes a token until it would have expired. Tokens that are not correctly signed are ignored.
+   * Revokes a token until it would have expired. Tokens that are not correctly signed are ignored. When the list is
+   * full, the revocation that expires first is dropped to make room.
    * @param {unknown} token
    */
   revoke(token) {
     const issuedAt = this.#verify(token);
     if (issuedAt === null) return;
+    this.#pruneRevoked(this.#now());
+    const key = sha256Hex(/** @type {string} */ (token));
+    if (!this.#revoked.has(key) && this.#revoked.size >= this.#maxRevoked) this.#dropEarliest();
+    this.#revoked.set(key, issuedAt + this.#ttlMs);
+  }
+
+  /**
+   * Loads revocations persisted by `revocations()`. Malformed and already expired entries are ignored; when more than
+   * `maxRevoked` remain, the ones that expire first are dropped.
+   * @param {unknown} entries `{<sha256 hex of the cookie value>: expiresAt}`
+   */
+  restore(entries) {
+    if (typeof entries !== 'object' || entries === null || Array.isArray(entries)) return;
     const now = this.#now();
-    this.#pruneRevoked(now);
-    if (this.#revoked.size >= this.#maxRevoked) {
-      const oldest = this.#revoked.keys().next().value;
-      if (oldest !== undefined) this.#revoked.delete(oldest);
-    }
-    this.#revoked.set(/** @type {string} */ (token), issuedAt + this.#ttlMs);
+    const live = Object.entries(entries)
+      .filter(([key, expiresAt]) => SHA256_HEX_RE.test(key) && Number.isSafeInteger(expiresAt) && expiresAt > now)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, this.#maxRevoked);
+    for (const [key, expiresAt] of live) this.#revoked.set(key, expiresAt);
+  }
+
+  /** @returns {Record<string, number>} unexpired revocations keyed by the SHA-256 of the cookie value */
+  revocations() {
+    this.#pruneRevoked(this.#now());
+    return Object.fromEntries(this.#revoked);
   }
 
   /** @param {number} now */
   #pruneRevoked(now) {
-    for (const [token, expiresAt] of this.#revoked) {
-      if (expiresAt <= now) this.#revoked.delete(token);
+    for (const [key, expiresAt] of this.#revoked) {
+      if (expiresAt <= now) this.#revoked.delete(key);
     }
+  }
+
+  #dropEarliest() {
+    /** @type {[string, number]|undefined} */
+    let earliest;
+    for (const entry of this.#revoked) {
+      if (earliest === undefined || entry[1] < earliest[1]) earliest = entry;
+    }
+    if (earliest !== undefined) this.#revoked.delete(earliest[0]);
   }
 
   /** @returns {number} number of tokens currently held in the revocation list */

@@ -2,6 +2,7 @@ import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyCompletion,
+  detachChip,
   detectTrigger,
   draftKey,
   effortLevelsFor,
@@ -10,6 +11,7 @@ import {
   findModelInfo,
   formatBytes,
   isSendShortcut,
+  joinRestoredText,
   mergeCommands,
   modelSelectPlan,
 } from '../../public/js/ui/composer-logic.js';
@@ -493,5 +495,60 @@ describe('isSendShortcut', () => {
     assert.equal(isSendShortcut({ key: 'a' }), false);
     assert.equal(isSendShortcut(null), false);
     assert.equal(isSendShortcut(undefined), false);
+  });
+});
+
+describe('detachChip', () => {
+  test('drops the DOM references of the old mount and keeps the file, path and thumbnail', () => {
+    const chip = {
+      status: 'done', progress: 1, error: null, retryable: true, controller: null, el: { root: {} },
+      path: '/work/a.png', previewUrl: 'blob:a',
+    };
+    assert.equal(detachChip(chip), null);
+    assert.equal(chip.el, null);
+    assert.equal(chip.status, 'done');
+    assert.equal(chip.path, '/work/a.png');
+    assert.equal(chip.previewUrl, 'blob:a');
+  });
+
+  test('cuts a running upload short and returns its controller for the caller to abort', () => {
+    const controller = new AbortController();
+    const chip = {
+      status: 'uploading', progress: 0.4, error: null, retryable: false, controller, el: {}, previewUrl: 'blob:b',
+    };
+    assert.equal(detachChip(chip), controller);
+    assert.equal(controller.signal.aborted, false);
+    assert.equal(chip.controller, null);
+    assert.equal(chip.status, 'error');
+    assert.equal(chip.progress, 0);
+    assert.equal(chip.error, null);
+    assert.equal(chip.retryable, true);
+    assert.equal(chip.previewUrl, 'blob:b');
+  });
+
+  test('leaves a failed chip alone, so its own message and retry decision stand', () => {
+    const chip = {
+      status: 'error', progress: 0, error: 'Larger than 25 MB', retryable: false, controller: null, el: {},
+    };
+    assert.equal(detachChip(chip), null);
+    assert.equal(chip.error, 'Larger than 25 MB');
+    assert.equal(chip.retryable, false);
+    assert.equal(chip.el, null);
+  });
+});
+
+describe('joinRestoredText', () => {
+  test('puts the restored message above the text already typed, on its own line', () => {
+    assert.equal(joinRestoredText('Fix the bug', 'and add tests'), 'Fix the bug\nand add tests');
+  });
+
+  test('replaces whitespace-only text and tolerates a missing current value', () => {
+    assert.equal(joinRestoredText('Fix the bug', '  \n '), 'Fix the bug');
+    assert.equal(joinRestoredText('Fix the bug', null), 'Fix the bug');
+  });
+
+  test('changes nothing for an empty restored message', () => {
+    assert.equal(joinRestoredText('', 'and add tests'), 'and add tests');
+    assert.equal(joinRestoredText('', ''), '');
   });
 });

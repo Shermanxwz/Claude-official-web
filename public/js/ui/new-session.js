@@ -83,6 +83,8 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     },
     on: {
       keydown: (/** @type {KeyboardEvent} */ event) => {
+        // Enter or Escape that commits an IME composition must neither create the folder nor close the row.
+        if (event.isComposing || event.keyCode === 229) return;
         event.stopPropagation();
         if (event.key === 'Enter') {
           event.preventDefault();
@@ -145,6 +147,23 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   const errorEl = h('p', { class: 'form-error', attrs: { role: 'alert' } });
   errorEl.hidden = true;
 
+  // Folder trust (docs/PROTOCOL.md): an untrusted folder starts with user settings only. The notice offers trust for
+  // the folder on screen and trust is applied before the session starts. Read-profile viewers cannot change trust.
+  const profile = meta?.profile ?? store.get().auth?.profile ?? null;
+  const canTrust = profile !== 'read';
+  /** @type {{path: string, trusted: boolean} | null} */
+  let trustState = null;
+  let trustToken = 0;
+  const trustCheckbox = h('input', { attrs: { type: 'checkbox' } });
+  trustCheckbox.checked = true;
+  const trustNotice = h('div', { class: 'trust-notice' },
+    icon('alert'),
+    h('div', { class: 'trust-notice-body' },
+      h('p', { class: 'trust-notice-title', text: t('shell.trust.noticeTitle') }),
+      h('p', { class: 'trust-notice-text', text: t('shell.trust.noticeText') }),
+      h('label', { class: 'trust-check' }, trustCheckbox, h('span', { text: t('shell.trust.checkbox') }))));
+  trustNotice.hidden = true;
+
   function syncModeHint() {
     modeHint.textContent = t(`common.mode.${modeSelect.value}.hint`);
   }
@@ -154,6 +173,29 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   function showError(message) {
     errorEl.textContent = message;
     errorEl.hidden = message === '';
+  }
+
+  /** Show the notice only while the folder on screen is known to be untrusted. */
+  function syncTrustNotice() {
+    trustNotice.hidden = !(trustState !== null && !trustState.trusted && trustState.path === currentPath);
+  }
+
+  /** @param {string | null} path */
+  async function refreshTrust(path) {
+    const token = ++trustToken;
+    trustState = null;
+    syncTrustNotice();
+    if (!path || !canTrust) return;
+    try {
+      const data = await api.get(`/api/fs/trust?path=${encodeURIComponent(path)}`);
+      if (token !== trustToken) return;
+      trustState = { path, trusted: data.trusted === true };
+      trustCheckbox.checked = true;
+    } catch (err) {
+      if (token !== trustToken) return;
+      showError(errorText(err, t));
+    }
+    syncTrustNotice();
   }
 
   /** @param {boolean} [force] */
@@ -218,6 +260,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
       entries = Array.isArray(data.entries) ? data.entries : [];
       showError('');
       renderBrowser();
+      refreshTrust(currentPath);
     } catch (err) {
       if (token !== loadToken) return;
       showError(errorText(err, t));
@@ -259,6 +302,12 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     if (model) body.model = model;
     if (effortSelect.value) body.effort = effortSelect.value;
     try {
+      // Trust is applied before the session starts, so the new session loads the folder's project settings.
+      if (trustState?.path === currentPath && !trustState.trusted && trustCheckbox.checked) {
+        await api.post('/api/fs/trust', { path: currentPath, trusted: true });
+        trustState = { path: currentPath, trusted: true };
+        syncTrustNotice();
+      }
       const { live } = await api.post('/api/sessions', body);
       rememberCwd(currentPath);
       dialogHandle?.close();
@@ -277,7 +326,8 @@ export function openNewSessionDialog({ api, store, t, actions }) {
       h('div', { class: 'dir-browser' },
         h('div', { class: 'dir-toolbar' }, upButton, pathEl, newFolderButton),
         newFolderRow,
-        listEl)),
+        listEl),
+      trustNotice),
     h('div', { class: 'newsession-grid' },
       h('label', { class: 'field' },
         h('span', { class: 'field-label', text: t('shell.newSession.name') }),

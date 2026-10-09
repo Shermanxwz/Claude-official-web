@@ -121,7 +121,8 @@ openPanel(name, { api, store, t, actions })   // panels.js: 'session'|'capabilit
 actions = {
   selectSession(sessionId),            // switch view, reload timeline, reconnect SSE with watch + after
   newSession(),                        // opens the new-session dialog
-  sendMessage({ text, attachments }),  // generates clientMessageId (crypto.randomUUID), optimistic render, POST
+  sendMessage({ text, attachments, clientMessageId }),  // reuses clientMessageId when given (retry of a lost
+                                       // response must not duplicate the turn), else crypto.randomUUID(); POST
   interrupt(),                         // POST /interrupt for the current session
   updateSettings({ model, permissionMode, effort }),
   openRewind(userMessageId?), openFork(upToMessageId?),   // timeline/rewind.js dialogs

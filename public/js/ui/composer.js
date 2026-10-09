@@ -1,7 +1,8 @@
 import { errorText } from '../api.js';
 import { clear, h, icon } from '../dom.js';
 import {
-  applyCompletion, detectTrigger, draftKey, filterCommands, formatBytes, isSendShortcut, mergeCommands,
+  applyCompletion, detachChip, detectTrigger, draftKey, filterCommands, formatBytes, isSendShortcut, joinRestoredText,
+  mergeCommands,
 } from './composer-logic.js';
 import { highlightText, openPalette } from './palette.js';
 
@@ -46,12 +47,39 @@ const HEADER_CONTROLS = { model: '.hdr-model', permissions: '.hdr-mode', effort:
  * @property {'uploading'|'done'|'error'} status
  * @property {number} progress          0..1 while uploading
  * @property {string|null} path         absolute path returned by the upload
- * @property {string|null} error        localized message when status is 'error'
+ * @property {string|null} error        localized message when status is 'error'; null if a remount cut the upload short
  * @property {boolean} retryable
  * @property {string|null} previewUrl   object URL for image thumbnails
  * @property {AbortController|null} controller
  * @property {{root: HTMLElement, fill: HTMLElement, meta: HTMLElement}|null} el
  */
+
+/**
+ * Per-session composer state that outlives a mount: the attachments waiting to be sent, the suggestion and the last
+ * sent text. A composer that is remounted, for example after a language change, finds what the previous one left. An
+ * object URL is released only when its chip is removed or sent.
+ * @type {Map<string, {chips: Chip[], suggestion: string|null, lastSent: string}>}
+ */
+const records = new Map();
+
+/**
+ * Composers on screen. A send that fails after its composer was replaced hands its text to the composer that shows the
+ * session.
+ * @type {Set<(id: string, text: string) => boolean>}
+ */
+const mounts = new Set();
+
+/**
+ * @param {string} id
+ * @param {string} text
+ * @returns {boolean} whether a mounted composer shows the session and took the text
+ */
+function restoreIntoMounted(id, text) {
+  for (const restore of mounts) {
+    if (restore(id, text)) return true;
+  }
+  return false;
+}
 
 /** @param {string} query */
 function matchesMedia(query) {
@@ -88,7 +116,7 @@ function revokeChip(chip) {
  */
 function chipStatusText(chip, t) {
   if (chip.status === 'uploading') return t('composer.attach.uploading', { percent: Math.round(chip.progress * 100) });
-  if (chip.status === 'error') return chip.error ?? '';
+  if (chip.status === 'error') return chip.error ?? t('composer.attach.interrupted');
   return formatBytes(chip.size);
 }
 
@@ -108,8 +136,6 @@ function chipStatusText(chip, t) {
  *   setSuggestion: (text: string|null) => void, destroy: () => void}}
  */
 export function createComposer({ container, api, store, t, actions }) {
-  /** @type {Map<string, {chips: Chip[], suggestion: string|null, lastSent: string}>} */
-  const records = new Map();
   const view = { id: /** @type {string|null} */ (null), disposed: false, capsRef: undefined, dragDepth: 0 };
   let palette = /** @type {ReturnType<typeof openPalette>|null} */ (null);
   let paletteKind = /** @type {'slash'|'mention'|null} */ (null);
@@ -197,6 +223,7 @@ export function createComposer({ container, api, store, t, actions }) {
     input.placeholder = t(compact ? 'composer.placeholderShort' : 'composer.placeholder');
   });
   const unsubscribe = store.subscribe(onStoreChange);
+  mounts.add(restoreText);
   sync();
 
   // ---- state
@@ -702,6 +729,22 @@ export function createComposer({ container, api, store, t, actions }) {
   }
 
   /**
+   * Puts a message that failed to send back into this composer, when it shows the session that sent it.
+   * @param {string} id
+   * @param {string} text
+   * @returns {boolean}
+   */
+  function restoreText(id, text) {
+    if (view.disposed || view.id !== id) return false;
+    input.value = joinRestoredText(text, input.value);
+    renderChips();
+    onTextChanged();
+    return true;
+  }
+
+  /**
+   * A send that the shell rejected unexpectedly: its attachments and text come back. A composer that shows the session
+   * takes the text in place; otherwise the text is kept as that session's draft.
    * @param {string} id
    * @param {string} text
    * @param {Chip[]} chips
@@ -710,13 +753,7 @@ export function createComposer({ container, api, store, t, actions }) {
   function restoreAfterFailure(id, text, chips, err) {
     const record = recordFor(id);
     record.chips = [...chips, ...record.chips];
-    if (view.id === id && !view.disposed) {
-      input.value = input.value.trim() ? `${text}\n${input.value}` : text;
-      renderChips();
-      onTextChanged();
-    } else {
-      saveDraft(id, text);
-    }
+    if (!restoreIntoMounted(id, text) && text) saveDraft(id, joinRestoredText(text, loadDraft(id)));
     actions.toast(errorText(err, t), 'error');
     sync();
   }
@@ -995,15 +1032,13 @@ export function createComposer({ container, api, store, t, actions }) {
       view.disposed = true;
       unsubscribe();
       stopPlaceholderWatch();
+      mounts.delete(restoreText);
       if (mentionTimer) clearTimeout(mentionTimer);
       closePalette();
+      // The chips outlive this composer with their thumbnails, so object URLs stay until a chip is removed or sent.
       for (const record of records.values()) {
-        for (const chip of record.chips) {
-          chip.controller?.abort();
-          revokeChip(chip);
-        }
+        for (const chip of record.chips) detachChip(chip)?.abort();
       }
-      records.clear();
       root.remove();
     },
   };

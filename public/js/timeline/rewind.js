@@ -5,7 +5,8 @@
 import { h, clear } from '../dom.js';
 import { errorText } from '../api.js';
 import { openDialog } from '../ui/dialog.js';
-import { truncateMiddle } from './format.js';
+import { truncateMiddle, pluralKey } from './format.js';
+import { getLocale } from '../i18n.js';
 import { isRecord } from './tools/summaries.js';
 import { TIMELINE_RELOAD_EVENT } from './view.js';
 
@@ -135,7 +136,7 @@ export function openRewindDialog({ api, sessionId, userMessageId, t, actions }) 
       class: 'rewind-note',
       text: total === 0
         ? t('cards.rewind.preview.none')
-        : t('cards.rewind.preview.summary', { files: total, insertions: current.insertions, deletions: current.deletions }),
+        : t(pluralKey('cards.rewind.preview.summary', total, getLocale()), { files: total, insertions: current.insertions, deletions: current.deletions }),
     }));
     if (total > 0) {
       previewEl.append(h('ul', { class: 'rewind-files' }, current.files.slice(0, LISTED_FILES).map((file) => h('li', {},

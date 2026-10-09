@@ -103,6 +103,8 @@ function makeWorkspaces() {
   /** @type {Array<{name: string, args: any[]}>} */
   const calls = [];
   const record = (/** @type {string} */ name, /** @type {any[]} */ ...args) => calls.push({ name, args });
+  /** @type {Set<string>} */
+  const trusted = new Set();
   return {
     calls,
     roots: [root],
@@ -123,6 +125,16 @@ function makeWorkspaces() {
     search: async (/** @type {string} */ cwd, /** @type {string} */ q, /** @type {number} */ limit) => {
       record('search', cwd, q, limit);
       return { results: [] };
+    },
+    isTrusted: async (/** @type {string} */ p) => {
+      record('isTrusted', p);
+      return trusted.has(p);
+    },
+    setTrusted: async (/** @type {string} */ p, /** @type {boolean} */ value) => {
+      record('setTrusted', p, value);
+      if (value) trusted.add(p);
+      else trusted.delete(p);
+      return { path: p, trusted: value };
     },
   };
 }
@@ -198,7 +210,7 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
   const sink = [];
   const log = createLogger({ level: 'debug', stream: { write: (/** @type {string} */ line) => sink.push(line) } });
   const events = new EventHub({ bootId: BOOT, version: config.version, log, heartbeatMs: 60000 });
-  const auth = createAuth(config, { log, bootId: BOOT });
+  const auth = await createAuth(config, { log, bootId: BOOT });
   const engineHost = makeEngineHost();
   const workspaces = makeWorkspaces();
   const attachments = makeAttachments();
@@ -593,7 +605,7 @@ describe('input validation', () => {
       await login(ctx);
       const bad = [
         '/api/sessions?limit=0',
-        '/api/sessions?limit=1001',
+        '/api/sessions?limit=501',
         '/api/sessions?offset=-1',
         `/api/sessions/${SESSION}/messages?tail=5&before=3`,
         `/api/sessions/${SESSION}/messages?limit=5`,
@@ -1060,6 +1072,110 @@ describe('event stream endpoint', () => {
       await login(ctx);
       assert.equal((await request(ctx, 'GET', '/api/events?watch=nope', {})).status, 400);
       assert.equal((await request(ctx, 'GET', '/api/events?after=x', {})).status, 400);
+    });
+  });
+});
+
+describe('host validation', () => {
+  it('answers 421 HOST_REJECTED for names that are neither loopback nor the public origin', async () => {
+    await withApp({}, async (ctx) => {
+      for (const target of ['/healthz', '/api/session', '/', '/api/meta']) {
+        const response = await request(ctx, 'GET', target, { cookie: false, headers: { Host: 'evil.example' } });
+        assert.equal(response.status, 421, target);
+        assert.equal(response.json.error.code, 'HOST_REJECTED', target);
+        assertSecurityHeaders(response.headers);
+      }
+      const loopback = await request(ctx, 'GET', '/healthz', { cookie: false, headers: { Host: 'LOCALHOST:9' } });
+      assert.equal(loopback.status, 200);
+      const lookalike = await request(ctx, 'GET', '/healthz', { cookie: false, headers: { Host: '127.0.0.1.nip.io' } });
+      assert.equal(lookalike.status, 421);
+    });
+  });
+
+  it('accepts exactly the host[:port] of CAW_PUBLIC_ORIGIN as well as loopback names', async () => {
+    await withApp({ publicOrigin: 'https://gw.example:8443' }, async (ctx) => {
+      const allowed = await request(ctx, 'GET', '/healthz', { cookie: false, headers: { Host: 'gw.example:8443' } });
+      assert.equal(allowed.status, 200);
+      const otherPort = await request(ctx, 'GET', '/healthz', { cookie: false, headers: { Host: 'gw.example:9443' } });
+      assert.equal(otherPort.status, 421);
+      const noPort = await request(ctx, 'GET', '/healthz', { cookie: false, headers: { Host: 'gw.example' } });
+      assert.equal(noPort.status, 421);
+    });
+  });
+
+  it('refuses a WebSocket upgrade with a foreign Host using a bare 421 status line', async () => {
+    await withApp({ profile: 'full', terminal: true }, async (ctx) => {
+      await login(ctx);
+      const reply = await rawExchange(ctx.port, upgradeHead(ctx, { Cookie: ctx.cookie, Host: 'evil.example' }));
+      assert.match(reply, /^HTTP\/1\.1 421 Misdirected Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n$/);
+      assert.equal(ctx.terminal.calls.length, 0);
+    });
+  });
+});
+
+describe('workspace trust routes', () => {
+  it('reports trust to read clients and changes it for standard and above', async () => {
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      const query = `/api/fs/trust?path=${encodeURIComponent(root)}`;
+      assert.deepEqual((await request(ctx, 'GET', query, {})).json, { path: root, trusted: false });
+      const trusted = await request(ctx, 'POST', '/api/fs/trust', { body: { path: root, trusted: true } });
+      assert.deepEqual(trusted.json, { path: root, trusted: true });
+      assert.deepEqual((await request(ctx, 'GET', query, {})).json, { path: root, trusted: true });
+      assert.deepEqual(ctx.workspaces.calls.filter((call) => call.name !== 'resolveDir').map((call) => call.name),
+        ['isTrusted', 'setTrusted', 'isTrusted']);
+    });
+  });
+
+  it('lets read clients query trust but not change it', async () => {
+    await withApp({ profile: 'read' }, async (ctx) => {
+      await login(ctx);
+      assert.equal((await request(ctx, 'GET', `/api/fs/trust?path=${encodeURIComponent(root)}`, {})).status, 200);
+      const change = await request(ctx, 'POST', '/api/fs/trust', { body: { path: root, trusted: true } });
+      assert.equal(change.status, 403);
+      assert.equal(change.json.error.code, 'FORBIDDEN');
+      assert.equal(ctx.workspaces.calls.some((call) => call.name === 'setTrusted'), false);
+    });
+  });
+
+  it('validates the path and the trusted flag', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      assert.equal((await request(ctx, 'GET', '/api/fs/trust', {})).status, 400);
+      assert.equal((await request(ctx, 'POST', '/api/fs/trust', { body: { path: root } })).status, 400);
+      assert.equal((await request(ctx, 'POST', '/api/fs/trust', { body: { path: root, trusted: 'yes' } })).status, 400);
+      assert.equal((await request(ctx, 'POST', '/api/fs/trust', { body: { trusted: true } })).status, 400);
+      assert.equal(ctx.workspaces.calls.length, 0);
+    });
+  });
+});
+
+describe('event stream limits over HTTP', () => {
+  it('answers 429 TOO_MANY_STREAMS as JSON once one client address holds 16 streams', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const streams = [];
+      try {
+        for (let index = 0; index < 16; index += 1) {
+          const stream = openStream(ctx, '/api/events');
+          streams.push(stream);
+          await stream.waitFor(/event: hello/);
+        }
+        const refused = await request(ctx, 'GET', '/api/events', {});
+        assert.equal(refused.status, 429);
+        assert.equal(refused.json.error.code, 'TOO_MANY_STREAMS');
+        assert.match(String(refused.headers['content-type']), /^application\/json/);
+      } finally {
+        for (const stream of streams) stream.close();
+      }
+    });
+  });
+
+  it('accepts a session page of up to 500 entries', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      assert.equal((await request(ctx, 'GET', '/api/sessions?limit=500', {})).status, 200);
+      assert.equal(ctx.engineHost.calls.at(-1)?.args[0].limit, 500);
     });
   });
 });

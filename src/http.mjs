@@ -17,6 +17,8 @@ import { secureHeaders } from './security.mjs';
 /** @typedef {import('./contracts.mjs').AccessProfile} AccessProfile */
 
 const DEFAULT_READ_LIMIT = 1048576;
+/** Longest silence allowed while a request body is still arriving (docs/PROTOCOL.md). */
+export const BODY_IDLE_TIMEOUT_MS = 30000;
 const JSON_SUBTYPE_RE = /^application\/[a-z0-9.!#$&^_+-]+\+json$/;
 
 /**
@@ -87,20 +89,25 @@ function mayHaveBody(req) {
 }
 
 /**
- * Collects the request body, failing with 413 as soon as it exceeds the limit.
+ * Collects the request body. Fails with 413 as soon as it exceeds the limit, and with 400 when no chunk arrives for
+ * `idleMs`: the request is then destroyed, so the connection closes without a response (no 408).
  * @param {IncomingMessage} req
  * @param {number} limit
+ * @param {number} idleMs
  * @returns {Promise<Buffer>}
  */
-function collectBody(req, limit) {
+function collectBody(req, limit, idleMs) {
   return new Promise((resolve, reject) => {
     /** @type {Buffer[]} */
     const chunks = [];
     let size = 0;
     let settled = false;
+    /** @type {ReturnType<typeof setTimeout>|undefined} */
+    let idleTimer;
 
     // The error listener stays attached: an error emitted after settling must not become an uncaught exception.
     const cleanup = () => {
+      clearTimeout(idleTimer);
       req.off('data', onData);
       req.off('end', onEnd);
       req.off('close', onClose);
@@ -113,8 +120,16 @@ function collectBody(req, limit) {
       if (error) reject(error);
       else resolve(value ?? Buffer.alloc(0));
     };
+    const armIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        req.destroy();
+        settle(new AppError(400, 'BAD_REQUEST', 'Request body timed out'));
+      }, idleMs);
+    };
     /** @param {Buffer} chunk */
     const onData = (chunk) => {
+      armIdle();
       size += chunk.length;
       if (size > limit) {
         // Stop reading; the 413 response carries Connection: close so the rest of the upload is dropped.
@@ -132,6 +147,7 @@ function collectBody(req, limit) {
     req.on('end', onEnd);
     req.on('error', onError);
     req.on('close', onClose);
+    armIdle();
   });
 }
 
@@ -140,12 +156,14 @@ function collectBody(req, limit) {
  * - No body → `{}`.
  * - Media type must be application/json or application/*+json (415 otherwise).
  * - Bodies over `limit` bytes → 413.
+ * - No data for `idleTimeoutMs` (30 s by default) → 400 'Request body timed out'; the connection is closed.
  * - Invalid JSON, or JSON that is not an object → 400.
  * @param {IncomingMessage} req
  * @param {number} [limit]
+ * @param {{idleTimeoutMs?: number}} [options]
  * @returns {Promise<Record<string, unknown>>}
  */
-export async function readJson(req, limit = DEFAULT_READ_LIMIT) {
+export async function readJson(req, limit = DEFAULT_READ_LIMIT, { idleTimeoutMs = BODY_IDLE_TIMEOUT_MS } = {}) {
   if (!mayHaveBody(req)) return {};
   const type = mediaTypeOf(req);
   if (type !== 'application/json' && !JSON_SUBTYPE_RE.test(type)) {
@@ -155,7 +173,7 @@ export async function readJson(req, limit = DEFAULT_READ_LIMIT) {
   if (Number.isFinite(declared) && declared > limit) {
     throw new AppError(413, 'PAYLOAD_TOO_LARGE', `Request body must be at most ${limit} bytes`);
   }
-  const body = await collectBody(req, limit);
+  const body = await collectBody(req, limit, idleTimeoutMs);
   if (body.length === 0) return {};
   /** @type {unknown} */
   let parsed;
@@ -168,6 +186,35 @@ export async function readJson(req, limit = DEFAULT_READ_LIMIT) {
     throw new AppError(400, 'BAD_REQUEST', 'Request body must be a JSON object');
   }
   return /** @type {Record<string, unknown>} */ (parsed);
+}
+
+/**
+ * Runs `consume`, which reads the request body, under the body inactivity limit for streams this module does not read
+ * itself (uploads). While it runs, a socket that stays silent for `idleMs` destroys the request, and the result rejects
+ * with AppError 400 'Request body timed out'. The limit is lifted when `consume` settles, so a slow handler that runs
+ * after the body has been read is not affected.
+ * @template T
+ * @param {IncomingMessage} req
+ * @param {() => Promise<T>} consume
+ * @param {number} [idleMs]
+ * @returns {Promise<T>}
+ */
+export async function withBodyIdleLimit(req, consume, idleMs = BODY_IDLE_TIMEOUT_MS) {
+  let idle = false;
+  const onIdle = () => {
+    idle = true;
+    req.destroy();
+  };
+  req.setTimeout(idleMs, onIdle);
+  try {
+    return await consume();
+  } catch (error) {
+    if (idle) throw new AppError(400, 'BAD_REQUEST', 'Request body timed out');
+    throw error;
+  } finally {
+    req.off('timeout', onIdle);
+    req.setTimeout(0);
+  }
 }
 
 /**

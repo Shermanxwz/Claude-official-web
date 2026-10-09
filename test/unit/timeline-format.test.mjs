@@ -7,7 +7,16 @@ import {
   relativeTime,
   truncateMiddle,
   stripAnsi,
+  pluralKey,
 } from '../../public/js/timeline/format.js';
+
+test('pluralKey picks the one or other form of a count-aware message in the locale', () => {
+  assert.equal(pluralKey('cards.task.tools', 1, 'en'), 'cards.task.tools.one');
+  assert.equal(pluralKey('cards.task.tools', 0, 'en'), 'cards.task.tools.other');
+  assert.equal(pluralKey('cards.task.tools', 2, 'en'), 'cards.task.tools.other');
+  assert.equal(pluralKey('cards.task.tools', 1, 'zh-CN'), 'cards.task.tools.other', 'zh-CN has no separate singular');
+  assert.equal(pluralKey('cards.task.tools', 1, 'not a locale!!'), 'cards.task.tools.one', 'an unusable tag keeps the English split');
+});
 
 test('formatDuration renders milliseconds, seconds, minutes and hours', () => {
   assert.equal(formatDuration(0), '0 ms');

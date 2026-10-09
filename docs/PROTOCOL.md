@@ -12,6 +12,10 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 - Errors always use status + body `{ "error": { "code": string, "message": string } }`. Messages are human readable
   English; the UI maps known codes to localized text. Stack traces are never returned.
 - Session ids are UUIDs. Any path segment that should be a UUID but is not → `400 BAD_REQUEST`.
+- `Host` must be a loopback name (`127.0.0.1`, `localhost`, `[::1]`, any port) or the host of `CAW_PUBLIC_ORIGIN`;
+  otherwise `421 HOST_REJECTED`. This blocks DNS-rebinding attacks, notably against demo mode without auth.
+- Request bodies must arrive within 30 s of inactivity between chunks, otherwise `408` is not sent; the connection is
+  closed. Session routes for sessions whose `cwd` lies outside the workspace roots answer `404 SESSION_NOT_FOUND`.
 - Body limit: 1 MiB for JSON (`413 PAYLOAD_TOO_LARGE`). Uploads have their own limit.
 
 ### Error codes
@@ -23,6 +27,7 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 | 401 | `INVALID_TOKEN` | wrong login token |
 | 403 | `ORIGIN_REJECTED` | Origin check failed |
 | 403 | `FORBIDDEN` | access profile does not allow this action |
+| 421 | `HOST_REJECTED` | `Host` header is not an allowed name (DNS-rebinding protection) |
 | 404 | `NOT_FOUND` / `SESSION_NOT_FOUND` / `REQUEST_NOT_FOUND` | unknown route / session / pending request |
 | 409 | `SESSION_LOCKED` | terminal holds the session |
 | 409 | `SESSION_NOT_LIVE` | action needs a live session (call `open` first) |
@@ -34,6 +39,7 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 | 422 | `CANNOT_REWIND` | rewind target invalid |
 | 429 | `RATE_LIMITED` | login attempts exceeded (`Retry-After` header) |
 | 429 | `TOO_MANY_SESSIONS` | live session limit reached and none idle |
+| 429 | `TOO_MANY_STREAMS` | event-stream limit reached (64 total, 16 per client address) |
 | 500 | `INTERNAL` | unexpected error |
 | 501 | `FEATURE_DISABLED` | terminal / bypass / feature not enabled |
 | 502 | `ENGINE_ERROR` | Claude Code / SDK call failed (message is safe summary) |
@@ -82,6 +88,14 @@ Lists sub-directories (not files) of `path`, which must be a root or inside a ro
 `isProject` is true when the directory contains `.git`, `.claude`, `CLAUDE.md` or `package.json`. Hidden directories
 (name starts with `.`) are omitted. Max 500 entries, sorted by name.
 
+### `GET /api/fs/trust?path=<abs>` → `{ path: string, trusted: boolean }`
+### `POST /api/fs/trust` `{ path: string, trusted: boolean }` → `{ path: string, trusted: boolean }` (profile `standard`+)
+Folder trust mirrors Claude Code's own trust dialog. A session whose cwd is trusted (the folder itself or any parent
+was trusted) starts with `settingSources: ['user', 'project', 'local']`; an untrusted one starts with `['user']`, so
+project hooks, MCP servers, settings, skills and CLAUDE.md of an unknown repository never run without consent.
+`LiveInfo.trusted` reports what the live query was started with; trusting a folder applies to sessions (re)opened
+afterwards (the UI closes and reopens the current session).
+
 ### `POST /api/fs/mkdir` `{ parent: string, name: string }` → `{ path: string }`
 `name`: 1–100 chars, `[A-Za-z0-9._ -]`, not `.`/`..`. Profile `standard`+.
 
@@ -97,7 +111,7 @@ type LiveState = 'starting'|'idle'|'running'|'requires_action'|'closing'|'error'
 type LiveInfo = { sessionId: string, cwd: string, state: LiveState, model: string|null,
   permissionMode: PermissionMode, effort: EffortLevel|null, title: string|null,
   lockedBy: 'terminal'|null, pendingCount: number, lastActivity: number,
-  claudeCodeVersion: string|null, error: { code: string, message: string } | null };
+  claudeCodeVersion: string|null, error: { code: string, message: string } | null, trusted: boolean };
 type SessionSummary = SDKSessionInfo & { live: LiveInfo | null };
 type PendingRequest = {
   id: string, sessionId: string, kind: 'permission'|'question'|'plan'|'elicitation', createdAt: number,
@@ -158,7 +172,9 @@ Body depends on the request kind:
 ```ts
 // permission
 { decision: 'allow' | 'allow_always' | 'deny', message?: string, updatedInput?: Record<string, unknown>,
-  suggestionIndexes?: number[] /* which suggestions to persist for allow_always; default: all */, interrupt?: boolean }
+  suggestionIndexes?: number[] /* suggestions to persist for allow_always; default: only addRules/replaceRules
+                                   suggestions — directory and mode suggestions are applied only when selected */,
+  interrupt?: boolean }
 // question (AskUserQuestion)
 { answers: Record<string, string | string[]>, response?: string } | { decline: true }
 // plan (ExitPlanMode)
@@ -172,6 +188,9 @@ question → allow with `updatedInput: {...input, answers, response?}`, decline 
 `setPermissionMode(nextMode)` when given, reject → deny with the feedback message.
 
 ### `GET /api/sessions/:id/context` → `SDKControlGetContextUsageResponse` (`409 SESSION_NOT_LIVE` if not live)
+Control calls to the runtime time out after 10 s (`502 ENGINE_ERROR`; capabilities fall back to `stale: true`).
+When the runtime reports rejected credentials (`system/api_retry` or an assistant `error` of an authentication class)
+the gateway publishes a `notice` with code `ENGINE_UNAVAILABLE` and sets `LiveInfo.error`.
 
 ### `GET /api/sessions/:id/capabilities`
 ```ts
@@ -232,7 +251,8 @@ Global events are delivered to every client; `sdk` events only for the watched s
 | `terminal_state` | `{ sessionId, attached: boolean }` | global |
 
 Per-client queues are bounded (1 MiB); a client that falls behind is disconnected and must reconnect (it then gets
-`resync` if events were dropped). The replay buffer holds the most recent 5 000 events.
+`resync` if events were dropped). The replay buffer holds the most recent 5 000 events. At most 64 streams are open
+at once and 16 per client address (`429 TOO_MANY_STREAMS`).
 
 ## Terminal (optional)
 

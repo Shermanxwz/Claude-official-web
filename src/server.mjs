@@ -97,8 +97,8 @@ export async function startServer({ env = process.env, engine, listenHost, liste
   const adapter = engine ?? (config.engine === 'mock'
     ? (await import('./engine/mock/index.mjs')).createMockAdapter({ config, log, delayMs: mockDelay(env) })
     : (await import('./engine/sdk-adapter.mjs')).createSdkAdapter({ config, log }));
-  const workspaces = (await import('./workspaces.mjs')).createWorkspaces(config);
-  const stateStore = await (await import('./state.mjs')).createStateStore(config.stateDir);
+  const stateStore = (await import('./state.mjs')).createStateStore(config.stateDir);
+  const workspaces = (await import('./workspaces.mjs')).createWorkspaces(config, { stateStore });
   const attachments = (await import('./attachments.mjs')).createAttachments({ config, log, workspaces, stateStore });
   const { EngineHost } = await import('./engine/host.mjs');
   const engineHost = new EngineHost({
@@ -108,11 +108,12 @@ export async function startServer({ env = process.env, engine, listenHost, liste
     publish,
     getSeq: () => events.lastSeq,
     isAllowedCwd: (/** @type {string} */ p) => workspaces.isInsideRoots(p),
+    isTrustedCwd: (/** @type {string} */ p) => workspaces.isTrusted(p),
   });
   const terminal = await (await import('./terminal.mjs')).createTerminal({ config, log, engineHost, publish });
   const maintenance = await (await import('./maintenance.mjs'))
     .startMaintenance({ config, log, attachments, engineHost });
-  const auth = createAuth(config, { log, bootId });
+  const auth = await createAuth(config, { log, bootId, stateStore });
   const app = createApp({
     config, log, engine: adapter, engineHost, events, auth, workspaces, attachments, terminal, bootId,
     publicDir: PUBLIC_DIR,

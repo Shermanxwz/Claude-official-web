@@ -42,6 +42,7 @@ const FALLBACK_CODES = /** @type {Record<number, string>} */ ({
   404: 'NOT_FOUND',
   413: 'PAYLOAD_TOO_LARGE',
   415: 'UNSUPPORTED_MEDIA_TYPE',
+  421: 'HOST_REJECTED',
   429: 'RATE_LIMITED',
 });
 

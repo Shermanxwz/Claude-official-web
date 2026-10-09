@@ -5,8 +5,8 @@
  */
 
 import { AppError, EFFORT_LEVELS, PERMISSION_MODES, isUuid } from './contracts.mjs';
-import { createRouter, parseUrl, readJson, sendError, sendJson, serveStatic } from './http.mjs';
-import { secureHeaders } from './security.mjs';
+import { createRouter, parseUrl, readJson, sendError, sendJson, serveStatic, withBodyIdleLimit } from './http.mjs';
+import { isAllowedHost, secureHeaders } from './security.mjs';
 
 /** @typedef {import('node:http').IncomingMessage} IncomingMessage */
 /** @typedef {import('node:http').ServerResponse} ServerResponse */
@@ -349,8 +349,8 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   });
 
   // Any signed-in client.
-  router.add('POST', '/api/logout', ({ req, res }) => {
-    auth.logout(req, res);
+  router.add('POST', '/api/logout', async ({ req, res }) => {
+    await auth.logout(req, res);
     return HANDLED;
   }, { profile: 'read' });
 
@@ -360,6 +360,7 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
     const watch = url.searchParams.get('watch');
     if (watch !== null && !isUuid(watch)) throw badRequest('watch must be a session UUID');
     events.attach(req, res, {
+      clientAddress: auth.clientAddress(req),
       watch: watch ?? undefined,
       after: queryInteger(url.searchParams, 'after', 0, 999999999999),
       lastEventId: lastEventIdHeader(req),
@@ -375,10 +376,14 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
     if (q.length > 200) throw badRequest('q must be at most 200 characters');
     return workspaces.search(cwd, q, queryInteger(url.searchParams, 'limit', 1, 200) ?? 50);
   }, { profile: 'read' });
+  router.add('GET', '/api/fs/trust', async ({ url }) => {
+    const folder = pathValue(url.searchParams.get('path'), 'path');
+    return { path: folder, trusted: await workspaces.isTrusted(folder) };
+  }, { profile: 'read' });
   router.add('GET', '/api/sessions', async ({ url }) => {
     const options = definedOnly({
       cwd: optionalPathQuery(url.searchParams.get('cwd')) ?? undefined,
-      limit: queryInteger(url.searchParams, 'limit', 1, 1000) ?? 100,
+      limit: queryInteger(url.searchParams, 'limit', 1, 500) ?? 100,
       offset: queryInteger(url.searchParams, 'offset', 0, 1000000) ?? 0,
     });
     return { sessions: await engineHost.listSessions(options) };
@@ -417,6 +422,12 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
       throw new AppError(422, 'INVALID_ARGUMENT', 'Folder names use letters, digits, dot, underscore, space or hyphen');
     }
     return workspaces.mkdir(parent, name);
+  }, { profile: 'standard' });
+  router.add('POST', '/api/fs/trust', async ({ req }) => {
+    const body = await readJson(req);
+    const folder = pathValue(body.path, 'path');
+    const trusted = booleanValue(body.trusted, 'trusted');
+    return workspaces.setTrusted(folder, trusted);
   }, { profile: 'standard' });
   router.add('POST', '/api/sessions', async ({ req }) => {
     const body = await readJson(req);
@@ -519,7 +530,7 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
     const cwd = await workspaces.resolveDir(pathValue(url.searchParams.get('cwd'), 'cwd'));
     const fileName = fileNameHeader(req.headers['x-file-name']);
     const mediaType = uploadMediaType(req.headers['content-type']);
-    return attachments.save(req, { cwd, fileName, mediaType });
+    return withBodyIdleLimit(req, () => attachments.save(req, { cwd, fileName, mediaType }));
   }, { profile: 'standard' });
 
   // full
@@ -536,6 +547,10 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
    * @param {ServerResponse} res
    */
   async function dispatch(req, res) {
+    if (!isAllowedHost(req.headers.host, config.publicOrigin)) {
+      log.warn('request host rejected');
+      throw new AppError(421, 'HOST_REJECTED', 'The Host header is not allowed');
+    }
     const url = parseUrl(req);
     const { pathname } = url;
     const method = req.method ?? '';
@@ -586,6 +601,11 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
      * @param {Buffer} head
      */
     handleUpgrade(req, socket, head) {
+      if (!isAllowedHost(req.headers.host, config.publicOrigin)) {
+        log.warn('upgrade host rejected');
+        rejectUpgrade(socket, 421, 'Misdirected Request');
+        return;
+      }
       let url;
       try {
         url = parseUrl(req);

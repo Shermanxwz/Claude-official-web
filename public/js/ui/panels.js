@@ -297,6 +297,11 @@ export function closePanel() {
   activeSheet?.close();
 }
 
+/** @returns {boolean} true while a side sheet is open */
+export function hasOpenSheet() {
+  return activeSheet !== null;
+}
+
 /**
  * @param {Record<string, any>} ctx
  * @returns {(() => void) | undefined}
@@ -413,10 +418,13 @@ function sessionPanel({ body, api, store, t, actions, close, reload }) {
       live && canFork ? actionButton(t('shell.session.closeLive'), 'stop', async () => {
         try {
           await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/close`, {});
-          reportError(t('shell.session.closed'), 'success');
         } catch (err) {
           reportError(errorText(err, t), 'error');
+          return;
         }
+        reportError(t('shell.session.closed'), 'success');
+        // The sidebar state dot and the Delete availability come from the session list, so reload it now.
+        refreshSessionList({ api, store }).catch((err) => reportError(errorText(err, t), 'error'));
       }) : null,
       canDelete ? actionButton(t('shell.session.delete'), 'trash', () => {
         deleteSessionFlow({
@@ -887,6 +895,7 @@ function settingsPanel({ body, api, store, t, actions }) {
   const localeSelect = h('select', {
     class: 'select',
     attrs: { 'aria-label': t('shell.settings.language') },
+    dataset: { focusKey: 'locale' },
     on: {
       change: (event) => {
         const value = /** @type {HTMLSelectElement} */ (event.target).value;
@@ -1032,8 +1041,9 @@ export function openPanel(name, { api, store, t, actions }) {
 
   /** @param {KeyboardEvent} event */
   function onKeydown(event) {
+    // A dialog opened from the sheet (for example the delete confirmation) owns the keyboard until it closes.
+    if (hasOpenDialog()) return;
     if (event.key === 'Escape') {
-      if (hasOpenDialog()) return;
       event.preventDefault();
       close();
       return;
@@ -1078,7 +1088,13 @@ export function openPanel(name, { api, store, t, actions }) {
   document.addEventListener('keydown', onKeydown);
   mountBody();
   disposeLocale = onLocaleChange(() => {
-    if (!closed) mountBody();
+    if (closed) return;
+    // Re-rendering replaces the focused control, so focus the element with the same key afterwards.
+    const focused = document.activeElement;
+    const focusKey = focused instanceof HTMLElement && bodyEl.contains(focused) ? focused.dataset.focusKey : undefined;
+    mountBody();
+    closeButton.setAttribute('aria-label', t('common.close'));
+    if (focusKey) bodyEl.querySelector(`[data-focus-key="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
   });
   sheet.focus({ preventScroll: true });
   return handle;

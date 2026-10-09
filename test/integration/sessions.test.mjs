@@ -60,7 +60,7 @@ describe('sessions: lifecycle', { timeout: 120000 }, () => {
     assert.equal(res.status, 200);
     const live = res.json.live;
     assert.deepEqual(Object.keys(live).sort(), ['claudeCodeVersion', 'cwd', 'effort', 'error', 'lastActivity',
-      'lockedBy', 'model', 'pendingCount', 'permissionMode', 'sessionId', 'state', 'title']);
+      'lockedBy', 'model', 'pendingCount', 'permissionMode', 'sessionId', 'state', 'title', 'trusted']);
     assert.ok(isUuid(live.sessionId));
     assert.equal(live.cwd, server.proj);
     assert.ok(['starting', 'idle'].includes(live.state), live.state);

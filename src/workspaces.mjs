@@ -5,6 +5,7 @@ import { AppError, UPLOAD_DIR_NAME } from './contracts.mjs';
 
 /** @typedef {import('./contracts.mjs').Config} Config */
 /** @typedef {import('./contracts.mjs').WorkspacesApi} WorkspacesApi */
+/** @typedef {import('./state.mjs').StateStore} StateStore */
 
 /**
  * @typedef {Object} Containment
@@ -31,6 +32,9 @@ const SEARCH_MAX_QUERY = 256;
 const SEARCH_DEFAULT_LIMIT = 50;
 const SEARCH_MAX_LIMIT = 200;
 const WORD_BOUNDARIES = new Set(['/', '.', '-', '_', ' ']);
+const TRUST_STATE = 'trusted-dirs';
+const TRUST_LIMIT = 1000;
+const PATH_MAX_LENGTH = 4096;
 
 /** @returns {AppError} */
 function notAllowed() {
@@ -505,13 +509,162 @@ async function searchFiles(containment, cwd, q, limit) {
 }
 
 /**
- * Workspace filesystem services: root containment, directory browsing, directory creation and file mention search.
- * Every path the caller supplies is resolved with realpath and must stay inside a configured root.
+ * @param {string} dir
+ * @returns {string}
+ */
+function prefixOf(dir) {
+  return dir.endsWith(path.sep) ? dir : dir + path.sep;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is string}
+ */
+function isStoredDir(value) {
+  return typeof value === 'string' && value.length <= PATH_MAX_LENGTH && path.isAbsolute(value)
+    && !value.includes('\0');
+}
+
+/**
+ * Unique entries, oldest first; when there are more than TRUST_LIMIT the newest are kept.
+ * @param {Iterable<unknown>} values
+ * @returns {string[]}
+ */
+function normalizeStoredDirs(values) {
+  /** @type {Map<string, true>} */
+  const unique = new Map();
+  for (const value of values) {
+    if (isStoredDir(value)) {
+      unique.delete(value);
+      unique.set(value, true);
+    }
+  }
+  return [...unique.keys()].slice(-TRUST_LIMIT);
+}
+
+/**
+ * @param {string[]} dirs
+ * @param {string} dir
+ * @returns {string[]} the list with `dir` at the newest position
+ */
+function withNewest(dirs, dir) {
+  return [...dirs.filter((entry) => entry !== dir), dir].slice(-TRUST_LIMIT);
+}
+
+/**
+ * Serialised, cached list of trusted folders. Without a state store the list lives in memory only.
+ * @param {StateStore|undefined} stateStore
+ */
+function createTrustStore(stateStore) {
+  /** @type {Promise<string[]>|null} */
+  let current = null;
+  /** @type {Promise<void>} */
+  let queue = Promise.resolve();
+
+  /** @returns {Promise<string[]>} */
+  function load() {
+    current ??= stateStore ? readStoredTrust(stateStore) : Promise.resolve([]);
+    return current;
+  }
+
+  /**
+   * @param {(dirs: string[]) => string[]} change
+   * @returns {Promise<void>}
+   */
+  function update(change) {
+    const run = queue.then(async () => {
+      const next = change(await load());
+      if (stateStore) {
+        await stateStore.write(TRUST_STATE, { dirs: next });
+      }
+      current = Promise.resolve(next);
+    });
+    queue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  return { load, update };
+}
+
+/**
+ * A missing or corrupt record reads as an empty list.
+ * @param {StateStore} stateStore
+ * @returns {Promise<string[]>}
+ */
+async function readStoredTrust(stateStore) {
+  const state = await stateStore.read(TRUST_STATE, { dirs: /** @type {unknown[]} */ ([]) });
+  return normalizeStoredDirs(Array.isArray(state?.dirs) ? state.dirs : []);
+}
+
+/**
+ * A trusted entry counts only while it still resolves to the same directory; removed or replaced entries are ignored.
+ * @param {string} dir
+ * @returns {Promise<boolean>}
+ */
+async function isLiveDirectory(dir) {
+  try {
+    const real = await fs.promises.realpath(dir);
+    return real === dir && (await fs.promises.stat(dir)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {Containment} containment
+ * @param {ReturnType<typeof createTrustStore>} trust
+ * @param {unknown} p
+ * @returns {Promise<boolean>} true when the realpath equals or lies below a trusted folder; never throws
+ */
+async function isTrustedPath(containment, trust, p) {
+  try {
+    const real = await containment.realpathInside(p);
+    if (real === null) {
+      return false;
+    }
+    for (const entry of await trust.load()) {
+      if ((real === entry || real.startsWith(prefixOf(entry))) && (await isLiveDirectory(entry))) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Records or removes trust for a folder inside the roots. Returns the effective trust afterwards, so a folder that is
+ * still covered by a trusted parent reports true.
+ * @param {Containment} containment
+ * @param {ReturnType<typeof createTrustStore>} trust
+ * @param {unknown} p
+ * @param {unknown} trusted
+ * @returns {Promise<{path: string, trusted: boolean}>}
+ */
+async function setTrustedDir(containment, trust, p, trusted) {
+  if (typeof trusted !== 'boolean') {
+    throw new AppError(422, 'INVALID_ARGUMENT', 'trusted must be a boolean');
+  }
+  const dir = await containment.resolveDir(p);
+  await trust.update((dirs) => (trusted ? withNewest(dirs, dir) : dirs.filter((entry) => entry !== dir)));
+  return { path: dir, trusted: await isTrustedPath(containment, trust, dir) };
+}
+
+/**
+ * Workspace filesystem services: root containment, directory browsing, directory creation, file mention search and
+ * folder trust. Every path the caller supplies is resolved with realpath and must stay inside a configured root.
  * @param {Config} config
+ * @param {{stateStore?: StateStore}} [options] trust is kept in `stateStore` under 'trusted-dirs' when given, else in
+ *   memory
  * @returns {WorkspacesApi}
  */
-export function createWorkspaces(config) {
+export function createWorkspaces(config, { stateStore } = {}) {
+  if (stateStore !== undefined && (typeof stateStore?.read !== 'function' || typeof stateStore?.write !== 'function')) {
+    throw new TypeError('stateStore must provide read and write');
+  }
   const containment = createContainment(config.roots);
+  const trust = createTrustStore(stateStore);
   return {
     roots: [...containment.roots],
     resolveDir: (p) => containment.resolveDir(p),
@@ -519,5 +672,7 @@ export function createWorkspaces(config) {
     listDirs: (p) => listDirs(containment, p),
     mkdir: (parent, name) => makeDirectory(containment, parent, name),
     search: (cwd, q, limit) => searchFiles(containment, cwd, q, limit),
+    isTrusted: (p) => isTrustedPath(containment, trust, p),
+    setTrusted: (p, trusted) => setTrustedDir(containment, trust, p, trusted),
   };
 }

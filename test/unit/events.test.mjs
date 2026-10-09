@@ -95,7 +95,7 @@ function hub(options = {}) {
  */
 function connect(events, options = {}) {
   const res = new FakeResponse();
-  events.attach(/** @type {any} */ ({}), /** @type {any} */ (res), options);
+  events.attach(/** @type {any} */ ({}), /** @type {any} */ (res), { clientAddress: '198.51.100.1', ...options });
   return res;
 }
 
@@ -180,6 +180,52 @@ describe('EventHub.attach', () => {
     const res = connect(events);
     assert.equal(res.statusCode, 503);
     assert.equal(res.body, 'The server is shutting down');
+  });
+});
+
+describe('EventHub stream limits', () => {
+  it('refuses the 65th stream with 429 TOO_MANY_STREAMS before any header or frame is written', () => {
+    const events = hub();
+    for (let index = 0; index < 64; index += 1) connect(events, { clientAddress: `10.0.0.${index + 1}` });
+    assert.equal(events.clientCount, 64);
+    const refused = new FakeResponse();
+    assert.throws(() => events.attach({}, /** @type {any} */ (refused), { clientAddress: '10.0.1.1' }),
+      (error) => error.status === 429 && error.code === 'TOO_MANY_STREAMS');
+    assert.equal(refused.statusCode, undefined, 'no status line was written');
+    assert.deepEqual(refused.chunks, []);
+    assert.equal(events.clientCount, 64);
+    events.close();
+  });
+
+  it('allows 16 streams per client address and refuses the 17th from that address only', () => {
+    const events = hub();
+    for (let index = 0; index < 16; index += 1) connect(events, { clientAddress: '203.0.113.7' });
+    assert.throws(() => connect(events, { clientAddress: '203.0.113.7' }),
+      (error) => error.status === 429 && error.code === 'TOO_MANY_STREAMS');
+    assert.doesNotThrow(() => connect(events, { clientAddress: '203.0.113.8' }));
+    assert.equal(events.clientCount, 17);
+    events.close();
+  });
+
+  it('frees capacity when a stream closes, once per stream, for both limits', () => {
+    const events = hub();
+    const streams = Array.from({ length: 16 }, () => connect(events, { clientAddress: '203.0.113.7' }));
+    assert.throws(() => connect(events, { clientAddress: '203.0.113.7' }), /TOO_MANY_STREAMS|Too many/);
+    streams[0].disconnect();
+    streams[0].disconnect();
+    assert.equal(events.clientCount, 15);
+    assert.doesNotThrow(() => connect(events, { clientAddress: '203.0.113.7' }));
+    assert.throws(() => connect(events, { clientAddress: '203.0.113.7' }));
+    events.close();
+  });
+
+  it('applies the configured limits and rejects invalid ones', () => {
+    const small = hub({ maxStreams: 1, maxStreamsPerClient: 1 });
+    connect(small, { clientAddress: '10.1.1.1' });
+    assert.throws(() => connect(small, { clientAddress: '10.1.1.2' }), (error) => error.status === 429);
+    small.close();
+    assert.throws(() => hub({ maxStreams: 0 }), TypeError);
+    assert.throws(() => hub({ maxStreamsPerClient: 1.5 }), TypeError);
   });
 });
 

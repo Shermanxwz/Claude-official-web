@@ -1445,6 +1445,11 @@ kbd {
   overflow-wrap: anywhere;
 }
 
+.banner-action {
+  flex: none;
+  align-self: center;
+}
+
 .banner-info {
   border-color: transparent;
   background: var(--info-soft);
@@ -2026,6 +2031,67 @@ kbd {
 .newsession {
   display: grid;
   gap: var(--space-4);
+}
+
+/* Folder trust notice in the new-session dialog (gateway: GET/POST /api/fs/trust). */
+.trust-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--warning-soft);
+  color: var(--fg);
+  font-size: var(--fs-sm);
+}
+
+.trust-notice > .icon {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--warning);
+}
+
+.trust-notice-body {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.trust-notice-title,
+.trust-notice-text {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.trust-notice-title {
+  font-weight: 600;
+}
+
+.trust-notice-text {
+  color: var(--fg-muted);
+}
+
+.trust-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--control-h);
+  cursor: pointer;
+}
+
+.trust-check input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+@media (pointer: coarse) {
+  .trust-check input[type="checkbox"] {
+    width: 22px;
+    height: 22px;
+  }
 }
 
 .newsession-grid {

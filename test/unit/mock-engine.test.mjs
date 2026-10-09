@@ -234,9 +234,16 @@ const SCENARIO_PROMPTS = {
   notify: 'notify me when done',
   rate: 'check the rate',
   hook: 'run a hook first',
+  auth: 'check the auth token',
   error: 'produce an error',
   slow: 'answer slowly',
   default: 'Tell me something about the project',
+};
+
+/** The scenarios whose turn ends with an error result, and the error each one reports. */
+const FAILING_SCENARIOS = {
+  error: 'Mock failure requested',
+  auth: 'Invalid API key · Please run /login',
 };
 
 describe('scenario selection', () => {
@@ -267,10 +274,10 @@ describe('well-formed sequences for every scenario', () => {
       const messages = await runSingle(adapter, cwd, SCENARIO_PROMPTS[name], options);
       const results = assertWellFormed(messages);
       assert.equal(results.length, 1, 'exactly one result per turn');
-      if (name === 'error') {
+      if (Object.hasOwn(FAILING_SCENARIOS, name)) {
         assert.equal(results[0].subtype, 'error_during_execution');
         assert.equal(results[0].is_error, true);
-        assert.deepEqual(results[0].errors, ['Mock failure requested']);
+        assert.deepEqual(results[0].errors, [FAILING_SCENARIOS[name]]);
       } else {
         assert.equal(results[0].subtype, 'success');
         assert.equal(results[0].is_error, false);
@@ -1319,5 +1326,88 @@ describe('turn linkage', () => {
     assertLinked(messages, [result.user_message_uuid]);
     const stored = await adapter.getSessionMessages(messages[0].session_id, { dir: cwd });
     assert.equal(stored[0].uuid, result.user_message_uuid);
+  });
+});
+
+/** The tool_result that answers the Bash call of a turn, with the message that carries it. */
+function bashResultOf(messages) {
+  const toolUse = messages
+    .filter((m) => m.type === 'assistant')
+    .flatMap((m) => m.message.content)
+    .find((b) => b.type === 'tool_use' && b.name === 'Bash');
+  return toolResultOf(messages, toolUse.id);
+}
+
+describe('permission suggestions', () => {
+  test('a Bash request offers two suggestions, and the approval records the ones it returns', async (t) => {
+    const cwd = projectDir(t);
+    const offered = [];
+    const canUseTool = async (name, input, options) => {
+      offered.push(options.suggestions);
+      return { behavior: 'allow', updatedInput: input, updatedPermissions: [options.suggestions[1]] };
+    };
+    const messages = await runSingle(adapterAt(tempDir(t)), cwd, 'run the tool', { canUseTool });
+    assertWellFormed(messages);
+    assert.deepEqual(offered[0], [
+      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow', destination: 'localSettings' },
+      { type: 'addDirectories', directories: [join(cwd, '..')], destination: 'session' },
+    ]);
+    assert.deepEqual(bashResultOf(messages).message.tool_use_result.updatedPermissions, [offered[0][1]]);
+  });
+
+  test('an approval that returns both suggestions records both, in the order returned', async (t) => {
+    const canUseTool = async (name, input, options) => ({
+      behavior: 'allow',
+      updatedInput: input,
+      updatedPermissions: [...options.suggestions].reverse(),
+    });
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'run the tool', { canUseTool });
+    assertWellFormed(messages);
+    const recorded = bashResultOf(messages).message.tool_use_result.updatedPermissions;
+    assert.deepEqual(recorded.map((update) => update.type), ['addDirectories', 'addRules']);
+  });
+
+  test('an approval without updatedPermissions records none', async (t) => {
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'run the tool', { canUseTool: allowAll });
+    assertWellFormed(messages);
+    assert.deepEqual(bashResultOf(messages).message.tool_use_result.updatedPermissions, []);
+  });
+});
+
+describe('api retries and failures', () => {
+  test('the auth scenario retries twice with a 401 notice each time, then fails with the sign-in hint', async (t) => {
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'check the auth token');
+    const results = assertWellFormed(messages);
+    const retries = messages.filter((m) => m.type === 'system' && m.subtype === 'api_retry');
+    assert.deepEqual(retries.map((retry) => retry.attempt), [1, 2]);
+    assert.deepEqual(retries.map((retry) => retry.retry_delay_ms), [500, 1000]);
+    for (const retry of retries) {
+      assert.equal(retry.max_retries, 2);
+      assert.equal(retry.error, 'authentication_failed');
+      assert.equal(retry.error_status, 401);
+    }
+    assert.equal(results[0].subtype, 'error_during_execution');
+    assert.equal(results[0].is_error, true);
+    assert.deepEqual(results[0].errors, ['Invalid API key · Please run /login']);
+    assert.equal(results[0].terminal_reason, 'model_error');
+  });
+});
+
+describe('model aliases', () => {
+  test('each alias names the wire id it resolves to, so the init model matches one row', async (t) => {
+    const { query, init } = await openQuery(t, tempDir(t), projectDir(t));
+    const expected = {
+      default: 'claude-sonnet-mock',
+      sonnet: 'claude-sonnet-mock',
+      opus: 'claude-opus-mock',
+      haiku: 'claude-haiku-mock',
+    };
+    const initRows = (await query.initializationResult()).models;
+    const listed = await query.supportedModels();
+    for (const rows of [initRows, listed]) {
+      assert.deepEqual(Object.fromEntries(rows.map((row) => [row.value, row.resolvedModel])), expected);
+    }
+    assert.equal(init.model, 'claude-sonnet-mock');
+    assert.ok(initRows.some((row) => row.resolvedModel === init.model));
   });
 });

@@ -89,7 +89,11 @@ export async function createTerminal({ config, log, engineHost, publish, ptyModu
   const registry = new Set();
   /** @type {Array<() => void>} */
   const emptyWaiters = [];
-  const deps = { config, log, engineHost, publish, pty };
+  // Resolved once, here, so the path logged below is the path every session runs.
+  const claudeBin = resolveClaudeBinary(config);
+  if (claudeBin) log.info('terminal claude binary resolved', { path: claudeBin });
+  else log.warn('terminal claude binary not found');
+  const deps = { config, log, engineHost, publish, pty, claudeBin };
   let closing = false;
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
@@ -168,26 +172,30 @@ export async function createTerminal({ config, log, engineHost, publish, ptyModu
 }
 
 /**
- * Claude Code executable for terminal sessions: `config.claudeBin` when set (never falling back to another binary),
- * else the first executable `claude` on PATH (absolute entries only), else the native binary shipped with the SDK.
+ * Claude Code executable for terminal sessions, in the order the SDK uses for the engine, so both run the same binary:
+ * `config.claudeBin` when set (never falling back to another binary), else the native binary the SDK ships for this
+ * platform (the musl package first on musl hosts), else the first executable `claude` on PATH (absolute entries only).
  * @param {Config} config
- * @param {{env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform, arch?: string}} [options]
+ * @param {{
+ *   env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform, arch?: string, preferMusl?: boolean,
+ *   bundled?: (pkg: string, binName: string) => string|null,
+ * }} [options] `bundled` looks up a package's binary and defaults to this checkout's node_modules.
  * @returns {string|null}
  */
 export function resolveClaudeBinary(config, {
   env = process.env,
   platform = process.platform,
   arch = process.arch,
+  preferMusl = platform === 'linux' && isMuslHost(),
+  bundled = resolveSdkBinary,
 } = {}) {
   const binName = platform === 'win32' ? 'claude.exe' : 'claude';
   if (config.claudeBin) return isExecutableFile(config.claudeBin) ? config.claudeBin : null;
-  const onPath = findOnPath(binName, env.PATH ?? env.Path ?? '');
-  if (onPath) return onPath;
-  for (const pkg of sdkPackageNames(platform, arch)) {
-    const bundled = resolveSdkBinary(pkg, binName);
-    if (bundled) return bundled;
+  for (const pkg of sdkPackageNames(platform, arch, preferMusl)) {
+    const shipped = bundled(pkg, binName);
+    if (shipped) return shipped;
   }
-  return null;
+  return findOnPath(binName, env.PATH ?? env.Path ?? '');
 }
 
 /**
@@ -197,7 +205,8 @@ export function resolveClaudeBinary(config, {
 class TerminalConnection {
   /**
    * @param {import('ws').WebSocket} ws
-   * @param {{config: Config, log: Logger, engineHost: EngineHostApi, publish: Publish, pty: PtyModule}} deps
+   * @param {{config: Config, log: Logger, engineHost: EngineHostApi, publish: Publish, pty: PtyModule,
+   *   claudeBin: string|null}} deps
    * @param {(connection: TerminalConnection) => void} onFinished
    */
   constructor(ws, deps, onFinished) {
@@ -299,7 +308,7 @@ class TerminalConnection {
         ? new AppError(422, 'PATH_NOT_ALLOWED', 'The session directory is not inside a workspace root')
         : new AppError(400, 'BAD_REQUEST', 'cwd must be an existing directory inside a workspace root');
     }
-    const bin = resolveClaudeBinary(config);
+    const bin = this.deps.claudeBin;
     if (!bin) throw new AppError(503, 'ENGINE_UNAVAILABLE', 'The Claude Code executable was not found');
     if (target.kind === 'session') {
       this.releaseLock = await engineHost.lockForTerminal(target.sessionId);
@@ -705,13 +714,34 @@ function findOnPath(binName, pathValue) {
 }
 
 /**
+ * Packages that ship the native binary, in lookup order. This mirrors the SDK's own choice (sdk.mjs), so the terminal
+ * and the engine run the same file.
  * @param {string} platform
  * @param {string} arch
+ * @param {boolean} preferMusl
  * @returns {string[]}
  */
-function sdkPackageNames(platform, arch) {
+function sdkPackageNames(platform, arch, preferMusl) {
+  if (platform === 'android') return [`@anthropic-ai/claude-agent-sdk-linux-${arch}-android`];
   const name = `@anthropic-ai/claude-agent-sdk-${platform}-${arch}`;
-  return platform === 'linux' ? [name, `${name}-musl`] : [name];
+  if (platform !== 'linux') return [name];
+  return preferMusl ? [`${name}-musl`, name] : [name, `${name}-musl`];
+}
+
+/** @type {boolean | null} */
+let muslHost = null;
+
+/**
+ * True on Linux when the process report has no glibc runtime version, the same test the SDK uses for musl.
+ * @returns {boolean}
+ */
+function isMuslHost() {
+  if (muslHost === null) {
+    /** @type {{header?: {glibcVersionRuntime?: string}} | null} */
+    const report = typeof process.report?.getReport === 'function' ? process.report.getReport() : null;
+    muslHost = process.platform === 'linux' && report !== null && report.header?.glibcVersionRuntime === undefined;
+  }
+  return muslHost;
 }
 
 /**
@@ -722,7 +752,9 @@ function sdkPackageNames(platform, arch) {
 function resolveSdkBinary(pkg, binName) {
   try {
     const file = requireFromHere.resolve(`${pkg}/${binName}`);
-    return isExecutableFile(file) ? file : null;
+    // Existence is enough, as in the SDK: a shipped binary that cannot start fails at spawn rather than silently
+    // running a different claude from PATH.
+    return fs.statSync(file).isFile() ? file : null;
   } catch {
     return null;
   }

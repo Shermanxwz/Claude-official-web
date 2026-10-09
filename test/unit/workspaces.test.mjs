@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it, mock } from 'node:test';
 import { AppError } from '../../src/contracts.mjs';
+import { createStateStore } from '../../src/state.mjs';
 import { createWorkspaces } from '../../src/workspaces.mjs';
 
 const BIG_FILE_COUNT = 20500;
@@ -525,6 +526,126 @@ describe('workspaces', () => {
       const none = createWorkspaces({ roots: [] });
       assert.equal(await none.isInsideRoots(fx.ws), false);
       await assertAppError(none.resolveDir(fx.ws), 422, 'PATH_NOT_ALLOWED');
+    });
+  });
+
+  describe('folder trust', () => {
+    /** @type {string} */
+    let root;
+    /** @type {string} */
+    let team;
+    /** @type {string} */
+    let other;
+
+    before(async () => {
+      root = path.join(tmp, 'trust-root');
+      team = path.join(root, 'team');
+      other = path.join(root, 'other');
+      await mkdirAll([path.join(team, 'app', 'src'), other]);
+      await writeText(path.join(root, 'file.txt'));
+      await fs.promises.symlink(team, path.join(root, 'link-team'));
+      await fs.promises.symlink(fx.outside, path.join(root, 'link-out'));
+    });
+
+    it('trusts a folder and everything below it, but not its parent or siblings', async () => {
+      const ws = createWorkspaces({ roots: [root] });
+      assert.equal(await ws.isTrusted(team), false);
+      assert.deepEqual(await ws.setTrusted(team, true), { path: team, trusted: true });
+      assert.equal(await ws.isTrusted(team), true);
+      assert.equal(await ws.isTrusted(path.join(team, 'app', 'src')), true);
+      assert.equal(await ws.isTrusted(other), false);
+      assert.equal(await ws.isTrusted(root), false);
+    });
+
+    it('judges symbolic links by their realpath and never trusts paths outside the roots', async () => {
+      const ws = createWorkspaces({ roots: [root] });
+      await ws.setTrusted(team, true);
+      assert.equal(await ws.isTrusted(path.join(root, 'link-team')), true);
+      assert.equal(await ws.isTrusted(path.join(root, 'link-out')), false);
+      await assertAppError(ws.setTrusted(path.join(root, 'link-out'), true), 422, 'PATH_NOT_ALLOWED');
+    });
+
+    it('reports the effective trust after a change, so a trusted parent keeps a child trusted', async () => {
+      const ws = createWorkspaces({ roots: [root] });
+      await ws.setTrusted(team, true);
+      const app = path.join(team, 'app');
+      assert.deepEqual(await ws.setTrusted(app, false), { path: app, trusted: true });
+      assert.deepEqual(await ws.setTrusted(team, false), { path: team, trusted: false });
+      assert.equal(await ws.isTrusted(app), false);
+    });
+
+    it('rejects folders that cannot be trusted and non-boolean values', async () => {
+      const ws = createWorkspaces({ roots: [root] });
+      await assertAppError(ws.setTrusted(fx.outside, true), 422, 'PATH_NOT_ALLOWED');
+      await assertAppError(ws.setTrusted(path.join(root, 'file.txt'), true), 422, 'PATH_NOT_ALLOWED');
+      await assertAppError(ws.setTrusted(path.join(root, 'missing'), true), 422, 'PATH_NOT_ALLOWED');
+      await assertAppError(ws.setTrusted(team, untyped('yes')), 422, 'INVALID_ARGUMENT');
+    });
+
+    it('isTrusted never throws and answers false for invalid input', async () => {
+      const ws = createWorkspaces({ roots: [root] });
+      await ws.setTrusted(team, true);
+      for (const value of [undefined, null, 42, '', 'relative', `${team}\0`, path.join(root, 'missing')]) {
+        assert.equal(await ws.isTrusted(untyped(value)), false);
+      }
+    });
+
+    it('ignores a trusted folder that was removed or has been replaced by a file', async () => {
+      const ws = createWorkspaces({ roots: [root] });
+      const temp = path.join(root, 'temp');
+      await mkdirAll([temp]);
+      await ws.setTrusted(temp, true);
+      await fs.promises.rm(temp, { recursive: true, force: true });
+      assert.equal(await ws.isTrusted(temp), false);
+      await writeText(temp, 'now a file');
+      assert.equal(await ws.isTrusted(temp), false);
+    });
+
+    it('keeps trust in the state store so that a restarted instance sees it', async () => {
+      const store = createStateStore(path.join(tmp, 'state-trust-persist'));
+      await createWorkspaces({ roots: [root] }, { stateStore: store }).setTrusted(team, true);
+      assert.deepEqual(await store.read('trusted-dirs', { dirs: [] }), { dirs: [team] });
+      const restarted = createWorkspaces({ roots: [root] }, { stateStore: store });
+      assert.equal(await restarted.isTrusted(path.join(team, 'app', 'src')), true);
+    });
+
+    it('stores each folder once, newest last, and keeps at most 1000 entries', async () => {
+      const store = createStateStore(path.join(tmp, 'state-trust-bound'));
+      const ws = createWorkspaces({ roots: [root] }, { stateStore: store });
+      await ws.setTrusted(team, true);
+      await ws.setTrusted(other, true);
+      await ws.setTrusted(team, true);
+      assert.deepEqual((await store.read('trusted-dirs', { dirs: [] })).dirs, [other, team]);
+
+      const many = Array.from({ length: 1000 }, (_, i) => path.join(root, 'old', String(i)));
+      await store.write('trusted-dirs', { dirs: many });
+      await createWorkspaces({ roots: [root] }, { stateStore: store }).setTrusted(other, true);
+      const { dirs } = await store.read('trusted-dirs', { dirs: [] });
+      assert.equal(dirs.length, 1000);
+      assert.equal(dirs[0], many[1]);
+      assert.equal(dirs.at(-1), other);
+    });
+
+    it('drops corrupt stored entries and keeps the valid ones', async () => {
+      const store = createStateStore(path.join(tmp, 'state-trust-corrupt'));
+      await store.write('trusted-dirs', { dirs: ['relative', 42, null, team, team] });
+      const ws = createWorkspaces({ roots: [root] }, { stateStore: store });
+      assert.equal(await ws.isTrusted(team), true);
+      await ws.setTrusted(other, true);
+      assert.deepEqual((await store.read('trusted-dirs', { dirs: [] })).dirs, [team, other]);
+    });
+
+    it('applies concurrent changes one after another without losing entries', async () => {
+      const store = createStateStore(path.join(tmp, 'state-trust-concurrent'));
+      const ws = createWorkspaces({ roots: [root] }, { stateStore: store });
+      const dirs = Array.from({ length: 20 }, (_, i) => path.join(root, 'many', `d${i}`));
+      await mkdirAll(dirs);
+      await Promise.all(dirs.map((dir) => ws.setTrusted(dir, true)));
+      assert.equal((await store.read('trusted-dirs', { dirs: [] })).dirs.length, 20);
+    });
+
+    it('rejects a state store that lacks read or write', () => {
+      assert.throws(() => createWorkspaces({ roots: [root] }, untyped({ stateStore: {} })), TypeError);
     });
   });
 });

@@ -1,4 +1,4 @@
-import { test, describe } from 'node:test';
+import { test, describe, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { EngineHost } from '../../src/engine/host.mjs';
@@ -31,6 +31,8 @@ class FakeQuery {
   closeMode = 'end';
   ignoreClose = false;
   closed = false;
+  /** Methods that never answer, so that the control timeout is what ends them. */
+  hangs = new Set();
 
   /**
    * @param {AsyncQueue<unknown>} prompt
@@ -76,6 +78,7 @@ class FakeQuery {
     this.calls.push([name, ...args]);
     const failure = this.failures.get(name);
     if (failure) throw failure;
+    if (this.hangs.has(name)) await new Promise(() => {});
     return this.values[name];
   }
 
@@ -256,18 +259,24 @@ function makeConfig(over = {}) {
   };
 }
 
+/** Folder trust of the harness by default: the workspace root and the folders below it are trusted. */
+const TRUSTED = async (p) => p === CWD || p.startsWith(`${CWD}/`);
+
 /**
  * A host wired to the fake engine, a recording publisher, a recording logger and a manual clock.
- * @param {{config?: Record<string, unknown>, clock?: number}} [options]
+ * `trusted` is the isTrustedCwd option; `null` leaves the option out so the host's default applies.
+ * @param {{config?: Record<string, unknown>, clock?: number,
+ *   trusted?: ((p: string) => Promise<boolean>)|null}} [options]
  */
-function harness({ config = {}, clock = 1_000_000 } = {}) {
+function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED } = {}) {
   const events = [];
   const logs = [];
   const engine = createEngine();
   const time = { now: clock };
   let seq = 0;
   const recordLog = (level) => (msg, fields) => logs.push({ level, msg, fields });
-  const host = new EngineHost({
+  /** @type {ConstructorParameters<typeof EngineHost>[0]} */
+  const options = {
     engine,
     config: makeConfig(config),
     log: { debug: recordLog('debug'), info: recordLog('info'), warn: recordLog('warn'), error: recordLog('error') },
@@ -279,7 +288,9 @@ function harness({ config = {}, clock = 1_000_000 } = {}) {
     getSeq: () => seq,
     isAllowedCwd: async (p) => p === CWD || p.startsWith(`${CWD}/`),
     now: () => time.now,
-  });
+  };
+  if (trusted !== null) options.isTrustedCwd = trusted;
+  const host = new EngineHost(options);
   return { host, engine, events, logs, time, sequence: () => seq };
 }
 
@@ -455,7 +466,7 @@ describe('EngineHost starting queries', () => {
     await expectError(h.host.openSession('not-a-uuid'), 400, 'BAD_REQUEST');
     await expectError(h.host.openSession(UNKNOWN), 404, 'SESSION_NOT_FOUND');
     addSession(h.engine, S2, { cwd: OUTSIDE });
-    await expectError(h.host.openSession(S2), 422, 'PATH_NOT_ALLOWED');
+    await expectError(h.host.openSession(S2), 404, 'SESSION_NOT_FOUND');
     assert.equal(h.engine.queries.length, 0);
   });
 
@@ -1518,13 +1529,16 @@ describe('EngineHost capabilities', () => {
     await h.host.getCapabilities(sessionId);
     await h.host.closeSession(sessionId);
     addSession(h.engine, S2, { cwd: CWD });
-    addSession(h.engine, S3, { cwd: OUTSIDE });
+    addSession(h.engine, S3, { cwd: `${CWD}/other` });
     const sameFolder = await h.host.getCapabilities(S2);
     assert.equal(sameFolder.stale, true);
     assert.deepEqual(sameFolder.commands, DEFAULT_INIT.commands);
     const otherFolder = await h.host.getCapabilities(S3);
     assert.equal(otherFolder.stale, true);
     assert.deepEqual(otherFolder.models, DEFAULT_INIT.models);
+    const outside = randomUUID();
+    addSession(h.engine, outside, { cwd: OUTSIDE });
+    await expectError(h.host.getCapabilities(outside), 404, 'SESSION_NOT_FOUND');
   });
 
   test('a closed session with nothing remembered answers with empty, stale capabilities', async () => {
@@ -1535,24 +1549,27 @@ describe('EngineHost capabilities', () => {
     await expectError(h.host.getCapabilities('bad'), 400, 'BAD_REQUEST');
   });
 
-  test('one failing capability query still answers with the other, and the failure is only logged', async () => {
-    const h = harness();
-    const { sessionId, query } = await startLive(h);
-    query.failures.set('mcpServerStatus', new Error('mcp down'));
-    const caps = await h.host.getCapabilities(sessionId);
-    assert.equal(caps.stale, false);
-    assert.deepEqual(caps.models, DEFAULT_INIT.models);
-    assert.deepEqual(caps.mcpServers, []);
-    assert.equal(ofType(h.events, 'notice').length, 0);
-    assert.equal(h.logs.some((entry) => entry.level === 'debug' && entry.msg === 'capability query failed'), true);
-  });
+  test('a failing capability query answers with the last known capabilities, marked stale, and only logs the failure',
+    async () => {
+      const h = harness();
+      const { sessionId, query } = await startLive(h);
+      await h.host.getCapabilities(sessionId);
+      h.time.now += 30_000;
+      query.failures.set('mcpServerStatus', new Error('mcp down'));
+      const caps = await h.host.getCapabilities(sessionId);
+      assert.equal(caps.stale, true);
+      assert.deepEqual(caps.models, DEFAULT_INIT.models);
+      assert.deepEqual(caps.mcpServers, DEFAULT_MCP);
+      assert.equal(ofType(h.events, 'notice').length, 0);
+      assert.equal(h.logs.some((entry) => entry.level === 'debug' && entry.msg === 'capability query failed'), true);
+    });
 
-  test('when both capability queries fail the answer is empty and live', async () => {
+  test('when both capability queries fail with nothing known, the answer is empty and stale', async () => {
     const h = harness();
     const { sessionId, query } = await startLive(h);
     query.failures.set('initializationResult', new Error('x'));
     query.failures.set('mcpServerStatus', new Error('y'));
-    assert.deepEqual(await h.host.getCapabilities(sessionId), { ...EMPTY_CAPABILITIES, stale: false });
+    assert.deepEqual(await h.host.getCapabilities(sessionId), { ...EMPTY_CAPABILITIES, stale: true });
   });
 
   test('when the init query fails, the commands last announced by the query are used', async () => {
@@ -1688,16 +1705,20 @@ describe('EngineHost subagents', () => {
     addSession(h.engine, S1);
     assert.deepEqual(await h.host.listSubagents(S1), ['agent-a']);
     assert.deepEqual(await h.host.getSubagentMessages(S1, 'agent-a'), []);
-    assert.deepEqual(h.engine.calls.slice(-2), [
+    const subagentCalls = h.engine.calls.filter((call) => call[0] === 'listSubagents'
+      || call[0] === 'getSubagentMessages');
+    assert.deepEqual(subagentCalls, [
       ['listSubagents', S1],
       ['getSubagentMessages', S1, 'agent-a'],
     ]);
     await expectError(h.host.listSubagents('nope'), 400, 'BAD_REQUEST');
     await expectError(h.host.getSubagentMessages(S1, ''), 400, 'BAD_REQUEST');
+    await expectError(h.host.listSubagents(UNKNOWN), 404, 'SESSION_NOT_FOUND');
   });
 
   test('a failing subagent read is reported without the engine text', async () => {
     const h = harness();
+    addSession(h.engine, S1);
     h.engine.listSubagents = async () => {
       throw new Error('/home/claude/.claude/subagents denied');
     };
@@ -2002,9 +2023,13 @@ describe('EngineHost terminal locks', () => {
     release();
   });
 
-  test('locks need a valid id and cannot be taken twice', async () => {
+  test('locks need a valid id and a session inside the roots, and cannot be taken twice', async () => {
     const h = harness();
     await expectError(h.host.lockForTerminal('bad'), 400, 'BAD_REQUEST');
+    await expectError(h.host.lockForTerminal(S1), 404, 'SESSION_NOT_FOUND');
+    addSession(h.engine, S1);
+    addSession(h.engine, S2, { cwd: OUTSIDE });
+    await expectError(h.host.lockForTerminal(S2), 404, 'SESSION_NOT_FOUND');
     const release = await h.host.lockForTerminal(S1);
     await expectError(h.host.lockForTerminal(S1), 409, 'SESSION_LOCKED');
     release();
@@ -2162,5 +2187,380 @@ describe('EngineHost log hygiene', () => {
       assert.equal(logged.includes(secret), false, `${secret} must not be logged`);
     }
     assert.equal(h.logs.some((entry) => entry.level === 'debug' && entry.msg === 'engine stderr'), true);
+  });
+});
+
+const CREDENTIALS_NOTICE = 'Claude Code credentials were rejected. Log in again on the server: run `claude` and use '
+  + '/login.';
+const TIMEOUT_NOTICE = 'The Claude Code runtime did not respond in time.';
+const CONTROL_TIMEOUT = 10_000;
+
+/** @param {string} sessionId @param {string} error */
+function retryMessage(sessionId, error) {
+  return {
+    type: 'system',
+    subtype: 'api_retry',
+    attempt: 1,
+    max_retries: 10,
+    retry_delay_ms: 500,
+    error_status: 401,
+    error,
+    uuid: randomUUID(),
+    session_id: sessionId,
+  };
+}
+
+/** @param {string} sessionId @param {string} error */
+function assistantError(sessionId, error) {
+  return {
+    type: 'assistant',
+    uuid: randomUUID(),
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    error,
+    message: { id: `msg-${randomUUID()}`, role: 'assistant', content: [{ type: 'text', text: 'Please log in.' }] },
+  };
+}
+
+describe('EngineHost credential failures', () => {
+  test('a retry that reports rejected credentials sets the session error and publishes one notice per query',
+    async () => {
+      const h = harness();
+      const { sessionId, query } = await startLive(h);
+      query.emit(retryMessage(sessionId, 'authentication_failed'));
+      await flush();
+      query.emit(retryMessage(sessionId, 'authentication_failed'));
+      await flush();
+      assert.deepEqual(h.host.liveInfo(sessionId).error, { code: 'ENGINE_UNAVAILABLE', message: CREDENTIALS_NOTICE });
+      const notices = ofType(h.events, 'notice');
+      assert.equal(notices.length, 1);
+      assert.deepEqual(notices[0].data, {
+        sessionId,
+        level: 'error',
+        code: 'ENGINE_UNAVAILABLE',
+        message: CREDENTIALS_NOTICE,
+      });
+      assert.equal(query.closed, false);
+      assert.equal(h.logs.some((entry) => entry.msg === 'the runtime rejected its credentials'), true);
+      assert.equal(JSON.stringify(h.logs).includes('authentication_failed'), false);
+    });
+
+  test('other retries and errors are not credential failures', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    for (const error of ['rate_limit', 'server_error', 'overloaded', 'billing_error', 'cloud_credential_error']) {
+      query.emit(retryMessage(sessionId, error));
+      query.emit(assistantError(sessionId, error));
+    }
+    await flush();
+    assert.equal(h.host.liveInfo(sessionId).error, null);
+    assert.equal(ofType(h.events, 'notice').length, 0);
+  });
+
+  test('an assistant message with an authentication error is reported the same way, and a query that starts again '
+    + 'reports once more', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    query.emit(assistantError(S1, 'oauth_org_not_allowed'));
+    query.emit(assistantError(S1, 'account_on_hold'));
+    await flush();
+    assert.equal(ofType(h.events, 'notice').length, 1);
+    await h.host.closeSession(S1);
+    const reopened = await openLive(h, S1);
+    reopened.query.emit(assistantError(S1, 'verification_required'));
+    await flush();
+    assert.equal(ofType(h.events, 'notice').length, 2);
+    assert.equal(h.host.liveInfo(S1).error.code, 'ENGINE_UNAVAILABLE');
+  });
+});
+
+describe('EngineHost lifecycle queue', () => {
+  test('a send that arrives during a conversation rewind reaches the restarted query only', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query: first } = await openLive(h, S1);
+    const clientMessageId = randomUUID();
+    const rewinding = h.host.rewind(S1, { userMessageId: 'u-2', mode: 'conversation' });
+    const sending = h.host.sendMessage(S1, { clientMessageId, text: 'after the rewind' });
+    await rewinding;
+    assert.deepEqual(await sending, { accepted: true, duplicate: false });
+    assert.equal(h.engine.queries.length, 2);
+    const [, second] = h.engine.queries;
+    assert.equal(first.closed, true);
+    assert.equal(first.prompt.size, 0);
+    assert.equal(second.options.resume, S1);
+    assert.equal(second.options.resumeSessionAt, 'a-1');
+    assert.equal((await nextInput(second)).uuid, clientMessageId);
+  });
+
+  test('an open during a conversation rewind waits for the restart and starts no second query', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    await openLive(h, S1);
+    const rewinding = h.host.rewind(S1, { userMessageId: 'u-2', mode: 'conversation' });
+    const opening = h.host.openSession(S1);
+    await rewinding;
+    const info = await opening;
+    assert.equal(info.sessionId, S1);
+    assert.equal(h.engine.queries.length, 2);
+    assert.equal(h.engine.queries[0].closed, true);
+    assert.equal(h.engine.queries[1].closed, false);
+  });
+
+  test('a close during a conversation rewind waits for the restart and then stops the restarted query', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    await openLive(h, S1);
+    const rewinding = h.host.rewind(S1, { userMessageId: 'u-2', mode: 'conversation' });
+    const closing = h.host.closeSession(S1);
+    await rewinding;
+    await closing;
+    assert.equal(h.host.liveInfo(S1), null);
+    assert.equal(h.engine.queries.length, 2);
+    assert.equal(h.engine.queries[1].closed, true);
+  });
+
+  test('a dry run of a rewind changes nothing and starts nothing new', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    await openLive(h, S1);
+    const preview = await h.host.rewind(S1, { userMessageId: 'u-2', mode: 'conversation', dryRun: true });
+    assert.deepEqual(preview, { conversation: { resumeAt: 'a-1' } });
+    assert.equal(h.engine.queries.length, 1);
+    assert.equal(h.engine.queries[0].closed, false);
+  });
+
+  test('a query that ended by itself takes no more input, and the next send starts the session again', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    query.finish();
+    await flush();
+    assert.equal(query.prompt.ended, true);
+    assert.equal(h.host.liveInfo(S1), null);
+    await h.host.sendMessage(S1, { clientMessageId: randomUUID(), text: 'again' });
+    assert.equal(h.engine.queries.length, 2);
+    assert.equal(h.engine.queries[1].options.resume, S1);
+  });
+});
+
+describe('EngineHost close and lock ordering', () => {
+  test('a send that arrives while the session is closing is not lost: it opens the session again', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    const closing = h.host.closeSession(S1);
+    const clientMessageId = randomUUID();
+    const sending = h.host.sendMessage(S1, { clientMessageId, text: 'still there?' });
+    await closing;
+    assert.deepEqual(await sending, { accepted: true, duplicate: false });
+    assert.equal(query.closed, true);
+    assert.equal(query.prompt.size, 0);
+    assert.equal(h.engine.queries.length, 2);
+    assert.equal(h.engine.queries[1].options.resume, S1);
+    assert.equal((await nextInput(h.engine.queries[1])).uuid, clientMessageId);
+  });
+
+  test('a send that arrives during a terminal lock answers SESSION_LOCKED and starts nothing', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    const locking = h.host.lockForTerminal(S1);
+    const sending = h.host.sendMessage(S1, { clientMessageId: randomUUID(), text: 'x' });
+    const release = await locking;
+    await expectError(sending, 409, 'SESSION_LOCKED');
+    assert.equal(query.closed, true);
+    assert.equal(h.engine.queries.length, 1);
+    release();
+  });
+});
+
+describe('EngineHost workspace roots', () => {
+  test('session routes answer 404 for a session whose folder is outside the roots, and touch nothing', async () => {
+    const h = harness();
+    addSession(h.engine, S2, { cwd: OUTSIDE, messages: turns(S2) });
+    const hidden = S2;
+    await expectError(h.host.getSession(hidden), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.getTranscript(hidden, { tail: 2 }), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.sessionCwd(hidden), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.getCapabilities(hidden), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.fork(hidden, {}), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.rename(hidden, 'Renamed'), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.tag(hidden, 'tag'), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.deleteSession(hidden), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.listSubagents(hidden), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.getSubagentMessages(hidden, 'agent-a'), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.openSession(hidden), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.sendMessage(hidden, { clientMessageId: randomUUID(), text: 'x' }), 404,
+      'SESSION_NOT_FOUND');
+    await expectError(h.host.updateSettings(hidden, { model: 'haiku' }), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.rewind(hidden, { userMessageId: 'u-2', mode: 'code' }), 404, 'SESSION_NOT_FOUND');
+    await expectError(h.host.lockForTerminal(hidden), 404, 'SESSION_NOT_FOUND');
+    assert.equal(h.engine.queries.length, 0);
+    assert.equal(h.engine.store.has(hidden), true);
+    const changed = h.engine.calls.filter((call) => ['renameSession', 'tagSession', 'deleteSession', 'forkSession']
+      .includes(call[0]));
+    assert.deepEqual(changed, []);
+  });
+
+  test('listing an explicit folder outside the roots answers 422 PATH_NOT_ALLOWED without reading the engine',
+    async () => {
+      const h = harness();
+      await expectError(h.host.listSessions({ cwd: OUTSIDE }), 422, 'PATH_NOT_ALLOWED');
+      assert.equal(h.engine.calls.some((call) => call[0] === 'listSessions'), false);
+    });
+
+  test('creating a session outside the roots answers 422 PATH_NOT_ALLOWED and starts nothing', async () => {
+    const h = harness();
+    await expectError(h.host.createSession({ cwd: OUTSIDE }), 422, 'PATH_NOT_ALLOWED');
+    assert.equal(h.engine.queries.length, 0);
+  });
+
+  test('a session inside the roots is served next to one outside them', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { cwd: CWD, messages: turns(S1) });
+    addSession(h.engine, S2, { cwd: OUTSIDE, messages: turns(S2) });
+    assert.equal((await h.host.getSession(S1)).info.sessionId, S1);
+    assert.equal((await h.host.getTranscript(S1, { tail: 1 })).total, 4);
+    await expectError(h.host.getSession(S2), 404, 'SESSION_NOT_FOUND');
+  });
+});
+
+describe('EngineHost control timeouts', () => {
+  test('every control call gives up after 10 s with 502 ENGINE_ERROR and the runtime timeout message', async () => {
+    const cases = [
+      ['interrupt', (h, id) => h.host.interrupt(id)],
+      ['getContextUsage', (h, id) => h.host.getContextUsage(id)],
+      ['reconnectMcpServer', (h, id) => h.host.mcpAction(id, 'docs', { action: 'reconnect' })],
+      ['toggleMcpServer', (h, id) => h.host.mcpAction(id, 'docs', { action: 'toggle', enabled: false })],
+      ['reloadPlugins', (h, id) => h.host.reload(id, 'plugins')],
+      ['reloadSkills', (h, id) => h.host.reload(id, 'skills')],
+      ['rewindFiles', (h, id) => h.host.rewind(id, { userMessageId: 'u-2', mode: 'code', dryRun: true })],
+      ['stopTask', (h, id) => h.host.stopTask(id, 'task-1')],
+      ['setModel', (h, id) => h.host.updateSettings(id, { model: 'haiku' })],
+      ['setPermissionMode', (h, id) => h.host.updateSettings(id, { permissionMode: 'acceptEdits' })],
+      ['applyFlagSettings', (h, id) => h.host.updateSettings(id, { effort: 'low' })],
+    ];
+    for (const [method, invoke] of cases) {
+      const h = harness();
+      const { sessionId, query } = await startLive(h);
+      query.hangs.add(method);
+      mock.timers.enable({ apis: ['setTimeout'] });
+      try {
+        const outcome = invoke(h, sessionId).then(() => null, (error) => error);
+        await flush();
+        mock.timers.tick(CONTROL_TIMEOUT - 1);
+        await flush();
+        assert.equal(query.calls.some((call) => call[0] === method), true, `${method} was called`);
+        mock.timers.tick(1);
+        const error = await outcome;
+        assert.ok(error instanceof AppError, `${method} answered ${String(error)}`);
+        assert.equal(error.status, 502, method);
+        assert.equal(error.code, 'ENGINE_ERROR', method);
+        assert.equal(error.message, TIMEOUT_NOTICE, method);
+        assert.equal(h.host.liveInfo(sessionId).state, 'idle', `${method} leaves the session open`);
+      } finally {
+        mock.timers.reset();
+      }
+    }
+  });
+
+  test('a capability query that times out answers from the last known capabilities, marked stale', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    await h.host.getCapabilities(sessionId);
+    h.time.now += 30_000;
+    query.hangs.add('initializationResult');
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const outcome = h.host.getCapabilities(sessionId);
+      await flush();
+      mock.timers.tick(CONTROL_TIMEOUT);
+      const caps = await outcome;
+      assert.equal(caps.stale, true);
+      assert.deepEqual(caps.models, DEFAULT_INIT.models);
+      assert.deepEqual(caps.mcpServers, DEFAULT_MCP);
+      assert.equal(ofType(h.events, 'notice').length, 0);
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  test('an answer that comes before the 10 s limit is returned as it is', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const outcome = h.host.getContextUsage(sessionId);
+      await flush();
+      mock.timers.tick(CONTROL_TIMEOUT - 1);
+      assert.deepEqual(await outcome, DEFAULT_CONTEXT);
+      assert.equal(query.calls.at(-1)[0], 'getContextUsage');
+    } finally {
+      mock.timers.reset();
+    }
+  });
+});
+
+describe('EngineHost folder trust', () => {
+  test('without a trust check every folder is untrusted: the query loads user settings only', async () => {
+    const h = harness({ trusted: null });
+    const { sessionId, query, info } = await startLive(h);
+    assert.deepEqual(query.options.settingSources, ['user']);
+    assert.equal(info.trusted, false);
+    assert.equal(h.host.liveInfo(sessionId).trusted, false);
+  });
+
+  test('a trusted folder loads project and local settings, and LiveInfo says so', async () => {
+    const h = harness({ trusted: async (p) => p === CWD });
+    const { sessionId, query, info } = await startLive(h);
+    assert.deepEqual(query.options.settingSources, ['user', 'project', 'local']);
+    assert.equal(info.trusted, true);
+    assert.equal(h.host.liveInfo(sessionId).trusted, true);
+  });
+
+  test('trust is read at every start, so trusting a folder applies to the next start of its sessions', async () => {
+    const trustedFolders = new Set();
+    const h = harness({ trusted: async (p) => trustedFolders.has(p) });
+    addSession(h.engine, S1, { messages: turns(S1) });
+    await openLive(h, S1);
+    assert.deepEqual(h.engine.queries[0].options.settingSources, ['user']);
+    trustedFolders.add(CWD);
+    await h.host.closeSession(S1);
+    await openLive(h, S1);
+    assert.deepEqual(h.engine.queries[1].options.settingSources, ['user', 'project', 'local']);
+    assert.equal(h.host.liveInfo(S1).trusted, true);
+    await h.host.rewind(S1, { userMessageId: 'u-2', mode: 'conversation' });
+    assert.deepEqual(h.engine.queries[2].options.settingSources, ['user', 'project', 'local']);
+    assert.equal(h.host.liveInfo(S1).trusted, true);
+  });
+
+  test('a failing trust check counts as untrusted', async () => {
+    const h = harness({ trusted: async () => { throw new Error('trust store locked'); } });
+    const { sessionId, query } = await startLive(h);
+    assert.deepEqual(query.options.settingSources, ['user']);
+    assert.equal(h.host.liveInfo(sessionId).trusted, false);
+  });
+});
+
+describe('EngineHost limits and version', () => {
+  test('transcript windows are capped at 1000 messages and listings at 500', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    await expectError(h.host.getTranscript(S1, { tail: 1001 }), 400, 'BAD_REQUEST');
+    await expectError(h.host.getTranscript(S1, { before: 2, limit: 1001 }), 400, 'BAD_REQUEST');
+    await expectError(h.host.listSessions({ cwd: CWD, limit: 501 }), 400, 'BAD_REQUEST');
+    assert.equal((await h.host.getTranscript(S1, { tail: 1000 })).total, 4);
+    assert.equal((await h.host.listSessions({ cwd: CWD, limit: 500 })).length, 1);
+  });
+
+  test('lastClaudeCodeVersion reports the version of the latest init message and outlives its session', async () => {
+    const h = harness();
+    assert.equal(h.host.lastClaudeCodeVersion(), null);
+    const { sessionId } = await startLive(h);
+    assert.equal(h.host.lastClaudeCodeVersion(), '2.1.295');
+    await h.host.closeSession(sessionId).catch(() => undefined);
+    assert.equal(h.host.lastClaudeCodeVersion(), '2.1.295');
   });
 });

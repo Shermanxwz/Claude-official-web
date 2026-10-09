@@ -2,12 +2,15 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { AppError } from '../../src/contracts.mjs';
-import { createRouter, parseUrl, readJson, sendError, sendJson, serveStatic } from '../../src/http.mjs';
+import {
+  BODY_IDLE_TIMEOUT_MS, createRouter, parseUrl, readJson, sendError, sendJson, serveStatic, withBodyIdleLimit,
+} from '../../src/http.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -194,7 +197,121 @@ describe('readJson', () => {
       await server.close();
     }
   });
+
+  it('gives up on a body that stops arriving: the read fails with 400 and no response is written', async () => {
+    /** @type {unknown[]} */
+    const failures = [];
+    const server = await startServer(async (req) => {
+      await readJson(req, 1024, { idleTimeoutMs: 50 }).catch((error) => failures.push(error));
+    });
+    try {
+      const head = 'POST /x HTTP/1.1\r\nHost: gateway.test\r\nContent-Type: application/json\r\n'
+        + 'Content-Length: 20\r\n\r\n{"a":';
+      assert.equal(await stalledExchange(server.port, head), '', 'no 408 or other status line is sent');
+      assert.equal(failures.length, 1);
+      assert.ok(failures[0] instanceof AppError);
+      assert.equal(failures[0].status, 400);
+      assert.equal(failures[0].code, 'BAD_REQUEST');
+      assert.equal(failures[0].message, 'Request body timed out');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('does not crash when the handler writes the timeout error after the socket was destroyed', async () => {
+    let answered = false;
+    const server = await startServer(async (req, res) => {
+      try {
+        await readJson(req, 1024, { idleTimeoutMs: 50 });
+        sendJson(res, 200, { ok: true });
+      } catch (error) {
+        answered = true;
+        sendError(res, error, log);
+      }
+    });
+    try {
+      const head = 'POST /x HTTP/1.1\r\nHost: gateway.test\r\nContent-Type: application/json\r\n'
+        + 'Content-Length: 20\r\n\r\n{';
+      assert.equal(await stalledExchange(server.port, head), '');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(answered, true);
+      // The process is still serving after the failed write.
+      assert.equal((await send(server.port, { path: '/y' })).status, 200);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('uses a 30 second inactivity limit by default', () => {
+    assert.equal(BODY_IDLE_TIMEOUT_MS, 30000);
+  });
 });
+
+describe('withBodyIdleLimit', () => {
+  /** @param {http.IncomingMessage} req */
+  const drain = (req) => new Promise((resolve, reject) => {
+    req.on('data', () => {});
+    req.on('end', () => resolve(undefined));
+    req.on('close', () => reject(new Error('closed before the body ended')));
+  });
+
+  it('destroys a stalled upload and reports 400 Request body timed out', async () => {
+    /** @type {unknown[]} */
+    const failures = [];
+    const server = await startServer(async (req) => {
+      await withBodyIdleLimit(req, () => drain(req), 50).catch((error) => failures.push(error));
+    });
+    try {
+      const head = 'POST /upload HTTP/1.1\r\nHost: gateway.test\r\nContent-Length: 100\r\n\r\npartial';
+      assert.equal(await stalledExchange(server.port, head), '');
+      assert.equal(failures.length, 1);
+      assert.equal(failures[0].status, 400);
+      assert.equal(failures[0].message, 'Request body timed out');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('lifts the limit once the body is consumed, so a slow handler still answers', async () => {
+    const server = await startServer(async (req, res) => {
+      await withBodyIdleLimit(req, () => drain(req), 50);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      sendJson(res, 200, { ok: true });
+    });
+    try {
+      const response = await send(server.port, { method: 'POST', body: 'payload' });
+      assert.equal(response.status, 200);
+      assert.deepEqual(JSON.parse(text(response.body)), { ok: true });
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+/**
+ * Sends a request head and then goes silent. Resolves with whatever the server wrote before it closed the connection.
+ * @param {number} port
+ * @param {string} head
+ * @returns {Promise<string>}
+ */
+function stalledExchange(port, head) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    /** @type {Buffer[]} */
+    const parts = [];
+    const guard = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('the server did not close a stalled request'));
+    }, 5000);
+    socket.on('data', (chunk) => parts.push(chunk));
+    socket.on('error', () => {});
+    socket.on('close', () => {
+      clearTimeout(guard);
+      resolve(Buffer.concat(parts).toString('utf8'));
+    });
+    socket.write(head);
+  });
+}
 
 describe('sendJson and sendError', () => {
   it('writes status, JSON body, content length and the security headers', async () => {

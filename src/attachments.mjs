@@ -184,10 +184,13 @@ class UploadGuard extends Transform {
 
 /**
  * Serialises every read-modify-write of the 'uploads' state record so concurrent uploads and cleanup cannot lose
- * entries.
+ * entries. Records beyond MAX_RECORDS are evicted oldest first and their batch directories are removed through
+ * `removeBatch`, which applies the cleanup safety checks. A batch that fails to be removed stays recorded and is
+ * retried first on the next pass, so the list can exceed the bound only while removals keep failing.
  * @param {StateStore} stateStore
+ * @param {(dir: string) => Promise<'removed'|'missing'|'rejected'|'failed'>} removeBatch
  */
-function createUploadLedger(stateStore) {
+function createUploadLedger(stateStore, removeBatch) {
   let queue = Promise.resolve();
 
   /**
@@ -209,7 +212,15 @@ function createUploadLedger(stateStore) {
       const state = await stateStore.read('uploads', { dirs: /** @type {unknown[]} */ ([]) });
       const current = Array.isArray(state?.dirs) ? state.dirs.filter(isRecord) : [];
       const { records, value } = await change(current);
-      await stateStore.write('uploads', { dirs: records.slice(-MAX_RECORDS) });
+      const overflow = Math.max(0, records.length - MAX_RECORDS);
+      /** @type {UploadRecord[]} */
+      const retained = [];
+      for (const record of records.slice(0, overflow)) {
+        if ((await removeBatch(record.path)) === 'failed') {
+          retained.push(record);
+        }
+      }
+      await stateStore.write('uploads', { dirs: [...retained, ...records.slice(overflow)] });
       return value;
     });
     queue = run.then(() => undefined, () => undefined);
@@ -440,11 +451,13 @@ function isBatchPath(dir) {
 }
 
 /**
- * @param {Context} ctx
+ * Removes one batch directory only when it passes the upload-layout, symbolic-link and roots checks. Used by cleanup
+ * and by eviction; anything that fails a check is left untouched.
+ * @param {{log: Logger, workspaces: WorkspacesApi}} ctx
  * @param {string} dir
  * @returns {Promise<'removed'|'missing'|'rejected'|'failed'>}
  */
-async function removeExpiredBatch(ctx, dir) {
+async function removeUploadBatch(ctx, dir) {
   if (!isBatchPath(dir)) {
     ctx.log.warn('dropped an upload record outside the upload layout');
     return 'rejected';
@@ -487,7 +500,7 @@ function cleanupUploads(ctx, now) {
         keep.push(record);
         continue;
       }
-      const outcome = await removeExpiredBatch(ctx, record.path);
+      const outcome = await removeUploadBatch(ctx, record.path);
       if (outcome === 'removed') {
         removed += 1;
       } else if (outcome === 'failed') {
@@ -506,7 +519,12 @@ function cleanupUploads(ctx, now) {
  */
 export function createAttachments({ config, log, workspaces, stateStore }) {
   /** @type {Context} */
-  const ctx = { config, log, workspaces, ledger: createUploadLedger(stateStore) };
+  const ctx = {
+    config,
+    log,
+    workspaces,
+    ledger: createUploadLedger(stateStore, (dir) => removeUploadBatch({ log, workspaces }, dir)),
+  };
   return {
     save: (req, opts) => saveUpload(ctx, req, opts),
     resolveAttachment: (absPath, cwd) => resolveUpload(ctx, absPath, cwd),

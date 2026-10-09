@@ -57,7 +57,8 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {string} host
  * @property {number} port
  * @property {boolean} requireAuth
- * @property {string} token
+ * @property {string} token                plaintext login token ('' when only tokenSha256 is configured)
+ * @property {string} tokenSha256           lowercase hex SHA-256 of the login token ('' when token is configured)
  * @property {string} publicOrigin           canonical exact origin or ''
  * @property {AccessProfile} profile
  * @property {string} appName
@@ -93,6 +94,7 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {number} lastActivity
  * @property {string|null} claudeCodeVersion
  * @property {{code: string, message: string}|null} error
+ * @property {boolean} trusted              project settings, hooks, skills and MCP servers of cwd are loaded
  */
 
 /**
@@ -240,6 +242,10 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {(parent: string, name: string) => Promise<{path: string}>} mkdir
  * @property {(cwd: string, q: string, limit?: number) =>
  *   Promise<{results: Array<{path: string, type: 'file'|'dir'}>}>} search
+ * @property {(p: string) => Promise<boolean>} isTrusted
+ *   true when the realpath equals or is inside a folder the owner trusted (never throws)
+ * @property {(p: string, trusted: boolean) => Promise<{path: string, trusted: boolean}>} setTrusted
+ *   records or removes trust for an existing directory inside the roots
  */
 
 /**

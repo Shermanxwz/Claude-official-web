@@ -22,6 +22,8 @@ import { join } from 'node:path';
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKPartialAssistantMessage['event']} BetaStreamEvent */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKUserMessageReplay} SDKUserMessageReplay */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKStatusMessage} SDKStatusMessage */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').PermissionUpdate} PermissionUpdate */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKAPIRetryMessage} SDKAPIRetryMessage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKSessionStateChangedMessage} SDKSessionStateChangedMessage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKPermissionDeniedMessage} SDKPermissionDeniedMessage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKRateLimitInfo} SDKRateLimitInfo */
@@ -53,11 +55,13 @@ export class ScenarioFailure extends Error {
  * @property {string} [decisionReason]
  * @property {string} [blockedPath]
  * @property {{name: string, source: string}} [mcpServer]
+ * @property {PermissionUpdate[]} [suggestions]  the "always allow" choices offered with the request
  */
 
 /**
+ * `updatedPermissions` holds the suggestions the host returned with its approval, as it returned them.
  * `interrupt` is set when the user denied with "stop the turn", so the scenario must not continue.
- * @typedef {{allowed: true, input: Record<string, unknown>} |
+ * @typedef {{allowed: true, input: Record<string, unknown>, updatedPermissions: PermissionUpdate[]} |
  *   {allowed: false, message: string, interrupt: boolean}} PermissionOutcome
  */
 
@@ -520,6 +524,26 @@ export function rateLimitEvent(ctx, info) {
 }
 
 /**
+ * A system notice that a failed model request is being retried.
+ * @param {TurnContext} ctx
+ * @param {{attempt: number, maxRetries: number, retryDelayMs: number, errorStatus: number|null,
+ *   error: SDKAPIRetryMessage['error']}} retry
+ * @returns {SDKAPIRetryMessage}
+ */
+function apiRetry(ctx, { attempt, maxRetries, retryDelayMs, errorStatus, error }) {
+  return {
+    type: 'system',
+    subtype: 'api_retry',
+    attempt,
+    max_retries: maxRetries,
+    retry_delay_ms: retryDelayMs,
+    error_status: errorStatus,
+    error,
+    ...ctx.envelope(),
+  };
+}
+
+/**
  * @param {TurnContext} ctx
  * @param {string} suggestion
  * @returns {import('@anthropic-ai/claude-agent-sdk').SDKPromptSuggestionMessage}
@@ -872,11 +896,17 @@ async function* bashScenario(ctx) {
     { type: 'text', text: 'Let me look at the project.' },
     { type: 'tool_use', id: toolUseId, name: 'Bash', input },
   ], { stopReason: 'tool_use' });
+  /** @type {PermissionUpdate[]} */
+  const suggestions = [
+    { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow', destination: 'localSettings' },
+    { type: 'addDirectories', directories: [join(ctx.cwd, '..')], destination: 'session' },
+  ];
   const decision = yield* ctx.askPermission('Bash', input, {
     toolUseId,
     title: 'Claude wants to run ls -la',
     displayName: 'Run command',
     description: 'Lists the files in the project directory',
+    suggestions,
   });
   if (decision.allowed === false) {
     yield toolResult(ctx, { toolUseId, content: decision.message, isError: true });
@@ -888,7 +918,12 @@ async function* bashScenario(ctx) {
   yield toolResult(ctx, {
     toolUseId,
     content: LS_OUTPUT,
-    toolUseResult: { stdout: LS_OUTPUT, stderr: '', interrupted: false },
+    toolUseResult: {
+      stdout: LS_OUTPUT,
+      stderr: '',
+      interrupted: false,
+      updatedPermissions: decision.updatedPermissions,
+    },
   });
   yield toolUseSummary(ctx, 'Listed project files', [toolUseId]);
   yield* modelResponse(ctx, [{
@@ -1318,6 +1353,19 @@ async function* errorScenario() {
   throw new ScenarioFailure('Mock failure requested');
 }
 
+/**
+ * A rejected API key: the request is retried twice with a 401, then the turn fails with the sign-in hint.
+ * @type {Scenario['run']}
+ */
+async function* authScenario(ctx) {
+  const error = 'authentication_failed';
+  yield apiRetry(ctx, { attempt: 1, maxRetries: 2, retryDelayMs: 500, errorStatus: 401, error });
+  yield* ctx.pause(ctx.delayMs);
+  yield apiRetry(ctx, { attempt: 2, maxRetries: 2, retryDelayMs: 1000, errorStatus: 401, error });
+  yield* ctx.pause(ctx.delayMs);
+  throw new ScenarioFailure('Invalid API key · Please run /login');
+}
+
 /** @type {Scenario['run']} */
 async function* slowScenario(ctx) {
   const chunks = Array.from({ length: 60 }, (_, index) => `Part ${index + 1} of 60. `);
@@ -1355,6 +1403,7 @@ const SCENARIOS = [
   { name: 'notify', matches: keyword('notif'), run: notifyScenario },
   { name: 'rate', matches: keyword('rate'), run: rateScenario },
   { name: 'hook', matches: keyword('hook'), run: hookScenario },
+  { name: 'auth', matches: keyword('auth'), run: authScenario },
   { name: 'error', matches: keyword('error'), run: errorScenario },
   { name: 'slow', matches: keyword('slow'), run: slowScenario },
   { name: 'default', matches: () => true, run: answerScenario },

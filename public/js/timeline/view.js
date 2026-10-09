@@ -8,7 +8,7 @@ import { renderTool } from './tools/index.js';
 import { summarizeTool } from './tools/summaries.js';
 import { renderRequest } from './requests.js';
 import { renderMarkdown } from '../markdown.js';
-import { formatDuration, formatTokens, truncateMiddle } from './format.js';
+import { formatDuration, formatTokens, truncateMiddle, pluralKey } from './format.js';
 import { getLocale } from '../i18n.js';
 
 /** Window event that asks every timeline to reload one session's snapshot. `detail: { sessionId }`. */
@@ -175,7 +175,7 @@ export function createTimeline({ container, api, store, t, actions }) {
     if (state.destroyed || !data) return;
     const eventSession = typeof data.sessionId === 'string' ? data.sessionId
       : (data.live && typeof data.live.sessionId === 'string' ? data.live.sessionId : null);
-    if (state.loading && (type === 'sdk' || type === 'request' || type === 'request_resolved')) {
+    if (state.loading && (type === 'sdk' || type === 'request' || type === 'request_resolved' || type === 'notice')) {
       state.queue.push([type, data]);
       return;
     }
@@ -209,6 +209,13 @@ export function createTimeline({ container, api, store, t, actions }) {
         state.model.markFailed(String(data.clientMessageId ?? ''), data.error);
         break;
       }
+      case 'notice': {
+        // An engine that cannot run shows inline in the session's timeline too, not only as the shell's toast.
+        if (data.code !== 'ENGINE_UNAVAILABLE') return;
+        if (eventSession !== null && eventSession !== state.sessionId) return;
+        state.model.applyNotice({ code: 'ENGINE_UNAVAILABLE', level: 'error', text: '' });
+        break;
+      }
       case 'session_state': {
         const sid = eventSession ?? state.sessionId;
         if (sid !== state.sessionId) return;
@@ -234,15 +241,53 @@ export function createTimeline({ container, api, store, t, actions }) {
     scheduleRender();
   };
 
+  /**
+   * The top-most entry the reader sees, with its key and its distance from the top of the viewport. A replay rebuilds
+   * the elements, so the key is what still identifies the entry afterwards.
+   * @returns {{key: string, offset: number}|null}
+   */
+  const anchorAt = () => {
+    const viewTop = refs.scroller.getBoundingClientRect().top;
+    for (const el of refs.list.children) {
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom <= viewTop) continue;
+      for (const [key, stored] of listStore) {
+        if (stored.el === el) return { key, offset: rect.top - viewTop };
+      }
+      return null;
+    }
+    return null;
+  };
+
+  /**
+   * Puts the anchor entry back where the reader had it after older entries were added above it. Without a usable anchor
+   * the scroll moves by the height that was added.
+   * @param {{key: string, offset: number}|null} anchor
+   * @param {{previousTop: number, previousHeight: number}} before
+   */
+  const restoreAnchor = (anchor, before) => {
+    const { scroller } = refs;
+    const stored = anchor ? listStore.get(anchor.key) : undefined;
+    if (anchor && stored && stored.el.isConnected) {
+      const offset = stored.el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+      scroller.scrollTop += offset - anchor.offset;
+      return;
+    }
+    scroller.scrollTop = before.previousTop + (scroller.scrollHeight - before.previousHeight);
+  };
+
   /** Loads the page of transcript messages before the oldest loaded one, keeping the scroll position. */
   const loadOlder = async () => {
     if (!state.sessionId || !state.hasMore || state.loadingOlder || state.destroyed) return;
     state.loadingOlder = true;
     const sessionId = state.sessionId;
     const token = state.loadToken;
+    render();
     const previousHeight = refs.scroller.scrollHeight;
     const previousTop = refs.scroller.scrollTop;
-    render();
+    const anchor = anchorAt();
+    // The browser's own scroll anchoring would adjust the position again after the prepend; the restore below does it.
+    refs.scroller.style.overflowAnchor = 'none';
     try {
       const page = await api.get(`/api/sessions/${encodeURIComponent(sessionId)}/messages?before=${state.oldestIndex}&limit=200`);
       if (state.destroyed || token !== state.loadToken) return;
@@ -251,10 +296,11 @@ export function createTimeline({ container, api, store, t, actions }) {
       state.hasMore = Boolean(page?.hasMore);
       state.forceStick = false;
       render();
-      refs.scroller.scrollTop = previousTop + (refs.scroller.scrollHeight - previousHeight);
+      restoreAnchor(anchor, { previousTop, previousHeight });
     } catch (err) {
       if (!state.destroyed && err?.name !== 'AbortError') actions.toast(t('cards.error.loadEarlier'), 'error');
     } finally {
+      refs.scroller.style.overflowAnchor = '';
       state.loadingOlder = false;
       if (!state.destroyed) render();
     }
@@ -512,13 +558,7 @@ function syncOpen(details, store, key, defaultOpen) {
  * @returns {string} "1 turn" or "N turns", in the plural form of the active locale
  */
 function turnCount(t, count) {
-  let form = count === 1 ? 'one' : 'other';
-  try {
-    form = new Intl.PluralRules(getLocale()).select(count);
-  } catch {
-    // Keep the English-style split when the locale tag is not usable.
-  }
-  return t(form === 'one' ? 'cards.result.turns.one' : 'cards.result.turns.other', { count });
+  return t(pluralKey('cards.result.turns', count, getLocale()), { count });
 }
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -594,9 +634,11 @@ function userEl(ui, entry) {
         on: {
           click: () => {
             ui.discardOptimistic(entry.clientMessageId);
+            // The retry keeps the id of the failed message, so the gateway can tell a repeat from a new message.
             actions.sendMessage({
               text: entry.text,
               attachments: (entry.attachments ?? []).map((file) => ({ path: file.path, name: file.name, kind: file.kind })),
+              clientMessageId: entry.clientMessageId,
             });
           },
         },
@@ -842,7 +884,7 @@ function rowEl(ui, row) {
       : status === 'completed' ? t('cards.task.completed')
         : status === 'failed' ? t('cards.task.failed') : t('cards.task.stopped');
     const details = [];
-    if (typeof row.toolUses === 'number') details.push(t('cards.task.tools', { count: row.toolUses }));
+    if (typeof row.toolUses === 'number') details.push(t(pluralKey('cards.task.tools', row.toolUses, getLocale()), { count: row.toolUses }));
     if (typeof row.durationMs === 'number') details.push(formatDuration(row.durationMs));
     return h('div', { class: ['work-row', 'is-task', failed && 'is-error'], dataset: { kind: 'task', status }, attrs: { role: 'status' } },
       icon(done ? (failed ? 'alert' : 'check') : 'clock'),
@@ -883,8 +925,12 @@ function noticeText(ui, entry) {
       const base = t('cards.notice.apiRetry', { attempt: vars.attempt ?? '?', max: vars.max ?? '?', seconds });
       return vars.error ? `${base} · ${String(vars.error)}` : base;
     }
-    case 'memory-recall':
-      return t('cards.notice.memory', { count: vars.count ?? 0 });
+    case 'memory-recall': {
+      const count = Number.isFinite(vars.count) ? vars.count : 0;
+      return t(pluralKey('cards.notice.memory', count, getLocale()), { count });
+    }
+    case 'ENGINE_UNAVAILABLE':
+      return t('common.error.ENGINE_UNAVAILABLE');
     case 'assistant-error':
       return t('cards.notice.assistantError', { error: String(vars.error ?? '') });
     case 'compact-failed':

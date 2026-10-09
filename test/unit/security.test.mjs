@@ -5,11 +5,13 @@ import {
   SessionStore,
   SlidingWindowCounter,
   canonicalExactOrigin,
+  isAllowedHost,
   isLoopbackHost,
   randomToken,
   safeEqualText,
   sameOrigin,
   secureHeaders,
+  sha256Hex,
 } from '../../src/security.mjs';
 
 const CSP = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
@@ -124,6 +126,32 @@ describe('small helpers', () => {
       assert.equal(isLoopbackHost(host), false, host);
     }
   });
+
+  it('computes lowercase hex SHA-256 digests', () => {
+    assert.equal(sha256Hex('abc'), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+  });
+
+  it('accepts loopback Host names on any port and nothing else without a public origin', () => {
+    for (const host of ['127.0.0.1', '127.0.0.1:4180', 'localhost', 'LocalHost:65535', '[::1]', '[::1]:1']) {
+      assert.equal(isAllowedHost(host), true, host);
+    }
+    for (const host of ['', undefined, 'localhost.', '127.0.0.1:0', '127.0.0.1:65536', '::1', '[::1]:', 'evil.example',
+      '127.0.0.1.nip.io', 'localhost:4180:4180', '10.0.0.5:4180', ['localhost', 'evil.example']]) {
+      assert.equal(isAllowedHost(host), false, String(host));
+    }
+  });
+
+  it('additionally accepts exactly the host[:port] of the public origin', () => {
+    assert.equal(isAllowedHost('gw.example', 'https://gw.example'), true);
+    assert.equal(isAllowedHost('GW.example', 'https://gw.example'), true);
+    assert.equal(isAllowedHost('gw.example:8443', 'https://gw.example:8443'), true);
+    assert.equal(isAllowedHost('gw.example:8443', 'https://gw.example'), false);
+    assert.equal(isAllowedHost('gw.example', 'https://gw.example:8443'), false);
+    assert.equal(isAllowedHost('sub.gw.example', 'https://gw.example'), false);
+    assert.equal(isAllowedHost('gw.example.evil', 'https://gw.example'), false);
+    assert.equal(isAllowedHost('127.0.0.1:4180', 'https://gw.example'), true, 'loopback names stay allowed');
+    assert.equal(isAllowedHost('gw.example', 'not an origin'), false);
+  });
 });
 
 describe('SessionStore', () => {
@@ -206,6 +234,50 @@ describe('SessionStore', () => {
     time.advance(1000);
     store.revoke(store.create());
     assert.equal(store.revokedCount, 1);
+  });
+
+  it('drops the revocation that expires first when the bound is reached', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 1000, now: time.now, maxRevoked: 2 });
+    const first = store.create();
+    time.advance(10);
+    const second = store.create();
+    time.advance(10);
+    const third = store.create();
+    store.revoke(first);
+    store.revoke(second);
+    store.revoke(third);
+    assert.deepEqual(Object.keys(store.revocations()).sort(), [sha256Hex(second), sha256Hex(third)].sort());
+    assert.equal(store.has(first), true, 'the earliest revocation was dropped; that token lives until it expires');
+  });
+
+  it('exports revocations as digests that restore into another store, dropping expired and malformed entries', () => {
+    const time = clock();
+    const issuer = new SessionStore({ secret, ttlMs: 10000, now: time.now });
+    const revoked = issuer.create();
+    const expired = issuer.create();
+    issuer.revoke(revoked);
+    const snapshot = issuer.revocations();
+    assert.deepEqual(Object.keys(snapshot), [sha256Hex(revoked)]);
+    assert.equal(JSON.stringify(snapshot).includes(revoked), false, 'the cookie value itself is never exported');
+
+    const restored = new SessionStore({ secret, ttlMs: 10000, now: time.now });
+    restored.restore({ ...snapshot, 'not-a-digest': time.now() + 5000, [sha256Hex(expired)]: time.now() - 1 });
+    assert.equal(restored.has(revoked), false);
+    assert.equal(restored.revokedCount, 1);
+    restored.restore('garbage');
+    restored.restore(null);
+    restored.restore([]);
+    assert.equal(restored.revokedCount, 1);
+  });
+
+  it('keeps the latest-expiring revocations when restoring more than the bound', () => {
+    const time = clock();
+    const store = new SessionStore({ secret, ttlMs: 100000, now: time.now, maxRevoked: 2 });
+    store.restore({
+      [sha256Hex('a')]: time.now() + 10, [sha256Hex('b')]: time.now() + 30, [sha256Hex('c')]: time.now() + 20,
+    });
+    assert.deepEqual(Object.keys(store.revocations()).sort(), [sha256Hex('b'), sha256Hex('c')].sort());
   });
 
   it('validates its constructor arguments', () => {

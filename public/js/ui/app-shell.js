@@ -11,9 +11,9 @@ import { createHeader } from './header.js';
 import { createComposer } from './composer.js';
 import { createSidebar } from './sidebar.js';
 import { createToasts } from './toasts.js';
-import { closeAllDialogs } from './dialog.js';
+import { closeAllDialogs, hasOpenDialog } from './dialog.js';
 import { closeMenu } from './menu.js';
-import { closePanel, openPanel, refreshSessionList, renameSessionDialog } from './panels.js';
+import { closePanel, hasOpenSheet, openPanel, refreshSessionList, renameSessionDialog } from './panels.js';
 import { openNewSessionDialog } from './new-session.js';
 import { formatClock } from './sidebar-model.js';
 import { createTimeline } from '../timeline/view.js';
@@ -24,7 +24,7 @@ const MOBILE_QUERY = '(max-width: 767.98px)';
 const SESSIONS_DEBOUNCE_MS = 300;
 const CONNECTION_GRACE_MS = 2000;
 const FORWARDED_EVENTS = new Set(['message_accepted', 'sdk', 'request', 'request_resolved', 'session_state',
-  'resync']);
+  'resync', 'notice']);
 
 /**
  * @param {string} hash
@@ -63,6 +63,12 @@ export function createAppShell({ root, api, store, t }) {
   let sessionsTimer = null;
   /** @type {ReturnType<typeof connectEvents> | null} */
   let events = null;
+  /** Session ids whose untrusted-folder banner was dismissed during this page view. */
+  const trustDismissed = new Set();
+  let trustBusy = false;
+  let drawerOpen = false;
+  /** @type {Element | null} */
+  let drawerReturnFocus = null;
 
   /** @type {Partial<{header: any, composer: any, timeline: any, sidebar: any, terminal: any}>} */
   let parts = {};
@@ -162,12 +168,14 @@ export function createAppShell({ root, api, store, t }) {
   function mountParts() {
     timelineHost = h('div', { class: 'app-timeline' });
     timelineSlot.replaceChildren(welcomeHost, timelineHost);
+    // The terminal panel is created once: a language change rebuilds the other parts but must not close its socket.
+    const terminal = parts.terminal ?? createTerminalPanel({ container: terminalSlot, api, store, t });
     parts = {
+      terminal,
       header: createHeader({ container: headerSlot, api, store, t, actions }),
       composer: createComposer({ container: composerSlot, api, store, t, actions }),
       timeline: createTimeline({ container: timelineHost, api, store, t, actions }),
       sidebar: createSidebar({ container: sidebarEl, api, store, t, actions }),
-      terminal: createTerminalPanel({ container: terminalSlot, api, store, t }),
     };
     const id = currentSessionId();
     parts.header.setSession(id);
@@ -176,12 +184,16 @@ export function createAppShell({ root, api, store, t }) {
     renderBanners();
   }
 
-  function unmountParts() {
-    for (const part of Object.values(parts)) part?.destroy?.();
-    parts = {};
+  /** @param {{ keepTerminal?: boolean }} [options] */
+  function unmountParts({ keepTerminal = false } = {}) {
+    for (const [name, part] of Object.entries(parts)) {
+      if (keepTerminal && name === 'terminal') continue;
+      part?.destroy?.();
+    }
+    parts = keepTerminal && parts.terminal ? { terminal: parts.terminal } : {};
     clear(headerSlot);
     clear(composerSlot);
-    clear(terminalSlot);
+    if (!keepTerminal) clear(terminalSlot);
   }
 
   /** @param {string} sessionId */
@@ -200,7 +212,11 @@ export function createAppShell({ root, api, store, t }) {
    */
   async function selectSession(sessionId, { history = 'push' } = {}) {
     if (destroyed) return;
-    if (sessionId === currentSessionId() && sessionId !== null) return;
+    if (sessionId === currentSessionId() && sessionId !== null) {
+      // Tapping the open session in the phone drawer only closes the drawer.
+      if (isMobile()) setSidebarOpen(false);
+      return;
+    }
     const token = ++loadToken;
     store.set({ currentSessionId: sessionId });
     rateLimit = null;
@@ -249,16 +265,18 @@ export function createAppShell({ root, api, store, t }) {
   }
 
   /**
-   * @param {{text: string, attachments?: Array<{path: string}>}} payload
+   * A retry passes the clientMessageId of the attempt it repeats. The gateway accepts a duplicate within 10 minutes,
+   * and the timeline keeps one row per clientMessageId.
+   * @param {{text: string, attachments?: Array<{path: string}>, clientMessageId?: string}} payload
    * @returns {Promise<boolean>}
    */
-  async function sendMessage({ text, attachments = [] }) {
+  async function sendMessage({ text, attachments = [], clientMessageId: retryId }) {
     const sessionId = currentSessionId();
     if (!sessionId) {
       toast(t('shell.send.noSession'), 'warning');
       return false;
     }
-    const clientMessageId = createUuid();
+    const clientMessageId = typeof retryId === 'string' && retryId !== '' ? retryId : createUuid();
     parts.timeline?.addOptimisticUserMessage({ clientMessageId, text, attachments });
     try {
       await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
@@ -434,7 +452,16 @@ export function createAppShell({ root, api, store, t }) {
     delete live[sessionId];
     const pending = { ...store.get().pending };
     delete pending[sessionId];
-    store.set({ live, pending });
+    /** @type {Record<string, unknown>} */
+    const patch = { live, pending };
+    // Session rows can carry their own live snapshot; clear it so the sidebar stops showing the session as running.
+    const sessions = store.get().sessions;
+    if (sessions.some((session) => session.sessionId === sessionId && session.live)) {
+      patch.sessions = sessions.map((session) => (session.sessionId === sessionId
+        ? { ...session, live: null }
+        : session));
+    }
+    store.set(patch);
   }
 
   /** @param {any} data */
@@ -594,12 +621,19 @@ export function createAppShell({ root, api, store, t }) {
   /**
    * @param {'info'|'warning'|'danger'} level
    * @param {string} text
-   * @param {() => void} [onDismiss]
+   * @param {(() => void) | null} [onDismiss]
+   * @param {{label: string, onClick: () => void, disabled?: boolean} | null} [action]
    */
-  function banner(level, text, onDismiss) {
+  function banner(level, text, onDismiss, action = null) {
     return h('div', { class: `banner banner-${level}`, attrs: { role: 'status' } },
       icon(level === 'info' ? 'info' : 'alert'),
       h('p', { class: 'banner-text', text }),
+      action ? h('button', {
+        class: 'btn btn-secondary btn-sm banner-action',
+        attrs: { type: 'button', disabled: action.disabled === true },
+        on: { click: action.onClick },
+        text: action.label,
+      }) : null,
       onDismiss ? h('button', {
         class: 'btn btn-ghost btn-icon btn-sm',
         attrs: { type: 'button', 'aria-label': t('common.dismiss') },
@@ -607,9 +641,62 @@ export function createAppShell({ root, api, store, t }) {
       }, icon('x')) : null);
   }
 
+  /**
+   * The current session when it runs with user settings only because its folder is untrusted, the dialog is not
+   * dismissed, and this viewer may change trust (profile standard or full). Returns null otherwise.
+   * @param {Record<string, any>} state
+   * @returns {{sessionId: string, path: string} | null}
+   */
+  function trustNeeded(state) {
+    const sessionId = state.currentSessionId;
+    if (!sessionId || trustDismissed.has(sessionId)) return null;
+    const live = state.live[sessionId];
+    if (!live || live.trusted !== false) return null;
+    const profile = state.meta?.profile ?? state.auth?.profile ?? null;
+    if (profile === 'read') return null;
+    const path = live.cwd || state.sessions.find((session) => session.sessionId === sessionId)?.cwd || '';
+    return path ? { sessionId, path } : null;
+  }
+
+  /** @param {Record<string, any>} state */
+  function trustKey(state) {
+    const need = trustNeeded(state);
+    return need ? `${need.sessionId}\n${need.path}` : '';
+  }
+
+  /**
+   * Trust the folder, then restart the live session: trust applies to sessions (re)opened later.
+   * @param {{sessionId: string, path: string}} trust
+   */
+  async function trustFolder({ sessionId, path }) {
+    if (trustBusy) return;
+    trustBusy = true;
+    renderBanners();
+    try {
+      await api.post('/api/fs/trust', { path, trusted: true });
+      const id = encodeURIComponent(sessionId);
+      await api.post(`/api/sessions/${id}/close`, {});
+      const result = await api.post(`/api/sessions/${id}/open`, {});
+      if (!destroyed && result?.live) store.set({ live: { ...store.get().live, [sessionId]: result.live } });
+      toast(t('shell.trust.done'), 'success');
+    } catch (err) {
+      toast(errorText(err, t), 'error');
+    } finally {
+      trustBusy = false;
+      if (!destroyed) renderBanners();
+    }
+  }
+
   function renderBanners() {
     clear(bannerSlot);
     if (connectionLost) bannerSlot.append(banner('warning', t('shell.connection.lost')));
+    const trust = trustNeeded(store.get());
+    if (trust) {
+      bannerSlot.append(banner('warning', t('shell.trust.bannerText'), () => {
+        trustDismissed.add(trust.sessionId);
+        renderBanners();
+      }, { label: t('shell.trust.button'), disabled: trustBusy, onClick: () => trustFolder(trust) }));
+    }
     if (rateLimit && rateLimit.status !== 'allowed') {
       const reset = rateLimit.resetsAt ? formatClock(rateLimit.resetsAt * 1000, getLocale()) : '';
       const rejected = rateLimit.status === 'rejected';
@@ -688,6 +775,39 @@ export function createAppShell({ root, api, store, t }) {
   function applySidebarState() {
     const { prefs } = store.get();
     layout.dataset.sidebar = prefs.sidebarOpen ? 'open' : 'closed';
+    syncDrawer();
+  }
+
+  /**
+   * On phones the sidebar is a modal drawer. While it is open, focus moves into it and the main area is inert. When
+   * it closes, focus returns to the element that opened it (the menu button by default).
+   */
+  function syncDrawer() {
+    const open = isMobile() && store.get().prefs.sidebarOpen === true;
+    if (open === drawerOpen) return;
+    drawerOpen = open;
+    if (open) {
+      drawerReturnFocus = document.activeElement;
+      main.inert = true;
+      const first = [...sidebarEl.querySelectorAll('button:not([disabled]), input:not([disabled]), a[href]')]
+        .find((element) => element.getClientRects().length > 0);
+      if (first instanceof HTMLElement) first.focus({ preventScroll: true });
+      return;
+    }
+    main.inert = false;
+    const saved = drawerReturnFocus;
+    drawerReturnFocus = null;
+    const target = saved instanceof HTMLElement && saved.isConnected && saved !== document.body ? saved : reopenButton;
+    target.focus({ preventScroll: true });
+  }
+
+  /** Escape closes the phone drawer, unless a dialog or sheet is on top or the search box still has text to clear. */
+  function onDrawerKeydown(/** @type {KeyboardEvent} */ event) {
+    if (event.key !== 'Escape' || !drawerOpen) return;
+    if (hasOpenDialog() || hasOpenSheet()) return;
+    if (event.target instanceof HTMLInputElement && event.target.value !== '') return;
+    event.preventDefault();
+    setSidebarOpen(false);
   }
 
   const onHashChange = () => {
@@ -696,6 +816,7 @@ export function createAppShell({ root, api, store, t }) {
   };
   const onViewportChange = () => {
     setSidebarOpen(!isMobile());
+    syncDrawer();
   };
 
   mountParts();
@@ -709,6 +830,8 @@ export function createAppShell({ root, api, store, t }) {
       updateDocumentTitle();
     }
     if (state.connection !== prev.connection) updateConnection(state.connection);
+    // Re-render the banners only when the trust target changes, so focus on a banner button survives live updates.
+    if (trustKey(state) !== trustKey(prev)) renderBanners();
     if (state.sessionsReady !== prev.sessionsReady || state.sessions !== prev.sessions
       || state.currentSessionId !== prev.currentSessionId) {
       renderWelcome();
@@ -717,7 +840,7 @@ export function createAppShell({ root, api, store, t }) {
   const unsubscribeLocale = onLocaleChange(() => {
     if (destroyed) return;
     const sessionId = currentSessionId();
-    unmountParts();
+    unmountParts({ keepTerminal: true });
     mountParts();
     if (sessionId && parts.timeline) {
       const token = ++loadToken;
@@ -728,6 +851,7 @@ export function createAppShell({ root, api, store, t }) {
     }
   });
   window.addEventListener('hashchange', onHashChange);
+  document.addEventListener('keydown', onDrawerKeydown);
   mobileQuery?.addEventListener?.('change', onViewportChange);
   boot();
 
@@ -742,7 +866,9 @@ export function createAppShell({ root, api, store, t }) {
       unsubscribeStore();
       unsubscribeLocale();
       window.removeEventListener('hashchange', onHashChange);
+      document.removeEventListener('keydown', onDrawerKeydown);
       mobileQuery?.removeEventListener?.('change', onViewportChange);
+      main.inert = false;
       closePanel();
       closeAllDialogs();
       closeMenu();

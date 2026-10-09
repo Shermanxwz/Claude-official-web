@@ -378,6 +378,37 @@ describe('attachments', () => {
       assert.equal(state.dirs[9999].path, path.dirname(result.path));
     });
 
+    it('removes the batch directories of evicted records under the cleanup safety checks', async () => {
+      const store = createStateStore(path.join(tmp, 'state-evict'));
+      const attachments = makeAttachments({ store });
+      const cwd = await freshCwd('evict');
+      const uploads = path.join(cwd, UPLOAD_DIR_NAME);
+      const oldBatch = path.join(uploads, '20250101-11111111');
+      await fs.promises.mkdir(oldBatch, { recursive: true });
+      await fs.promises.writeFile(path.join(oldBatch, 'old.txt'), 'old');
+      const escapeTarget = path.join(outside, 'evict-target');
+      await fs.promises.mkdir(escapeTarget, { recursive: true });
+      await fs.promises.writeFile(path.join(escapeTarget, 'keep.txt'), 'keep');
+      const linkedBatch = path.join(uploads, '20250101-22222222');
+      await fs.promises.symlink(escapeTarget, linkedBatch);
+      const ghosts = Array.from({ length: 9999 }, (_, i) => ({
+        path: path.join(tmp, 'ghost', String(i)), createdAt: i + 2,
+      }));
+      await store.write('uploads', {
+        dirs: [{ path: oldBatch, createdAt: 0 }, { path: linkedBatch, createdAt: 1 }, ...ghosts],
+      });
+
+      const result = await attachments.save(request('new'), { cwd, fileName: 'new.txt', mediaType: 'text/plain' });
+
+      assert.equal(fs.existsSync(oldBatch), false);
+      assert.equal(fs.lstatSync(linkedBatch).isSymbolicLink(), true);
+      assert.equal(fs.readFileSync(path.join(escapeTarget, 'keep.txt'), 'utf8'), 'keep');
+      const { dirs } = await store.read('uploads', { dirs: [] });
+      assert.equal(dirs.length, 10000);
+      assert.equal(dirs.at(-1).path, path.dirname(result.path));
+      assert.equal(dirs.some((entry) => entry.path === oldBatch || entry.path === linkedBatch), false);
+    });
+
     it('never logs file names or file contents', async () => {
       const logger = createLog();
       const attachments = makeAttachments({ logger });

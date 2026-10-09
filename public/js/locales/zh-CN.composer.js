@@ -47,6 +47,7 @@ registerMessages('zh-CN', {
   'composer.attach.imageTooLarge': '图片超过 {max}',
   'composer.attach.disabled': '本服务器已关闭附件上传',
   'composer.attach.noCwd': '该会话没有可上传的目录',
+  'composer.attach.interrupted': '上传已中断',
   'composer.attach.blocked': '请等待上传完成，并移除上传失败的文件后再发送。',
   'composer.drop': '松开即可添加附件',
   'composer.queued': '将在当前回合结束后发送',

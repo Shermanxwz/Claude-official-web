@@ -399,8 +399,20 @@ function deny(message) {
  */
 function selectSuggestions(suggestions, indexes) {
   const list = Array.isArray(suggestions) ? suggestions : [];
-  if (indexes === undefined) return [...list];
+  if (indexes === undefined) return list.filter(isAllowRuleSuggestion);
   return indexes.map((index) => list[index]);
+}
+
+/**
+ * Suggestions applied by "Always allow" when the client names none: allow rules only. Directory grants, mode changes
+ * and deny rules widen access in ways the user must opt into explicitly (docs/PROTOCOL.md).
+ * @param {unknown} suggestion
+ * @returns {boolean}
+ */
+function isAllowRuleSuggestion(suggestion) {
+  if (!suggestion || typeof suggestion !== 'object') return false;
+  const { type, behavior } = /** @type {{type?: unknown, behavior?: unknown}} */ (suggestion);
+  return (type === 'addRules' || type === 'replaceRules') && behavior === 'allow';
 }
 
 /**

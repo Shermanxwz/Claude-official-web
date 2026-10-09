@@ -3,7 +3,7 @@
  * Server-Sent Events hub: one global sequence, a bounded replay buffer, per-client backpressure limits and heartbeats.
  */
 
-import { EVENT_TYPES, SESSION_SCOPED_EVENTS } from './contracts.mjs';
+import { AppError, EVENT_TYPES, SESSION_SCOPED_EVENTS } from './contracts.mjs';
 import { secureHeaders } from './security.mjs';
 
 /** @typedef {import('node:http').IncomingMessage} IncomingMessage */
@@ -21,6 +21,7 @@ import { secureHeaders } from './security.mjs';
 /**
  * @typedef {Object} Client
  * @property {ServerResponse} res
+ * @property {string} address       client address the stream counts against
  * @property {string|undefined} watch
  * @property {boolean} blocked       true from the first unflushed write until 'drain'
  * @property {number} pending        bytes written while blocked
@@ -57,12 +58,18 @@ export class EventHub {
   #bufferSize;
   /** @type {number} */
   #clientMaxBytes;
+  /** @type {number} */
+  #maxStreams;
+  /** @type {number} */
+  #maxStreamsPerClient;
   /** @type {(BufferedEvent|undefined)[]} */
   #ring;
   /** @type {number} */
   #seq = 0;
   /** @type {Set<Client>} */
   #clients = new Set();
+  /** @type {Map<string, number>} client address -> open streams */
+  #perAddress = new Map();
   /** @type {ReturnType<typeof setInterval>|null} */
   #timer = null;
   /** @type {boolean} */
@@ -70,20 +77,31 @@ export class EventHub {
 
   /**
    * @param {{bootId: string, version: string, log: Logger, bufferSize?: number, clientMaxBytes?: number,
-   *   heartbeatMs?: number}} options
+   *   heartbeatMs?: number, maxStreams?: number, maxStreamsPerClient?: number}} options
    */
-  constructor({ bootId, version, log, bufferSize = 5000, clientMaxBytes = 1048576, heartbeatMs = 15000 }) {
+  constructor({
+    bootId, version, log, bufferSize = 5000, clientMaxBytes = 1048576, heartbeatMs = 15000, maxStreams = 64,
+    maxStreamsPerClient = 16,
+  }) {
     if (!Number.isSafeInteger(bufferSize) || bufferSize < 1) {
       throw new TypeError('bufferSize must be a positive integer');
     }
     if (!Number.isSafeInteger(clientMaxBytes) || clientMaxBytes < 1) {
       throw new TypeError('clientMaxBytes must be a positive integer');
     }
+    if (!Number.isSafeInteger(maxStreams) || maxStreams < 1) {
+      throw new TypeError('maxStreams must be a positive integer');
+    }
+    if (!Number.isSafeInteger(maxStreamsPerClient) || maxStreamsPerClient < 1) {
+      throw new TypeError('maxStreamsPerClient must be a positive integer');
+    }
     this.#bootId = bootId;
     this.#version = version;
     this.#log = log;
     this.#bufferSize = bufferSize;
     this.#clientMaxBytes = clientMaxBytes;
+    this.#maxStreams = maxStreams;
+    this.#maxStreamsPerClient = maxStreamsPerClient;
     this.#ring = new Array(bufferSize);
     this.#timer = setInterval(() => this.#heartbeat(), heartbeatMs);
     this.#timer.unref?.();
@@ -123,16 +141,26 @@ export class EventHub {
 
   /**
    * Opens an SSE stream on the response. Replays buffered events after the cursor, or sends `resync` when the
-   * cursor cannot be honoured.
+   * cursor cannot be honoured. Throws AppError 429 TOO_MANY_STREAMS before any header is written when the hub-wide or
+   * the per-address limit is reached, so the caller can answer with an ordinary JSON error.
    * @param {IncomingMessage} req
    * @param {ServerResponse} res
-   * @param {{watch?: string, after?: number, lastEventId?: string, headers?: Record<string, string|number>}} options
+   * @param {{clientAddress: string, watch?: string, after?: number, lastEventId?: string,
+   *   headers?: Record<string, string|number>}} options
    */
-  attach(req, res, { watch, after, lastEventId, headers = secureHeaders() }) {
+  attach(req, res, { clientAddress, watch, after, lastEventId, headers = secureHeaders() }) {
     if (this.#closed) {
       res.writeHead(503, { ...headers, 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('The server is shutting down');
       return;
+    }
+    if (this.#clients.size >= this.#maxStreams) {
+      this.#log.warn('event stream refused', { scope: 'total', open: this.#clients.size });
+      throw new AppError(429, 'TOO_MANY_STREAMS', 'Too many event streams are open');
+    }
+    if ((this.#perAddress.get(clientAddress) ?? 0) >= this.#maxStreamsPerClient) {
+      this.#log.warn('event stream refused', { scope: 'client' });
+      throw new AppError(429, 'TOO_MANY_STREAMS', 'Too many event streams are open for this client');
     }
     res.writeHead(200, {
       ...headers,
@@ -143,8 +171,9 @@ export class EventHub {
     });
     res.socket?.setNoDelay?.(true);
     /** @type {Client} */
-    const client = { res, watch, blocked: false, pending: 0, ended: false };
+    const client = { res, address: clientAddress, watch, blocked: false, pending: 0, ended: false };
     this.#clients.add(client);
+    this.#perAddress.set(clientAddress, (this.#perAddress.get(clientAddress) ?? 0) + 1);
     res.on('close', () => this.#remove(client));
     res.on('error', () => this.#remove(client));
 
@@ -264,8 +293,12 @@ export class EventHub {
 
   /** @param {Client} client */
   #remove(client) {
+    if (client.ended) return;
     client.ended = true;
     this.#clients.delete(client);
+    const open = (this.#perAddress.get(client.address) ?? 1) - 1;
+    if (open > 0) this.#perAddress.set(client.address, open);
+    else this.#perAddress.delete(client.address);
   }
 
   /** Ends every stream and stops the heartbeat. Publishing remains possible afterwards. */

@@ -123,6 +123,24 @@ export function stripAnsi(str) {
 }
 
 /**
+ * The key of a count-aware message in a locale: `${base}.one` for the singular form, `${base}.other` for the rest. Every
+ * locale file carries both forms; a locale without a separate singular (zh-CN) gives the same text for both.
+ * @param {string} base  e.g. 'cards.task.tools'
+ * @param {number} count
+ * @param {string} locale  e.g. 'en' or 'zh-CN'
+ * @returns {string}
+ */
+export function pluralKey(base, count, locale) {
+  let form = count === 1 ? 'one' : 'other';
+  try {
+    form = new Intl.PluralRules(locale || 'en').select(Number(count));
+  } catch {
+    // Keep the English split when the locale tag is not usable.
+  }
+  return `${base}.${form === 'one' ? 'one' : 'other'}`;
+}
+
+/**
  * @param {number} value
  * @returns {string}
  */

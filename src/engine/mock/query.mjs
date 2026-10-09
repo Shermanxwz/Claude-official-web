@@ -788,7 +788,7 @@ export async function* askPermission(core, turn, toolName, input, detail) {
   const view = sessionView(core);
   const mode = core.permissionMode;
   if (mode === 'bypassPermissions' || (mode === 'acceptEdits' && EDIT_TOOLS.has(toolName))) {
-    return { allowed: true, input };
+    return { allowed: true, input, updatedPermissions: [] };
   }
   if (mode === 'dontAsk' || turn.canUseTool === undefined) {
     const reason = mode === 'dontAsk' ? 'dontAsk' : 'no_prompt_tool';
@@ -800,7 +800,9 @@ export async function* askPermission(core, turn, toolName, input, detail) {
     return { allowed: false, message, interrupt: false };
   }
   /** @type {PermissionUpdate[]} */
-  const suggestions = [{ type: 'addRules', rules: [{ toolName }], behavior: 'allow', destination: 'localSettings' }];
+  const suggestions = detail.suggestions ?? [
+    { type: 'addRules', rules: [{ toolName }], behavior: 'allow', destination: 'localSettings' },
+  ];
   const canUseTool = turn.canUseTool;
   yield stateChanged(view, 'requires_action');
   const decision = yield* waitFor(core, Promise.resolve().then(() => canUseTool(toolName, input, {
@@ -816,7 +818,13 @@ export async function* askPermission(core, turn, toolName, input, detail) {
     suggestions,
   })), turn.signal);
   yield stateChanged(view, 'running');
-  if (decision.behavior === 'allow') return { allowed: true, input: decision.updatedInput ?? input };
+  if (decision.behavior === 'allow') {
+    return {
+      allowed: true,
+      input: decision.updatedInput ?? input,
+      updatedPermissions: [...(decision.updatedPermissions ?? [])],
+    };
+  }
   turn.denials.push({ tool_name: toolName, tool_use_id: detail.toolUseId, tool_input: input });
   if (decision.interrupt === true) throw new TurnStop('aborted_tools', decision.message);
   return { allowed: false, message: decision.message, interrupt: false };
@@ -1182,9 +1190,15 @@ export const AGENTS = [
 ];
 
 /** @type {ModelInfo[]} */
+/**
+ * The model aliases a client can pick. `resolvedModel` is the wire id each alias stands for, so a host can match the
+ * model of the init message against the alias row.
+ * @type {ModelInfo[]}
+ */
 export const MODELS = [
   {
     value: 'default',
+    resolvedModel: 'claude-sonnet-mock',
     displayName: 'Default (recommended)',
     description: 'Balanced model for everyday coding work',
     supportsEffort: true,
@@ -1192,6 +1206,7 @@ export const MODELS = [
   },
   {
     value: 'opus',
+    resolvedModel: 'claude-opus-mock',
     displayName: 'Opus',
     description: 'Most capable model for complex, long-running work',
     supportsEffort: true,
@@ -1199,6 +1214,7 @@ export const MODELS = [
   },
   {
     value: 'sonnet',
+    resolvedModel: 'claude-sonnet-mock',
     displayName: 'Sonnet',
     description: 'Fast and capable model for most coding tasks',
     supportsEffort: true,
@@ -1206,6 +1222,7 @@ export const MODELS = [
   },
   {
     value: 'haiku',
+    resolvedModel: 'claude-haiku-mock',
     displayName: 'Haiku',
     description: 'Fastest model for simple, well-defined tasks',
     supportsEffort: false,

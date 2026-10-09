@@ -6,7 +6,8 @@
 import { h, clear, icon } from '../dom.js';
 import { errorText } from '../api.js';
 import { getLocale } from '../i18n.js';
-import { relativeTime, truncateMiddle } from './format.js';
+import { relativeTime } from './format.js';
+import { isDefaultChecked, describeSuggestion, checkedIndexes } from './suggestions.js';
 import { displayPath, isRecord } from './tools/summaries.js';
 import { renderTool } from './tools/index.js';
 
@@ -14,7 +15,6 @@ const KINDS = Object.freeze(['permission', 'question', 'plan', 'elicitation']);
 const PREVIEW_LIMIT = 4000;
 const TEXT_LIMIT = 2000;
 const SHORT_LIMIT = 500;
-const RULE_LIMIT = 120;
 const MAX_QUESTIONS = 4;
 const MAX_OPTIONS = 12;
 const MAX_FIELDS = 25;
@@ -75,8 +75,9 @@ let cardCounter = 0;
  *   actionsEl: HTMLElement,
  *   endpoint: string | null,
  *   controls: HTMLElement[],
- *   keys: Map<string, {body: () => Record<string, unknown>}> | null,
+ *   keys: Map<string, {body: () => Record<string, unknown>, enabled?: () => boolean}> | null,
  *   focusTarget: HTMLElement | null,
+ *   gate?: () => void,
  * }} RequestView
  */
 
@@ -199,26 +200,30 @@ function buildPermission(view, request) {
       'aria-label': t('cards.request.denyReason'),
     },
   });
+  const suggestions = Array.isArray(request.suggestions) ? request.suggestions : [];
+  // "Always allow" applies the suggestions the user has checked. Rules that allow start checked; the rest start unchecked.
+  const always = suggestions.length > 0 && request.suppressAlwaysAllowRule !== true ? suggestionList(view, suggestions) : null;
+  if (always) details.push(always.element);
   details.push(h('label', { class: 'field request-deny-field' },
     h('span', { class: 'field-label', text: t('cards.request.denyReason') }),
     denyReason));
   view.bodyEl.append(...details);
   view.controls.push(denyReason);
 
-  const suggestions = Array.isArray(request.suggestions) ? request.suggestions : [];
-  /** @type {Array<{kind: 'primary'|'secondary', label: string, title: string|null, body: () => Record<string, unknown>}>} */
+  /** @type {Array<{kind: 'primary'|'secondary', label: string, title: string|null, enabled?: () => boolean, body: () => Record<string, unknown>}>} */
   const options = [{
     kind: 'primary',
     label: t('cards.request.allow'),
     title: null,
     body: () => ({ decision: 'allow' }),
   }];
-  if (suggestions.length > 0 && request.suppressAlwaysAllowRule !== true) {
+  if (always) {
     options.push({
       kind: 'secondary',
       label: t('cards.request.alwaysAllow'),
-      title: describeSuggestions(suggestions, t),
-      body: () => ({ decision: 'allow_always', suggestionIndexes: suggestions.map((_, index) => index) }),
+      title: null,
+      enabled: () => always.checked().length > 0,
+      body: () => ({ decision: 'allow_always', suggestionIndexes: always.checked() }),
     });
   }
   options.push({
@@ -240,6 +245,14 @@ function buildPermission(view, request) {
   }));
   view.keys = new Map(options.slice(0, SHORTCUT_KEYS.length).map((option, index) => [SHORTCUT_KEYS[index], option]));
   view.focusTarget = request.defaultToNo === true ? buttons[buttons.length - 1] : buttons[0];
+  // The button needs one checked suggestion, and its tooltip names the checked ones. setState re-applies this rule.
+  const alwaysButton = always ? buttons[1] : null;
+  view.gate = () => {
+    if (!always || !alwaysButton) return;
+    alwaysButton.disabled = view.card.dataset.state !== 'ready' || always.checked().length === 0;
+    alwaysButton.title = always.title();
+  };
+  view.gate();
 }
 
 /**
@@ -278,26 +291,38 @@ function toolPreview(view, request, input) {
 }
 
 /**
- * Human summary of the "always allow" rules, for the button tooltip.
+ * One checkbox per "always allow" suggestion, with what it changes and where the change is kept. Only the checked ones
+ * are sent with the answer.
+ * @param {RequestView} view
  * @param {unknown[]} suggestions
- * @param {Translate} t
- * @returns {string}
+ * @returns {{element: HTMLElement, checked: () => number[], title: () => string}}
  */
-function describeSuggestions(suggestions, t) {
-  const rules = [];
-  for (const suggestion of suggestions) {
-    if (!isRecord(suggestion) || !Array.isArray(suggestion.rules)) continue;
-    for (const rule of suggestion.rules) {
-      if (!isRecord(rule)) continue;
-      const tool = textOf(rule.toolName);
-      if (!tool) continue;
-      const content = textOf(rule.ruleContent);
-      rules.push(truncateMiddle(content ? `${tool}(${content})` : tool, RULE_LIMIT));
-    }
-  }
-  return rules.length > 0
-    ? t('cards.request.alwaysAllowHint', { rules: rules.slice(0, 4).join(', ') })
-    : t('cards.request.alwaysAllowHintGeneric');
+function suggestionList(view, suggestions) {
+  const { t } = view.ctx;
+  const described = suggestions.map((suggestion) => describeSuggestion(suggestion, t));
+  const boxes = suggestions.map((suggestion) => {
+    const box = h('input', {
+      class: 'request-suggestion-check',
+      attrs: { type: 'checkbox' },
+      on: { change: () => view.gate?.() },
+    });
+    box.checked = isDefaultChecked(suggestion);
+    view.controls.push(box);
+    return box;
+  });
+  const checked = () => checkedIndexes(boxes.map((box) => box.checked));
+  const element = h('fieldset', { class: 'request-suggestions' },
+    h('legend', { class: 'request-suggestions-title', text: t('cards.request.suggestions') }),
+    boxes.map((box, index) => h('label', { class: 'request-suggestion' },
+      box,
+      h('span', { class: 'request-suggestion-body' },
+        h('span', { class: 'request-suggestion-title', text: described[index].title }),
+        described[index].meta ? h('span', { class: 'request-suggestion-meta', text: described[index].meta }) : null))));
+  return {
+    element,
+    checked,
+    title: () => checked().map((index) => described[index].title).join('; '),
+  };
 }
 
 /**
@@ -736,6 +761,7 @@ function bindShortcuts(view) {
     if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
     const option = view.keys?.get(event.key);
     if (!option || view.card.dataset.state !== 'ready' || !keyboardIsFree(event.target)) return;
+    if (option.enabled && !option.enabled()) return;
     if (firstReadyPermission() !== view.card) return;
     event.preventDefault();
     submit(view, option.body());
@@ -793,6 +819,7 @@ function setState(view, state) {
   view.card.setAttribute('aria-busy', state === 'sending' ? 'true' : 'false');
   const locked = state !== 'ready';
   for (const control of view.controls) control.disabled = locked;
+  view.gate?.();
 }
 
 /**

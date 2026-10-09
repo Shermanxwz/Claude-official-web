@@ -83,6 +83,7 @@ const INTERRUPT_NOTICES = new Map([
  *   markAccepted: (clientMessageId: string) => void,
  *   markFailed: (clientMessageId: string, error: unknown) => void,
  *   discardOptimistic: (clientMessageId: string) => void,
+ *   applyNotice: (notice: {code: string, level?: string, text?: string}) => void,
  *   setPending: (requests: Array<Record<string, any>>) => void,
  *   resolvePending: (requestId: string) => void,
  *   setSessionState: (state: string|null) => void,
@@ -149,12 +150,15 @@ export function createModel() {
     counter += 1;
   };
 
-  /** @param {Object} obj @param {string} field @param {unknown} value */
+  /**
+   * @param {Object} obj @param {string} field @param {unknown} value
+   * @returns {boolean} true when the value changed
+   */
   const setField = (obj, field, value) => {
-    if (obj[field] !== value) {
-      obj[field] = value;
-      touch(obj);
-    }
+    if (obj[field] === value) return false;
+    obj[field] = value;
+    touch(obj);
+    return true;
   };
 
   /** @param {string} prefix @param {string|null} uuid */
@@ -326,27 +330,54 @@ export function createModel() {
     return flow.parent ? flowOpen(flow.parent) : false;
   };
 
-  /** @param {Record<string, any>} group */
+  /**
+   * Keeps a group's count and running flag in step with its tools.
+   * @param {Record<string, any>} group
+   * @returns {boolean} true when either changed
+   */
   const refreshGroup = (group) => {
     const tools = group.items.filter((item) => item.kind === 'tool');
-    setField(group, 'count', tools.length);
-    setField(group, 'running', tools.some((item) => item.running));
+    const counted = setField(group, 'count', tools.length);
+    const ran = setField(group, 'running', tools.some((item) => item.running));
+    return counted || ran;
+  };
+
+  /**
+   * A change inside a subagent's flow shows on its card. Every owner up the chain is touched, with the work group that
+   * holds it, so the keyed render rebuilds those cards. A top-level flow has no owner and touches nothing.
+   * @param {Flow} flow
+   */
+  const touchOwners = (flow) => {
+    let owner = flow.owner;
+    while (owner) {
+      touch(owner);
+      const group = groupOf.get(owner);
+      if (group) touch(group);
+      const holder = containerOf.get(owner);
+      owner = holder ? holder.owner : null;
+    }
   };
 
   /** @param {Flow} flow */
   const syncFlow = (flow) => {
     const open = flowOpen(flow);
+    let changed = false;
     for (const entry of flow.entries) {
       if (entry.kind !== 'work') continue;
       for (const item of entry.items) {
         if (item.kind !== 'tool') continue;
-        setField(item, 'running', item.result == null && open);
+        if (setField(item, 'running', item.result == null && open)) {
+          // The group header counts running tools, so the group shows the change too.
+          touch(entry);
+          changed = true;
+        }
         const child = childFlowOf.get(item);
         if (child) syncFlow(child);
       }
-      setField(entry, 'open', open);
-      refreshGroup(entry);
+      if (setField(entry, 'open', open)) changed = true;
+      if (refreshGroup(entry)) changed = true;
     }
+    if (changed) touchOwners(flow);
   };
 
   /** @param {Turn} state */
@@ -389,6 +420,7 @@ export function createModel() {
   const pushEntry = (flow, entry) => {
     touch(entry);
     flow.entries.push(entry);
+    touchOwners(flow);
     return entry;
   };
 
@@ -405,6 +437,9 @@ export function createModel() {
     if (item.kind === 'tool') setField(item, 'running', item.result == null && flowOpen(flow));
     setField(group, 'open', flowOpen(flow));
     refreshGroup(group);
+    // The group's items changed; its count and flags may not have, so its version is bumped here.
+    touch(group);
+    touchOwners(flow);
     return group;
   };
 
@@ -475,7 +510,12 @@ export function createModel() {
     touch(item);
     setField(item, 'running', false);
     const group = groupOf.get(item);
-    if (group) refreshGroup(group);
+    if (group) {
+      refreshGroup(group);
+      touch(group);
+    }
+    const holder = containerOf.get(item);
+    if (holder) touchOwners(holder);
     const child = childFlowOf.get(item);
     if (child) syncFlow(child);
   };
@@ -508,6 +548,8 @@ export function createModel() {
       touch(existing);
       const group = groupOf.get(existing);
       if (group) touch(group);
+      const holder = containerOf.get(existing);
+      if (holder) touchOwners(holder);
       return existing;
     }
     const row = Object.assign({ kind: 'row', key }, fields);
@@ -543,6 +585,18 @@ export function createModel() {
   const addNotice = (flow, level, code, vars, text, key) => {
     pushEntry(flow, { kind: 'notice', key: key ?? nextKey('n', null), level, code, text, vars });
     return flow;
+  };
+
+  /**
+   * A notice the gateway raises outside the SDK stream (for example ENGINE_UNAVAILABLE). It lands in the open turn, or
+   * starts one. The same notice right after itself is not added twice.
+   * @param {{code: string, level: string, text: string}} notice
+   */
+  const addInlineNotice = ({ code, level, text }) => {
+    const flow = liveFlow();
+    const last = flow.entries[flow.entries.length - 1];
+    if (last && last.kind === 'notice' && last.code === code && last.text === text) return;
+    addNotice(flow, level, code, {}, text, null);
   };
 
   /** @param {any} raw @param {boolean} live @param {string|null} label @returns {Flow} */
@@ -714,6 +768,7 @@ export function createModel() {
     touch(block);
     bubble.blocks.push(block);
     touch(bubble);
+    touchOwners(flow);
   };
 
   /** @param {Record<string, any>} raw @param {boolean} live @returns {Flow|null} */
@@ -1001,7 +1056,12 @@ export function createModel() {
     if (!item) return null;
     const flow = containerOf.get(item) ?? liveFlow();
     markLive(flow.state);
-    if (typeof raw.elapsed_time_seconds === 'number') setField(item, 'elapsedSeconds', raw.elapsed_time_seconds);
+    if (typeof raw.elapsed_time_seconds === 'number' && setField(item, 'elapsedSeconds', raw.elapsed_time_seconds)) {
+      // The group header shows the running tool's elapsed time, so the group is touched as well as the owners.
+      const group = groupOf.get(item);
+      if (group) touch(group);
+      touchOwners(flow);
+    }
     return flow;
   };
 
@@ -1012,7 +1072,9 @@ export function createModel() {
       const item = toolIndex.get(String(id));
       const group = item ? groupOf.get(item) : null;
       if (group) {
-        setField(group, 'label', String(raw.summary ?? ''));
+        const changed = setField(group, 'label', String(raw.summary ?? ''));
+        const holder = containerOf.get(item);
+        if (changed && holder) touchOwners(holder);
         break;
       }
     }
@@ -1136,6 +1198,9 @@ export function createModel() {
       case 'discard':
         discardEntry(operation.clientMessageId);
         break;
+      case 'notice':
+        addInlineNotice(operation);
+        break;
       default:
         break;
     }
@@ -1166,7 +1231,13 @@ export function createModel() {
       const toolUseId = entry.request.toolUseId;
       if (typeof toolUseId === 'string') wanted.set(toolUseId, entry.request.id);
     }
-    for (const item of toolIndex.values()) setField(item, 'pendingRequestId', wanted.get(item.id) ?? null);
+    for (const item of toolIndex.values()) {
+      if (!setField(item, 'pendingRequestId', wanted.get(item.id) ?? null)) continue;
+      const group = groupOf.get(item);
+      if (group) touch(group);
+      const holder = containerOf.get(item);
+      if (holder) touchOwners(holder);
+    }
   };
 
   /**
@@ -1441,6 +1512,23 @@ export function createModel() {
     /** Removes an optimistic message, e.g. before resending a failed one. @param {string} clientMessageId */
     discardOptimistic(clientMessageId) {
       const operation = { op: 'discard', clientMessageId };
+      log.push(operation);
+      apply(operation);
+    },
+
+    /**
+     * Adds an inline error notice for a gateway notice the timeline shows (ENGINE_UNAVAILABLE). Kept in the log, so it
+     * survives a replay.
+     * @param {{code: string, level?: string, text?: string}} notice
+     */
+    applyNotice(notice) {
+      if (!isObject(notice) || typeof notice.code !== 'string') return;
+      const operation = {
+        op: 'notice',
+        code: notice.code,
+        level: typeof notice.level === 'string' ? notice.level : 'error',
+        text: String(notice.text ?? ''),
+      };
       log.push(operation);
       apply(operation);
     },

@@ -151,6 +151,27 @@ describe('loadConfig validation', () => {
     assertInvalid({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN: 'short' }, 'CAW_TOKEN');
   });
 
+  it('accepts CAW_TOKEN_SHA256 as the only credential and normalizes it to lowercase hex', () => {
+    const config = loadConfig(env({ CAW_TOKEN: '', CAW_TOKEN_SHA256: 'AB'.repeat(32) }));
+    assert.equal(config.token, '');
+    assert.equal(config.tokenSha256, 'ab'.repeat(32));
+    assert.equal(loadConfig(env()).tokenSha256, '');
+    assert.equal(loadConfig(env({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN: '', CAW_TOKEN_SHA256: '' })).tokenSha256, '');
+  });
+
+  it('requires exactly one of CAW_TOKEN and CAW_TOKEN_SHA256 when auth is on', () => {
+    assertInvalid({ CAW_TOKEN: '' }, 'CAW_TOKEN');
+    assert.throws(() => loadConfig(env({ CAW_TOKEN_SHA256: 'a'.repeat(64) })), (error) => {
+      assert.ok(error instanceof ConfigError);
+      assert.match(error.message, /not both/);
+      return true;
+    });
+    for (const digest of ['a'.repeat(63), 'a'.repeat(65), 'g'.repeat(64), `${'a'.repeat(63)} `]) {
+      assertInvalid({ CAW_TOKEN: '', CAW_TOKEN_SHA256: digest }, 'CAW_TOKEN_SHA256');
+    }
+    assert.throws(() => loadConfig(env({ CAW_REQUIRE_AUTH: '0', CAW_TOKEN_SHA256: 'a'.repeat(64) })), ConfigError);
+  });
+
   it('allows disabling auth only on loopback hosts', () => {
     for (const host of ['127.0.0.1', '::1', 'localhost', '[::1]']) {
       assert.equal(loadConfig(env({ CAW_REQUIRE_AUTH: '0', CAW_HOST: host })).requireAuth, false, host);
@@ -214,6 +235,13 @@ describe('loadConfig validation', () => {
     const config = loadConfig(env({ CAW_DEFAULT_PERMISSION_MODE: 'bypassPermissions', CAW_ALLOW_BYPASS: '1' }));
     assert.equal(config.defaults.permissionMode, 'bypassPermissions');
     assert.equal(config.allowBypass, true);
+  });
+
+  it('requires the full access profile for bypassPermissions as the default mode', () => {
+    const bypass = { CAW_DEFAULT_PERMISSION_MODE: 'bypassPermissions', CAW_ALLOW_BYPASS: '1' };
+    assertInvalid({ ...bypass, CAW_ACCESS_PROFILE: 'standard' }, 'CAW_ACCESS_PROFILE');
+    assertInvalid({ ...bypass, CAW_ACCESS_PROFILE: 'read' }, 'CAW_ACCESS_PROFILE');
+    assert.equal(loadConfig(env({ ...bypass, CAW_ACCESS_PROFILE: 'full' })).profile, 'full');
   });
 
   it('validates the default model length', () => {

@@ -113,7 +113,8 @@ function onDocumentKeydown(event) {
     }
     return;
   }
-  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+  // keyCode 229 is the IME commit Enter on Safari, where isComposing is already false by the time keydown fires.
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     const target = event.target;
     const plainInput = target instanceof HTMLInputElement
       && !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'color', 'range'].includes(target.type);

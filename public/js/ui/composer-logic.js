@@ -324,3 +324,47 @@ export function isSendShortcut(event, { coarse = false } = {}) {
   if (coarse || event.shiftKey || event.altKey) return false;
   return true;
 }
+
+/**
+ * The parts of an attachment chip that a composer mount resets when another mount takes the chip over.
+ * @typedef {Object} DetachableChip
+ * @property {string} status
+ * @property {number} progress
+ * @property {string|null} error
+ * @property {boolean} retryable
+ * @property {AbortController|null} controller
+ * @property {unknown} el
+ */
+
+/**
+ * Hands an attachment chip over to a composer that did not render it. DOM references belong to the old mount and are
+ * dropped. An upload that was still running cannot finish without that mount, so it is cut short: the chip keeps its
+ * file, name, kind, path and thumbnail, offers a retry, and has no message yet, so the message is chosen in the
+ * current language when the chip renders. Returns the controller of the cut-short upload, which the caller aborts.
+ * @param {DetachableChip} chip
+ * @returns {AbortController|null}
+ */
+export function detachChip(chip) {
+  chip.el = null;
+  if (chip.status !== 'uploading') return null;
+  const running = chip.controller ?? null;
+  chip.controller = null;
+  chip.status = 'error';
+  chip.progress = 0;
+  chip.error = null;
+  chip.retryable = true;
+  return running;
+}
+
+/**
+ * Puts a message that was not sent back in front of the text already typed, on a line of its own. An empty message
+ * changes nothing, and whitespace-only text is replaced.
+ * @param {string} restored
+ * @param {string|null|undefined} current
+ * @returns {string}
+ */
+export function joinRestoredText(restored, current) {
+  const before = typeof current === 'string' ? current : '';
+  if (!restored) return before;
+  return before.trim() ? `${restored}\n${before}` : restored;
+}

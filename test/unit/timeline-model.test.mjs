@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createModel } from '../../public/js/timeline/model.js';
+import { isDefaultChecked, describeSuggestion, checkedIndexes, ruleText } from '../../public/js/timeline/suggestions.js';
 
 const uuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const SESSION = '11111111-1111-4111-8111-111111111111';
@@ -881,4 +882,155 @@ test('progress rows without tool steps form a group with no step count, and empt
   assert.equal(group.items[0].rowKind, 'hook');
   assert.equal(group.items[0].status, 'success');
   assert.ok(model.getEntries().every((entry) => entry.kind !== 'work' || entry.items.length > 0));
+});
+
+test('a retry reuses the failed message clientMessageId: once discarded it is added again as one pending message', () => {
+  const model = createModel();
+  model.addOptimistic({ clientMessageId: 'retry-1', text: 'again' });
+  model.markFailed('retry-1', 'network down');
+  model.discardOptimistic('retry-1');
+  assert.equal(find(model, 'user').length, 0);
+  model.addOptimistic({ clientMessageId: 'retry-1', text: 'again' });
+  model.addOptimistic({ clientMessageId: 'retry-1', text: 'again' });
+  const users = find(model, 'user');
+  assert.equal(users.length, 1, 'a second add of the same id while it is pending adds nothing');
+  assert.equal(users[0].clientMessageId, 'retry-1');
+  assert.equal(users[0].status, 'sending');
+  assert.equal(users[0].error, null);
+  model.markAccepted('retry-1');
+  assert.equal(find(model, 'user')[0].status, 'sent');
+});
+
+test('every change inside a subagent flow touches its Agent card and the work group that holds it', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'delegate'));
+  model.applyLiveEvent(live.assistant(2, 'm-agent', [{ type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'x' } }]));
+  const [group] = find(model, 'work');
+  const owner = group.items[0];
+
+  let cardVersion = owner.version;
+  let groupVersion = group.version;
+  model.applyLiveEvent(live.assistant(3, 'm-child', [{ type: 'text', text: 'first' }], { parent_tool_use_id: 'agent-1' }));
+  assert.ok(owner.version > cardVersion, 'a child message touches the card');
+  assert.ok(group.version > groupVersion, 'and the work group that holds the card');
+
+  cardVersion = owner.version;
+  model.applyLiveEvent(live.assistant(4, 'm-child', [{ type: 'text', text: 'second' }], { parent_tool_use_id: 'agent-1' }));
+  assert.ok(owner.version > cardVersion, 'a further block in the same child bubble touches the card');
+
+  cardVersion = owner.version;
+  model.applyLiveEvent(live.assistant(5, 'm-child-tool', [{ type: 'tool_use', id: 'read-1', name: 'Read', input: {} }],
+    { parent_tool_use_id: 'agent-1' }));
+  assert.ok(owner.version > cardVersion, 'a child tool card touches the card');
+
+  cardVersion = owner.version;
+  model.applyLiveEvent(live.toolResult(6, 'read-1', 'ok', { parent_tool_use_id: 'agent-1' }));
+  assert.ok(owner.version > cardVersion, 'a child tool result touches the card');
+
+  cardVersion = owner.version;
+  model.applyLiveEvent(live.system(7, 'task_progress', { task_id: 't1', tool_use_id: 'agent-1', description: 'Reading',
+    usage: { tool_uses: 1, duration_ms: 500 }, parent_tool_use_id: 'agent-1' }));
+  assert.ok(owner.version > cardVersion, 'a progress row inside the subagent touches the card');
+
+  cardVersion = owner.version;
+  model.applyLiveEvent(live.system(8, 'informational', { content: 'Note from the agent.', level: 'info', parent_tool_use_id: 'agent-1' }));
+  assert.ok(owner.version > cardVersion, 'a notice inside the subagent touches the card');
+  assert.equal(owner.children.length > 0, true, 'the card keeps its children');
+});
+
+test('a tool result touches its work group even when the group still runs other tools', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.assistant(2, 'm1', [
+    { type: 'tool_use', id: 'bash-1', name: 'Bash', input: { command: 'ls' } },
+    { type: 'tool_use', id: 'bash-2', name: 'Bash', input: { command: 'pwd' } },
+  ]));
+  const [group] = find(model, 'work');
+  const groupVersion = group.version;
+  model.applyLiveEvent(live.toolResult(3, 'bash-1', 'ok'));
+  assert.equal(group.count, 2, 'the count does not change, so only the result can refresh the group');
+  assert.ok(group.version > groupVersion);
+  assert.equal(toolsIn(group)[0].running, false);
+  assert.equal(toolsIn(group)[1].running, true);
+});
+
+test('a running tool updates its work group: elapsed time and a pending permission show in the group header and rows', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'run'));
+  model.applyLiveEvent(live.assistant(2, 'm1', [{ type: 'tool_use', id: 'bash-1', name: 'Bash', input: { command: 'ls' } }]));
+  const [group] = find(model, 'work');
+
+  let version = group.version;
+  model.applyLiveEvent({ type: 'tool_progress', uuid: uuid(3), session_id: SESSION, tool_use_id: 'bash-1', elapsed_time_seconds: 3 });
+  assert.equal(toolsIn(group)[0].elapsedSeconds, 3);
+  assert.ok(group.version > version, 'the group header shows the elapsed time');
+
+  version = group.version;
+  model.setPending([{ id: 'rq-1', toolUseId: 'bash-1', kind: 'permission', sessionId: SESSION }]);
+  assert.equal(toolsIn(group)[0].pendingRequestId, 'rq-1');
+  assert.ok(group.version > version, 'a permission waiting on a tool touches its group');
+});
+
+test('an ENGINE_UNAVAILABLE notice adds one inline error notice, once, and a replay keeps it', () => {
+  const model = createModel();
+  model.loadTranscript([tx('user', 101, { role: 'user', content: 'hello' })]);
+  model.applyNotice({ code: 'ENGINE_UNAVAILABLE', level: 'error', text: '' });
+  model.applyNotice({ code: 'ENGINE_UNAVAILABLE', level: 'error', text: '' });
+  const notices = find(model, 'notice');
+  assert.equal(notices.length, 1, 'the same notice right after itself is not repeated');
+  assert.equal(notices[0].code, 'ENGINE_UNAVAILABLE');
+  assert.equal(notices[0].level, 'error');
+  assert.deepEqual(kinds(model), ['user', 'notice']);
+
+  model.prependTranscript([tx('user', 100, { role: 'user', content: 'older' })]);
+  assert.deepEqual(kinds(model), ['user', 'user', 'notice'], 'the notice survives a replay of the older page');
+});
+
+test('an inline notice with no open turn starts one, and a notice after a finished turn joins the next one', () => {
+  const model = createModel();
+  model.applyNotice({ code: 'ENGINE_UNAVAILABLE', level: 'error', text: '' });
+  assert.deepEqual(kinds(model), ['notice']);
+  model.applyLiveEvent(live.user(1, 'later'));
+  model.applyLiveEvent(live.result(2));
+  model.applyNotice({ code: 'ENGINE_UNAVAILABLE', level: 'error', text: '' });
+  assert.deepEqual(kinds(model), ['notice', 'user', 'result', 'notice']);
+});
+
+test('a permission suggestion starts checked only when it adds an allow rule', () => {
+  assert.equal(isDefaultChecked({ type: 'addRules', behavior: 'allow', rules: [], destination: 'localSettings' }), true);
+  assert.equal(isDefaultChecked({ type: 'replaceRules', behavior: 'allow', rules: [] }), true);
+  assert.equal(isDefaultChecked({ type: 'addRules', behavior: 'deny', rules: [] }), false, 'a deny rule is never applied by default');
+  assert.equal(isDefaultChecked({ type: 'addDirectories', directories: ['/home/u/.ssh'], destination: 'session' }), false);
+  assert.equal(isDefaultChecked({ type: 'setMode', mode: 'acceptEdits', destination: 'session' }), false);
+  assert.equal(isDefaultChecked({ type: 'removeRules', behavior: 'allow', rules: [] }), false);
+  assert.equal(isDefaultChecked(null), false);
+});
+
+test('every suggestion reads as what it changes, with where the change is kept', () => {
+  const t = (key, vars) => (vars ? `${key} ${JSON.stringify(vars)}` : key);
+  const rule = describeSuggestion({
+    type: 'addRules', behavior: 'allow', destination: 'localSettings',
+    rules: [{ toolName: 'Bash', ruleContent: 'npm test:*' }, { toolName: 'Read' }],
+  }, t);
+  assert.equal(rule.title, 'cards.request.suggestion.allow {"rules":"Bash(npm test:*), Read"}');
+  assert.equal(rule.meta, 'cards.request.destination {"where":"cards.request.dest.localSettings"}');
+
+  const dirs = describeSuggestion({ type: 'addDirectories', directories: ['/home/u/.ssh'], destination: 'session' }, t);
+  assert.equal(dirs.title, 'cards.request.suggestion.directories {"dirs":"/home/u/.ssh"}');
+  assert.equal(dirs.meta, 'cards.request.destination {"where":"cards.request.dest.session"}');
+
+  const mode = describeSuggestion({ type: 'setMode', mode: 'acceptEdits', destination: 'userSettings' }, t);
+  assert.equal(mode.title, 'cards.request.suggestion.mode {"mode":"cards.request.plan.mode.acceptEdits"}');
+
+  const unknown = describeSuggestion({ type: 'mysteryUpdate' }, t);
+  assert.equal(unknown.title, 'cards.request.suggestion.other {"detail":"mysteryUpdate"}');
+  assert.equal(unknown.meta, '', 'no destination, no meta line');
+});
+
+test('checked suggestions give the indexes that an always-allow answer sends, and a tool name alone is a rule', () => {
+  assert.deepEqual(checkedIndexes([true, false, true]), [0, 2]);
+  assert.deepEqual(checkedIndexes([false, false]), []);
+  assert.equal(ruleText({ toolName: 'Bash', ruleContent: 'npm test:*' }), 'Bash(npm test:*)');
+  assert.equal(ruleText({ toolName: 'WebFetch' }), 'WebFetch');
+  assert.equal(ruleText({ toolName: '  ' }), '');
 });

@@ -54,7 +54,7 @@ const PENDING_SETTINGS_MAX = 5000;
 const DEFAULT_PAGE_LIMIT = 100;
 const MAX_PAGE_LIMIT = 500;
 const DEFAULT_TRANSCRIPT_LIMIT = 200;
-const MAX_TRANSCRIPT_LIMIT = 5000;
+const MAX_TRANSCRIPT_LIMIT = 1000;
 const TITLE_MAX = 200;
 const TAG_MAX = 100;
 const ID_MAX = 200;
@@ -64,6 +64,12 @@ const REWIND_MODES = ['code', 'conversation', 'both'];
 const MODEL_RE = /^[\x21-\x7e]{1,200}$/;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const ENGINE_UNAVAILABLE_RE = /spawn|ENOENT|not found|Native CLI binary|log ?in|authenticat|api key|credential/i;
+const CONTROL_TIMEOUT_MS = 10_000;
+const TIMEOUT_MESSAGE = 'The Claude Code runtime did not respond in time.';
+const CREDENTIALS_MESSAGE = 'Claude Code credentials were rejected. Log in again on the server: run `claude` and use '
+  + '/login.';
+/** Errors of the authentication class: the runtime's credentials were rejected. Billing and rate limits are not. */
+const AUTH_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required'];
 
 /**
  * Per-session state of one live query.
@@ -88,6 +94,8 @@ const ENGINE_UNAVAILABLE_RE = /spawn|ENOENT|not found|Native CLI binary|log ?in|
  * @property {Promise<void>|null} pump
  * @property {boolean} closing      set when the gateway closes the query; its end is never an error
  * @property {string|null} published   last published LiveInfo, without lastActivity
+ * @property {boolean} trusted      project settings, hooks and MCP servers of cwd are loaded by this query
+ * @property {boolean} credentialsRejected   the runtime rejected its credentials; the notice was published
  */
 
 /** @param {unknown} value @returns {value is Record<string, unknown>} */
@@ -138,6 +146,10 @@ function sessionNotFound() {
 
 function sessionNotLive() {
   return new AppError(409, 'SESSION_NOT_LIVE', 'The session is not open. Open it first.');
+}
+
+function outsideRoots() {
+  return new AppError(422, 'PATH_NOT_ALLOWED', 'The folder is outside the workspace roots.');
 }
 
 /** @param {unknown} sessionId */
@@ -360,6 +372,44 @@ function settleWithin(promise, ms) {
     .finally(() => clearTimeout(timer));
 }
 
+/** A control call of the runtime that did not settle within CONTROL_TIMEOUT_MS. */
+class ControlTimeout extends Error {
+  constructor() {
+    super(TIMEOUT_MESSAGE);
+    this.name = 'ControlTimeout';
+  }
+}
+
+/**
+ * Runs one control call of the runtime and rejects with ControlTimeout when it does not settle in time.
+ * @template T
+ * @param {() => Promise<T>} call
+ * @param {number} [ms]
+ * @returns {Promise<T>}
+ */
+async function withTimeout(call, ms = CONTROL_TIMEOUT_MS) {
+  /** @type {ReturnType<typeof setTimeout>|undefined} */
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new ControlTimeout()), ms);
+  });
+  try {
+    return await Promise.race([call(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Whether an SDK message reports rejected credentials. Other retries and errors are not credential failures.
+ * @param {SDKMessage} msg
+ * @returns {boolean}
+ */
+function isCredentialFailure(msg) {
+  if (msg.type === 'system' && msg.subtype === 'api_retry') return AUTH_ERRORS.includes(msg.error);
+  return msg.type === 'assistant' && AUTH_ERRORS.includes(msg.error);
+}
+
 /**
  * @template {Record<string, unknown>} T
  * @param {T} object
@@ -454,13 +504,15 @@ export class EngineHost {
   #getSeq;
   /** @type {(p: string) => Promise<boolean>} */
   #isAllowedCwd;
+  /** @type {(p: string) => Promise<boolean>} */
+  #isTrustedCwd;
   /** @type {() => number} */
   #now;
   /** @type {RequestRegistry} */
   #requests;
   /** @type {Map<string, LiveRecord>} */
   #live = new Map();
-  /** @type {Map<string, Promise<LiveRecord>>} */
+  /** @type {Map<string, Promise<void>>} the last lifecycle operation of each session that is still in flight */
   #opening = new Map();
   /** @type {Map<string, Partial<SessionSettings>>} */
   #pending = new Map();
@@ -481,16 +533,21 @@ export class EngineHost {
   #lastClaudeCodeVersion = null;
 
   /**
+   * Folder trust decides which setting sources a query loads. Without `isTrustedCwd` every folder is untrusted.
    * @param {{engine: EngineAdapter, config: Config, log: Logger, publish: Publish, getSeq: () => number,
-   *   isAllowedCwd: (p: string) => Promise<boolean>, now?: () => number}} options
+   *   isAllowedCwd: (p: string) => Promise<boolean>, isTrustedCwd?: (p: string) => Promise<boolean>,
+   *   now?: () => number}} options
    */
-  constructor({ engine, config, log, publish, getSeq, isAllowedCwd, now = Date.now }) {
+  constructor({
+    engine, config, log, publish, getSeq, isAllowedCwd, isTrustedCwd = async () => false, now = Date.now,
+  }) {
     this.#engine = engine;
     this.#config = config;
     this.#log = log;
     this.#publish = publish;
     this.#getSeq = getSeq;
     this.#isAllowedCwd = isAllowedCwd;
+    this.#isTrustedCwd = isTrustedCwd;
     this.#now = now;
     this.#requests = new RequestRegistry({
       publish: (event) => {
@@ -516,6 +573,7 @@ export class EngineHost {
     const page = parsePage({ limit, offset });
     if (cwd === undefined) return this.#allSessions(page);
     if (typeof cwd !== 'string' || cwd === '') throw badRequest('The cwd must be a path.');
+    if (!(await this.#withinRoots(cwd))) throw outsideRoots();
     const found = await this.#engineList({ dir: cwd, limit: page.limit, offset: page.offset });
     const sessions = found.map((info) => this.#summary(info));
     if (page.offset === 0) {
@@ -557,13 +615,11 @@ export class EngineHost {
    */
   async getSession(sessionId) {
     requireSessionId(sessionId);
-    const info = await this.#readInfoOrNull(sessionId);
-    const live = this.#live.get(sessionId) ?? null;
-    if (!info && !live) throw sessionNotFound();
+    const { info, live } = await this.#scopeOf(sessionId, true);
     return {
       info,
       live: live ? this.#info(live) : null,
-      pending: this.#requests.list(sessionId),
+      pending: live ? this.#requests.list(sessionId) : [],
       liveEvents: live ? live.events.snapshot() : [],
       seq: this.#getSeq(),
       init: live ? live.init : null,
@@ -577,7 +633,8 @@ export class EngineHost {
   async getTranscript(sessionId, options = {}) {
     requireSessionId(sessionId);
     const { before, count } = parseWindow(options);
-    const indexed = await this.#transcript(sessionId);
+    const { info } = await this.#scopeOf(sessionId);
+    const indexed = await this.#transcript(sessionId, info);
     const total = indexed.length;
     const end = before === undefined ? total : Math.min(before, total);
     const start = before === undefined ? Math.max(0, total - count) : Math.max(0, end - count);
@@ -590,11 +647,10 @@ export class EngineHost {
    */
   async sessionCwd(sessionId) {
     requireSessionId(sessionId);
-    const live = this.#live.get(sessionId);
-    if (live) return live.cwd;
-    const info = await this.#readInfo(sessionId);
-    if (!info?.cwd) throw sessionNotFound();
-    return info.cwd;
+    const { info, live } = await this.#scopeOf(sessionId);
+    const cwd = live?.cwd ?? info?.cwd;
+    if (!cwd) throw sessionNotFound();
+    return cwd;
   }
 
   /**
@@ -627,13 +683,9 @@ export class EngineHost {
    */
   async getCapabilities(sessionId) {
     requireSessionId(sessionId);
-    const live = this.#live.get(sessionId);
+    const { info, live } = await this.#scopeOf(sessionId);
     if (live) return this.#liveCapabilities(live);
-    const info = await this.#readInfo(sessionId);
-    if (!info) throw sessionNotFound();
-    const byCwd = info.cwd ? this.#capsByCwd.get(info.cwd) : undefined;
-    const remembered = byCwd ?? this.#capsGlobal;
-    return remembered ? withStale(remembered, true) : emptyCapabilities(true);
+    return this.#rememberedFor(info?.cwd ?? null);
   }
 
   /**
@@ -647,24 +699,26 @@ export class EngineHost {
       this.#attempt(live, () => live.query.initializationResult()),
       this.#attempt(live, () => live.query.mcpServerStatus()),
     ]);
+    if (init === undefined || mcpServers === undefined) return this.#lastKnown(live);
     /** @type {Capabilities} */
     const value = {
       stale: false,
-      commands: init?.commands ?? live.commands ?? [],
-      models: init?.models ?? [],
-      agents: init?.agents ?? [],
-      account: init?.account ?? null,
-      mcpServers: mcpServers ?? [],
-      outputStyle: init?.output_style ?? null,
-      availableOutputStyles: init?.available_output_styles ?? [],
+      commands: init.commands ?? live.commands ?? [],
+      models: init.models ?? [],
+      agents: init.agents ?? [],
+      account: init.account ?? null,
+      mcpServers,
+      outputStyle: init.output_style ?? null,
+      availableOutputStyles: init.available_output_styles ?? [],
     };
     if (this.#live.get(live.sessionId) === live) live.capsCache = { at: this.#now(), value };
-    if (init) this.#rememberCapabilities(live.cwd, value);
+    this.#rememberCapabilities(live.cwd, value);
     return withStale(value, false);
   }
 
   /**
-   * Runs one capability query. A failure yields undefined so the other query still answers.
+   * Runs one capability query under the control timeout. A failure or a timeout yields undefined, and the capabilities
+   * then fall back to the last known value.
    * @template T
    * @param {LiveRecord} live
    * @param {() => Promise<T>} call
@@ -672,7 +726,7 @@ export class EngineHost {
    */
   async #attempt(live, call) {
     try {
-      return await call();
+      return await withTimeout(call);
     } catch (error) {
       this.#log.debug('capability query failed', { sessionId: live.sessionId, reason: errorName(error) });
       return undefined;
@@ -694,6 +748,27 @@ export class EngineHost {
   }
 
   /**
+   * The last known capabilities of a folder, or of any folder, or empty lists. Always marked stale.
+   * @param {string|null} cwd
+   * @returns {Capabilities}
+   */
+  #rememberedFor(cwd) {
+    const remembered = (cwd ? this.#capsByCwd.get(cwd) : undefined) ?? this.#capsGlobal;
+    return remembered ? withStale(remembered, true) : emptyCapabilities(true);
+  }
+
+  /**
+   * The answer of a live session when the runtime does not answer: the last known capabilities of its folder, with the
+   * commands the session announced last. Always marked stale.
+   * @param {LiveRecord} live
+   * @returns {Capabilities}
+   */
+  #lastKnown(live) {
+    const base = this.#rememberedFor(live.cwd);
+    return live.commands === null ? base : { ...base, commands: live.commands };
+  }
+
+  /**
    * @param {LiveRecord} live
    * @returns {LiveInfo}
    */
@@ -711,6 +786,7 @@ export class EngineHost {
       lastActivity: live.lastActivity,
       claudeCodeVersion: live.claudeCodeVersion,
       error: live.error,
+      trusted: live.trusted,
     };
   }
 
@@ -792,11 +868,10 @@ export class EngineHost {
   /**
    * The full transcript of a session with message indexes. Cached until the session file changes.
    * @param {string} sessionId
+   * @param {SDKSessionInfo|null} info the session file, already checked to lie inside the roots
    * @returns {Promise<IndexedMessage[]>}
    */
-  async #transcript(sessionId) {
-    const info = await this.#readInfo(sessionId);
-    if (!info && !this.#live.has(sessionId)) throw sessionNotFound();
+  async #transcript(sessionId, info) {
     const key = info ? `${info.lastModified}:${info.fileSize ?? ''}` : 'live';
     const cached = this.#transcripts.get(sessionId);
     if (cached?.key === key) return cached.messages;
@@ -833,16 +908,86 @@ export class EngineHost {
   }
 
   /**
-   * Starts the query of a new or an existing session. The caller has already validated the working directory.
-   * @param {{mode: 'new'|'resume', sessionId: string|null, cwd: string, title?: string, settings: SessionSettings,
-   *   resumeSessionAt?: string}} start
+   * Runs one lifecycle operation of a session after the operations already queued for it. The operation is registered
+   * synchronously, before its first await, so every caller that arrives later waits for it. Work run here must never
+   * wait for the same session again, or it would wait for itself.
+   * @template T
+   * @param {string} sessionId
+   * @param {() => Promise<T>} work
+   * @returns {Promise<T>}
+   */
+  #exclusive(sessionId, work) {
+    const earlier = this.#opening.get(sessionId) ?? Promise.resolve();
+    const run = earlier.then(work);
+    const settled = run.then(() => undefined, () => undefined);
+    this.#opening.set(sessionId, settled);
+    void settled.then(() => {
+      if (this.#opening.get(sessionId) === settled) this.#opening.delete(sessionId);
+    });
+    return run;
+  }
+
+  /**
+   * Resolves once every lifecycle operation queued for the session so far has finished.
+   * @param {string} sessionId
+   * @returns {Promise<void>}
+   */
+  async #settled(sessionId) {
+    for (let pending = this.#opening.get(sessionId); pending; pending = this.#opening.get(sessionId)) {
+      await pending;
+    }
+  }
+
+  /**
+   * @param {unknown} cwd
+   * @returns {Promise<boolean>} whether the folder lies inside an allowed workspace root
+   */
+  async #withinRoots(cwd) {
+    return typeof cwd === 'string' && cwd !== '' && (await this.#isAllowed(cwd));
+  }
+
+  /**
+   * Whether the folder is trusted. Fails closed: an error from the trust check means untrusted.
+   * @param {string} cwd
+   * @returns {Promise<boolean>}
+   */
+  async #trustOf(cwd) {
+    try {
+      return (await this.#isTrustedCwd(cwd)) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The file and the live query of a session, each withheld when its folder is outside the workspace roots. Throws
+   * SESSION_NOT_FOUND when neither is visible. With `lenient`, a file that cannot be read counts as no file.
+   * @param {string} sessionId
+   * @param {boolean} [lenient]
+   * @returns {Promise<{info: SDKSessionInfo|null, live: LiveRecord|null}>}
+   */
+  async #scopeOf(sessionId, lenient = false) {
+    const found = lenient ? await this.#readInfoOrNull(sessionId) : await this.#readInfo(sessionId);
+    const info = found && (await this.#withinRoots(found.cwd)) ? found : null;
+    const current = this.#live.get(sessionId) ?? null;
+    const live = current && (await this.#withinRoots(current.cwd)) ? current : null;
+    if (!info && !live) throw sessionNotFound();
+    return { info, live };
+  }
+
+  /**
+   * Starts the query of a new or an existing session. The caller has validated the working directory and read its
+   * trust. A session that is already open is refused, so two queries never share one id.
+   * @param {{mode: 'new'|'resume', sessionId: string|null, cwd: string, trusted: boolean, title?: string,
+   *   settings: SessionSettings, resumeSessionAt?: string}} start
    * @returns {LiveRecord}
    */
-  #startQuery({ mode, sessionId, cwd, title, settings, resumeSessionAt }) {
+  #startQuery({ mode, sessionId, cwd, trusted, title, settings, resumeSessionAt }) {
     if (this.#stopped) throw new AppError(503, 'ENGINE_UNAVAILABLE', 'The gateway is shutting down.');
-    const resolved = this.#resolveSettings(mode === 'new' ? null : sessionId, settings);
+    const id = mode === 'new' ? randomUUID() : /** @type {string} */ (sessionId);
+    if (this.#live.has(id)) throw new AppError(409, 'CONFLICT', 'The session is already open.');
+    const resolved = this.#resolveSettings(mode === 'new' ? null : id, settings);
     this.#makeRoom();
-    const id = mode === 'new' ? randomUUID() : sessionId;
     /** @type {LiveRecord} */
     const live = {
       sessionId: id,
@@ -865,6 +1010,8 @@ export class EngineHost {
       pump: null,
       closing: false,
       published: null,
+      trusted: trusted === true,
+      credentialsRejected: false,
     };
     const options = this.#queryOptions(live, mode, resumeSessionAt);
     try {
@@ -904,7 +1051,7 @@ export class EngineHost {
       allowDangerouslySkipPermissions: allowBypass,
       systemPrompt: { type: 'preset', preset: 'claude_code' },
       tools: { type: 'preset', preset: 'claude_code' },
-      settingSources: ['user', 'project', 'local'],
+      settingSources: live.trusted ? ['user', 'project', 'local'] : ['user'],
       includePartialMessages: true,
       includeHookEvents: true,
       promptSuggestions: true,
@@ -975,6 +1122,7 @@ export class EngineHost {
     let victim = null;
     for (const live of this.#live.values()) {
       if (live.state !== 'idle' || this.#requests.count(live.sessionId) > 0) continue;
+      if (this.#opening.has(live.sessionId)) continue;
       if (victim === null || live.lastActivity < victim.lastActivity) victim = live;
     }
     if (victim === null) {
@@ -992,15 +1140,14 @@ export class EngineHost {
    */
   #ensureLive(sessionId, settings = {}) {
     const live = this.#live.get(sessionId);
-    if (live) return Promise.resolve(live);
-    const starting = this.#opening.get(sessionId);
-    if (starting) return starting;
-    const opening = this.#resumeLive(sessionId, settings).finally(() => this.#opening.delete(sessionId));
-    this.#opening.set(sessionId, opening);
-    return opening;
+    if (live && !this.#opening.has(sessionId)) return Promise.resolve(live);
+    return this.#exclusive(sessionId, async () => {
+      return this.#live.get(sessionId) ?? this.#resumeLive(sessionId, settings);
+    });
   }
 
   /**
+   * Starts the query of a session that is not open. Runs inside the session's lifecycle queue.
    * @param {string} sessionId
    * @param {SessionSettings} settings
    * @returns {Promise<LiveRecord>}
@@ -1013,7 +1160,9 @@ export class EngineHost {
     this.#assertNotLocked(sessionId);
     const existing = this.#live.get(sessionId);
     if (existing) return existing;
-    return this.#startQuery({ mode: 'resume', sessionId, cwd: info.cwd, settings });
+    const trusted = await this.#trustOf(info.cwd);
+    this.#assertNotLocked(sessionId);
+    return this.#startQuery({ mode: 'resume', sessionId, cwd: info.cwd, trusted, settings });
   }
 
   /** @param {string} sessionId */
@@ -1021,11 +1170,12 @@ export class EngineHost {
     if (this.#locks.has(sessionId)) throw sessionLocked();
   }
 
-  /** @param {SDKSessionInfo} info */
+  /**
+   * A session whose folder is outside the workspace roots does not exist for the gateway.
+   * @param {SDKSessionInfo} info
+   */
   async #assertResumable(info) {
-    if (!info.cwd || !(await this.#isAllowed(info.cwd))) {
-      throw new AppError(422, 'PATH_NOT_ALLOWED', 'The session folder is outside the workspace roots.');
-    }
+    if (!(await this.#withinRoots(info.cwd))) throw sessionNotFound();
   }
 
   /**
@@ -1064,6 +1214,25 @@ export class EngineHost {
     this.#applyMessage(live, msg);
     const seq = this.#publish({ type: 'sdk', sessionId: live.sessionId, data: { sessionId: live.sessionId, msg } });
     live.events.push(seq, msg);
+    this.#sync(live);
+    if (isCredentialFailure(msg)) this.#rejectCredentials(live);
+  }
+
+  /**
+   * The runtime rejected its credentials. The session carries the error, and one notice is published per query.
+   * The query itself is left alone: the user fixes the login and reopens the session.
+   * @param {LiveRecord} live
+   */
+  #rejectCredentials(live) {
+    if (live.credentialsRejected || live.closing) return;
+    live.credentialsRejected = true;
+    live.error = { code: 'ENGINE_UNAVAILABLE', message: CREDENTIALS_MESSAGE };
+    this.#log.warn('the runtime rejected its credentials', { sessionId: live.sessionId });
+    this.#publish({
+      type: 'notice',
+      sessionId: live.sessionId,
+      data: { sessionId: live.sessionId, level: 'error', code: 'ENGINE_UNAVAILABLE', message: CREDENTIALS_MESSAGE },
+    });
     this.#sync(live);
   }
 
@@ -1136,6 +1305,8 @@ export class EngineHost {
     const current = this.#live.get(live.sessionId) === live;
     if (current) this.#live.delete(live.sessionId);
     live.state = 'closing';
+    // Ending the input lets sendMessage see that a query which ended by itself no longer takes messages.
+    live.input.end();
     // A query that was replaced has already cancelled its requests; the session id may belong to the new query now.
     if (current) this.#requests.cancelSession(live.sessionId);
     if (failed && !live.closing) this.#reportFailure(live, failure);
@@ -1335,7 +1506,7 @@ export class EngineHost {
   async #applyPlanMode(live, nextMode) {
     if (this.#live.get(live.sessionId) !== live || live.closing || !live.query) return;
     try {
-      await live.query.setPermissionMode(nextMode);
+      await withTimeout(() => live.query.setPermissionMode(nextMode));
       live.permissionMode = nextMode;
       this.#sync(live);
     } catch (error) {
@@ -1377,7 +1548,23 @@ export class EngineHost {
    */
   #failure(sessionId, error, message) {
     this.#log.warn('engine call failed', { sessionId, reason: errorName(error) });
-    return engineError(message);
+    return engineError(error instanceof ControlTimeout ? TIMEOUT_MESSAGE : message);
+  }
+
+  /**
+   * Runs one control call of the runtime under the control timeout. A timeout answers with its own safe message.
+   * @template T
+   * @param {string} sessionId
+   * @param {() => Promise<T>} call
+   * @param {string} message  the safe message for any other failure
+   * @returns {Promise<T>}
+   */
+  async #control(sessionId, call, message) {
+    try {
+      return await withTimeout(call);
+    } catch (error) {
+      throw this.#failure(sessionId, error, message);
+    }
   }
 
   /**
@@ -1403,10 +1590,13 @@ export class EngineHost {
     if (typeof cwd !== 'string' || cwd === '') throw badRequest('The cwd must be a path.');
     const settings = parseSettings({ model, permissionMode, effort });
     const titleText = title === undefined ? '' : parseText(title, 'title', TITLE_MAX);
+    if (!(await this.#withinRoots(cwd))) throw outsideRoots();
+    const trusted = await this.#trustOf(cwd);
     const live = this.#startQuery({
       mode: 'new',
       sessionId: null,
       cwd,
+      trusted,
       title: titleText || undefined,
       settings,
     });
@@ -1423,11 +1613,16 @@ export class EngineHost {
   async openSession(sessionId, settings) {
     requireSessionId(sessionId);
     const parsed = parseSettings(settings);
+    if (parsed.permissionMode !== undefined) this.#assertBypassAllowed(parsed.permissionMode);
     this.#assertNotLocked(sessionId);
-    const live = this.#live.get(sessionId);
-    if (live) return (await this.updateSettings(sessionId, parsed)) ?? this.#info(live);
-    const started = await this.#ensureLive(sessionId, parsed);
-    return this.#info(started);
+    // Registered at once, so a close or lock that is requested after this open waits for it.
+    const live = await this.#exclusive(sessionId, async () => {
+      const current = this.#live.get(sessionId);
+      if (!current) return this.#resumeLive(sessionId, parsed);
+      await this.#applySettings(current, parsed);
+      return current;
+    });
+    return this.#info(live);
   }
 
   /**
@@ -1436,9 +1631,10 @@ export class EngineHost {
    */
   async closeSession(sessionId) {
     requireSessionId(sessionId);
-    await this.#opening.get(sessionId)?.catch(() => undefined);
-    const live = this.#live.get(sessionId);
-    if (live) await this.#detach(live, { publish: true });
+    await this.#exclusive(sessionId, async () => {
+      const live = this.#live.get(sessionId);
+      if (live) await this.#detach(live, { publish: true });
+    });
   }
 
   /**
@@ -1477,7 +1673,7 @@ export class EngineHost {
     requireSessionId(sessionId);
     const live = this.#live.get(sessionId);
     if (!live) return;
-    await this.#engineCall(sessionId, () => live.query.interrupt(), 'The turn could not be interrupted.');
+    await this.#control(sessionId, () => live.query.interrupt(), 'The turn could not be interrupted.');
   }
 
   /**
@@ -1491,14 +1687,27 @@ export class EngineHost {
     requireSessionId(sessionId);
     const parsed = parseSettings(settings);
     if (parsed.permissionMode !== undefined) this.#assertBypassAllowed(parsed.permissionMode);
+    await this.#settled(sessionId);
     const live = this.#live.get(sessionId);
     if (!live) {
+      await this.#scopeOf(sessionId, true);
       this.#remember(sessionId, parsed);
       return null;
     }
+    return this.#applySettings(live, parsed);
+  }
+
+  /**
+   * Applies settings to a live query and remembers them. Runs inside the session's lifecycle queue, or after it.
+   * @param {LiveRecord} live
+   * @param {SessionSettings} parsed
+   * @returns {Promise<LiveInfo>}
+   */
+  async #applySettings(live, parsed) {
+    const { sessionId } = live;
     if (parsed.model !== undefined) {
       const model = parsed.model;
-      await this.#engineCall(sessionId, () => live.query.setModel(model ?? undefined),
+      await this.#control(sessionId, () => live.query.setModel(model ?? undefined),
         'The model could not be changed.');
       live.model = model;
       this.#remember(sessionId, { model });
@@ -1506,7 +1715,7 @@ export class EngineHost {
     }
     if (parsed.permissionMode !== undefined) {
       const mode = parsed.permissionMode;
-      await this.#engineCall(sessionId, () => live.query.setPermissionMode(mode),
+      await this.#control(sessionId, () => live.query.setPermissionMode(mode),
         'The permission mode could not be changed.');
       live.permissionMode = mode;
       this.#remember(sessionId, { permissionMode: mode });
@@ -1514,7 +1723,7 @@ export class EngineHost {
     }
     if (parsed.effort !== undefined) {
       const effort = parsed.effort;
-      await this.#engineCall(sessionId, () => live.query.applyFlagSettings({ effortLevel: effort }),
+      await this.#control(sessionId, () => live.query.applyFlagSettings({ effortLevel: effort }),
         'The effort level could not be changed.');
       live.effort = effort;
       this.#remember(sessionId, { effort });
@@ -1541,11 +1750,8 @@ export class EngineHost {
   async getContextUsage(sessionId) {
     requireSessionId(sessionId);
     const live = this.#requireLive(sessionId);
-    try {
-      return await live.query.getContextUsage({ detail: 'summary' });
-    } catch (error) {
-      throw this.#failure(sessionId, error, 'The context usage could not be read.');
-    }
+    return this.#control(sessionId, () => live.query.getContextUsage({ detail: 'summary' }),
+      'The context usage could not be read.');
   }
 
   /**
@@ -1560,15 +1766,12 @@ export class EngineHost {
     const name = parseToken(server, 'The server name');
     const { kind, enabled } = parseMcpAction(action);
     const live = this.#requireLive(sessionId);
-    await this.#engineCall(sessionId, () => (kind === 'toggle'
+    await this.#control(sessionId, () => (kind === 'toggle'
       ? live.query.toggleMcpServer(name, enabled)
       : live.query.reconnectMcpServer(name)), 'The MCP server could not be updated.');
     live.capsCache = null;
-    try {
-      return await live.query.mcpServerStatus();
-    } catch (error) {
-      throw this.#failure(sessionId, error, 'The MCP server status could not be read.');
-    }
+    return this.#control(sessionId, () => live.query.mcpServerStatus(),
+      'The MCP server status could not be read.');
   }
 
   /**
@@ -1580,15 +1783,16 @@ export class EngineHost {
     requireSessionId(sessionId);
     if (what !== 'plugins' && what !== 'skills') throw invalid('The reload target must be plugins or skills.');
     const live = this.#requireLive(sessionId);
-    await this.#engineCall(sessionId, () => (what === 'plugins'
-      ? live.query.reloadPlugins()
-      : live.query.reloadSkills()), 'The session could not be reloaded.');
+    /** @type {() => Promise<unknown>} */
+    const reload = () => (what === 'plugins' ? live.query.reloadPlugins() : live.query.reloadSkills());
+    await this.#control(sessionId, reload, 'The session could not be reloaded.');
     live.capsCache = null;
   }
 
   /**
    * Rewinds the files, the conversation, or both to just before a user message. Every check runs before any change,
-   * so a refused rewind leaves the session untouched. `dryRun` never changes anything.
+   * so a refused rewind leaves the session untouched. `dryRun` never changes anything. A rewind that changes state
+   * runs in the session's lifecycle queue, so sends and opens that arrive meanwhile wait for the restarted query.
    * @param {string} sessionId
    * @param {{userMessageId: string, mode: 'code'|'conversation'|'both', dryRun?: boolean}} options
    * @returns {Promise<{files?: RewindFilesResult, conversation?: {resumeAt: string}}>}
@@ -1599,35 +1803,66 @@ export class EngineHost {
     if (!includes(REWIND_MODES, mode)) throw invalid('The rewind mode must be code, conversation or both.');
     if (dryRun !== undefined && typeof dryRun !== 'boolean') throw badRequest('dryRun must be a boolean.');
     this.#assertNotLocked(sessionId);
-    const preview = dryRun === true;
-    const resumeAt = mode === 'code' ? undefined : await this.#rewindTarget(sessionId, messageId);
+    if (dryRun === true) return this.#previewRewind(sessionId, messageId, mode);
+    return this.#exclusive(sessionId, () => this.#applyRewind(sessionId, messageId, mode));
+  }
+
+  /**
+   * The outcome of a rewind without changing anything. The query is opened when it is not live yet.
+   * @param {string} sessionId
+   * @param {string} messageId
+   * @param {'code'|'conversation'|'both'} mode
+   * @returns {Promise<{files?: RewindFilesResult, conversation?: {resumeAt: string}}>}
+   */
+  async #previewRewind(sessionId, messageId, mode) {
+    const { info } = await this.#scopeOf(sessionId);
+    const resumeAt = mode === 'code' ? undefined : await this.#rewindTarget(sessionId, messageId, info);
     /** @type {{files?: RewindFilesResult, conversation?: {resumeAt: string}}} */
     const result = {};
-    if (mode !== 'conversation') result.files = await this.#rewindFiles(sessionId, messageId, preview);
+    if (mode !== 'conversation') {
+      const live = await this.#ensureLive(sessionId);
+      result.files = await this.#rewindFiles(live, messageId, true);
+    }
+    if (mode !== 'code') result.conversation = { resumeAt };
+    return result;
+  }
+
+  /**
+   * A rewind that changes state. Runs inside the session's lifecycle queue: the files are rewound first, then the
+   * conversation restarts at the entry before the message.
+   * @param {string} sessionId
+   * @param {string} messageId
+   * @param {'code'|'conversation'|'both'} mode
+   * @returns {Promise<{files?: RewindFilesResult, conversation?: {resumeAt: string}}>}
+   */
+  async #applyRewind(sessionId, messageId, mode) {
+    this.#assertNotLocked(sessionId);
+    const { info } = await this.#scopeOf(sessionId);
+    const resumeAt = mode === 'code' ? undefined : await this.#rewindTarget(sessionId, messageId, info);
+    /** @type {{files?: RewindFilesResult, conversation?: {resumeAt: string}}} */
+    const result = {};
+    if (mode !== 'conversation') {
+      const live = this.#live.get(sessionId) ?? await this.#resumeLive(sessionId, {});
+      result.files = await this.#rewindFiles(live, messageId, false);
+    }
     if (mode !== 'code') {
+      await this.#restartNow(sessionId, resumeAt);
       result.conversation = { resumeAt };
-      if (!preview) {
-        await this.#restartAt(sessionId, resumeAt);
-        this.#publishSessionsChanged('rewind', sessionId);
-      }
+      this.#publishSessionsChanged('rewind', sessionId);
     }
     return result;
   }
 
   /**
-   * @param {string} sessionId
+   * Rewinds the files to just before a message. A refused rewind changes nothing.
+   * @param {LiveRecord} live
    * @param {string} messageId
    * @param {boolean} preview
    * @returns {Promise<RewindFilesResult>}
    */
-  async #rewindFiles(sessionId, messageId, preview) {
-    const live = await this.#ensureLive(sessionId);
-    let files;
-    try {
-      files = await live.query.rewindFiles(messageId, { dryRun: preview });
-    } catch (error) {
-      throw this.#failure(sessionId, error, 'The files could not be rewound.');
-    }
+  async #rewindFiles(live, messageId, preview) {
+    const files = await this.#control(live.sessionId,
+      () => live.query.rewindFiles(messageId, { dryRun: preview }), 'The files could not be rewound.');
     if (!files.canRewind && !preview) {
       throw cannotRewind(firstLine(files.error, 'The files cannot be rewound to this message.'));
     }
@@ -1638,10 +1873,11 @@ export class EngineHost {
    * The transcript entry just before the target message, which is where a conversation rewind resumes.
    * @param {string} sessionId
    * @param {string} messageId
+   * @param {SDKSessionInfo|null} info
    * @returns {Promise<string>}
    */
-  async #rewindTarget(sessionId, messageId) {
-    const transcript = await this.#transcript(sessionId);
+  async #rewindTarget(sessionId, messageId, info) {
+    const transcript = await this.#transcript(sessionId, info);
     const index = transcript.findIndex((message) => message.uuid === messageId);
     if (index < 1 || transcript[index].type !== 'user') throw cannotRewind('This message cannot be rewound to.');
     return transcript[index - 1].uuid;
@@ -1650,10 +1886,11 @@ export class EngineHost {
   /**
    * Stops the live query of a session, if any, and starts it again at an earlier entry of the conversation. The
    * stop is not reported as the end of the session, and the old query is fully stopped before the new one starts.
+   * Runs inside the session's lifecycle queue, so it never waits for the session again.
    * @param {string} sessionId
    * @param {string} resumeAt
    */
-  async #restartAt(sessionId, resumeAt) {
+  async #restartNow(sessionId, resumeAt) {
     const previous = this.#live.get(sessionId);
     /** @type {string} */
     let cwd;
@@ -1664,13 +1901,13 @@ export class EngineHost {
       settings = { model: previous.model, permissionMode: previous.permissionMode, effort: previous.effort };
       await this.#detach(previous, { publish: false });
     } else {
-      const info = await this.#readInfo(sessionId);
-      if (!info) throw sessionNotFound();
-      await this.#assertResumable(info);
-      cwd = info.cwd;
+      const { info } = await this.#scopeOf(sessionId);
+      cwd = /** @type {string} */ (info?.cwd);
     }
     this.#assertNotLocked(sessionId);
-    this.#startQuery({ mode: 'resume', sessionId, cwd, settings, resumeSessionAt: resumeAt });
+    const trusted = await this.#trustOf(cwd);
+    this.#assertNotLocked(sessionId);
+    this.#startQuery({ mode: 'resume', sessionId, cwd, trusted, settings, resumeSessionAt: resumeAt });
   }
 
   /**
@@ -1683,7 +1920,7 @@ export class EngineHost {
     requireSessionId(sessionId);
     const upTo = upToMessageId === undefined ? undefined : parseToken(upToMessageId, 'The message id');
     const titleText = title === undefined ? undefined : parseText(title, 'title', TITLE_MAX) || undefined;
-    const info = await this.#readInfo(sessionId);
+    const { info } = await this.#scopeOf(sessionId);
     if (!info) throw sessionNotFound();
     /** @type {import('@anthropic-ai/claude-agent-sdk').ForkSessionResult} */
     let forked;
@@ -1705,9 +1942,7 @@ export class EngineHost {
     requireSessionId(sessionId);
     const text = parseText(title, 'title', TITLE_MAX);
     if (text === '') throw invalid('The title must not be empty.');
-    const live = this.#live.get(sessionId);
-    const info = await this.#readInfo(sessionId);
-    if (!info && !live) throw sessionNotFound();
+    const { info, live } = await this.#scopeOf(sessionId);
     if (info) {
       await this.#engineCall(sessionId, () => this.#engine.renameSession(sessionId, text),
         'The session could not be renamed.');
@@ -1727,8 +1962,7 @@ export class EngineHost {
   async tag(sessionId, tag) {
     requireSessionId(sessionId);
     const value = tag === null ? null : parseText(tag, 'tag', TAG_MAX) || null;
-    const info = await this.#readInfo(sessionId);
-    if (!info && !this.#live.has(sessionId)) throw sessionNotFound();
+    const { info } = await this.#scopeOf(sessionId);
     if (info) {
       await this.#engineCall(sessionId, () => this.#engine.tagSession(sessionId, value),
         'The session could not be tagged.');
@@ -1742,18 +1976,14 @@ export class EngineHost {
    */
   async deleteSession(sessionId) {
     requireSessionId(sessionId);
+    await this.#scopeOf(sessionId);
     this.#assertNotLocked(sessionId);
     if (this.#live.has(sessionId) || this.#opening.has(sessionId)) {
       throw new AppError(409, 'CONFLICT', 'Close the session before deleting it.');
     }
-    const info = await this.#readInfo(sessionId);
-    if (!info) throw sessionNotFound();
-    this.#assertNotLocked(sessionId);
-    if (this.#live.has(sessionId) || this.#opening.has(sessionId)) {
-      throw new AppError(409, 'CONFLICT', 'Close the session before deleting it.');
-    }
-    await this.#engineCall(sessionId, () => this.#engine.deleteSession(sessionId),
-      'The session could not be deleted.');
+    // Registered before the first await, so no send or open can start a query on the file while it is removed.
+    await this.#exclusive(sessionId, () => this.#engineCall(sessionId, () => this.#engine.deleteSession(sessionId),
+      'The session could not be deleted.'));
     this.#transcripts.delete(sessionId);
     this.#pending.delete(sessionId);
     this.#publishSessionsChanged('deleted', sessionId);
@@ -1767,12 +1997,13 @@ export class EngineHost {
     requireSessionId(sessionId);
     const id = parseToken(taskId, 'The task id');
     const live = this.#requireLive(sessionId);
-    await this.#engineCall(sessionId, () => live.query.stopTask(id), 'The task could not be stopped.');
+    await this.#control(sessionId, () => live.query.stopTask(id), 'The task could not be stopped.');
   }
 
   /** @param {string} sessionId @returns {Promise<string[]>} */
   async listSubagents(sessionId) {
     requireSessionId(sessionId);
+    await this.#scopeOf(sessionId);
     try {
       return await this.#engine.listSubagents(sessionId);
     } catch (error) {
@@ -1788,6 +2019,7 @@ export class EngineHost {
   async getSubagentMessages(sessionId, agentId) {
     requireSessionId(sessionId);
     const id = parseToken(agentId, 'The agent id');
+    await this.#scopeOf(sessionId);
     try {
       return await this.#engine.getSubagentMessages(sessionId, id);
     } catch (error) {
@@ -1804,15 +2036,17 @@ export class EngineHost {
   async lockForTerminal(sessionId) {
     requireSessionId(sessionId);
     this.#assertNotLocked(sessionId);
-    await this.#opening.get(sessionId)?.catch(() => undefined);
-    this.#assertNotLocked(sessionId);
-    const token = Symbol(sessionId);
-    this.#locks.set(sessionId, token);
-    const live = this.#live.get(sessionId);
-    if (live) await this.#detach(live, { publish: true });
-    return () => {
-      if (this.#locks.get(sessionId) === token) this.#locks.delete(sessionId);
-    };
+    return this.#exclusive(sessionId, async () => {
+      await this.#scopeOf(sessionId, true);
+      this.#assertNotLocked(sessionId);
+      const token = Symbol(sessionId);
+      this.#locks.set(sessionId, token);
+      const live = this.#live.get(sessionId);
+      if (live) await this.#detach(live, { publish: true });
+      return () => {
+        if (this.#locks.get(sessionId) === token) this.#locks.delete(sessionId);
+      };
+    });
   }
 
   /**
@@ -1824,6 +2058,7 @@ export class EngineHost {
     const timeout = this.#config.idleTimeoutMs;
     const idle = [...this.#live.values()].filter((live) => live.state === 'idle'
       && this.#requests.count(live.sessionId) === 0
+      && !this.#opening.has(live.sessionId)
       && now - live.lastActivity > timeout);
     await Promise.all(idle.map((live) => this.#detach(live, { publish: true })));
     if (idle.length > 0) this.#log.info('closed idle sessions', { count: idle.length });

@@ -160,9 +160,30 @@ export function openMenu(anchor, items, { label } = {}) {
     close(false);
   };
 
-  /** @param {Event} event */
+  /**
+   * An element anchor is in view while any part of it is inside the viewport. A detached anchor is not.
+   * @returns {boolean}
+   */
+  const anchorInView = () => {
+    if (anchorElement && !anchorElement.isConnected) return false;
+    const rect = anchorRect(anchor);
+    const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+    return rect.right >= 0 && rect.bottom >= 0 && rect.left <= viewportWidth && rect.top <= window.innerHeight;
+  };
+
+  /**
+   * A scroll closes the menu only when its anchor has left the viewport. While the anchor is still visible the menu
+   * follows it, so auto-scroll inside the timeline (.tl-scroll while a turn streams) keeps the menu open.
+   * @param {Event} event
+   */
   const onScrollOrResize = (event) => {
-    if (event.type === 'scroll' && menu.contains(/** @type {Node} */ (event.target))) return;
+    if (event.type === 'scroll') {
+      if (menu.contains(/** @type {Node} */ (event.target))) return;
+      if (anchorInView()) {
+        place(menu, anchor);
+        return;
+      }
+    }
     close(false);
   };
 
