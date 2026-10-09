@@ -5,29 +5,70 @@
 
 import { h, icon } from '../../dom.js';
 import { t as defaultT } from '../../i18n.js';
+import { openDialog } from '../../ui/dialog.js';
+import { imageSource } from './images.js';
 
 /** @typedef {'running' | 'done' | 'error' | 'waiting'} ToolStatus */
 /** @typedef {(key: string, vars?: Record<string, string | number>) => string} Translate */
 
-const STATUS_ICON = { done: 'check', error: 'alert', waiting: 'clock' };
-
 /**
- * Status of a tool card. Returns null for a card that sits inside a permission request, where the request card carries
- * the state and the tool card shows no badge.
+ * Status of a tool card: waiting while its request waits for the user (the request card above the composer carries the
+ * decision), error or done once it has a result, running while it runs.
  * @param {{ result?: { isError?: boolean } | null, running?: boolean, pendingRequestId?: string }} card
- * @returns {ToolStatus | null}
+ * @returns {ToolStatus}
  */
 export function statusOf(card) {
-  if (card.pendingRequestId) return null;
+  if (card.pendingRequestId) return 'waiting';
   if (card.result) return card.result.isError ? 'error' : 'done';
   return card.running ? 'running' : 'done';
 }
 
+/** Action-log verbs (tools.verb.*) of the built-in tools; a name not listed here is shown as it is. */
+const VERB_KEYS = Object.freeze({
+  Read: 'tools.verb.read',
+  Write: 'tools.verb.write',
+  Edit: 'tools.verb.edit',
+  MultiEdit: 'tools.verb.edit',
+  NotebookEdit: 'tools.verb.notebook',
+  Bash: 'tools.verb.run',
+  BashOutput: 'tools.verb.output',
+  Monitor: 'tools.verb.monitor',
+  KillShell: 'tools.verb.stop',
+  KillBash: 'tools.verb.stop',
+  TaskStop: 'tools.verb.stop',
+  Grep: 'tools.verb.search',
+  Glob: 'tools.verb.find',
+  LS: 'tools.verb.list',
+  WebFetch: 'tools.verb.fetch',
+  WebSearch: 'tools.verb.webSearch',
+  Agent: 'tools.verb.agent',
+  Task: 'tools.verb.agent',
+  TodoWrite: 'tools.verb.todo',
+  TaskCreate: 'tools.verb.todo',
+  TaskUpdate: 'tools.verb.todo',
+  TaskList: 'tools.verb.todo',
+  TaskGet: 'tools.verb.todo',
+  ExitPlanMode: 'tools.verb.plan',
+  EnterPlanMode: 'tools.verb.plan',
+});
+
 /**
- * Collapsible tool card. `body` is either a Node or a function returning one. A function is called on the first open
- * (immediately when the card starts open) with the action toolbar, to which it may append controls.
+ * The verb a tool row starts with: "Read", "Run", "Search"… for a built-in tool, the tool's own name otherwise.
+ * @param {string} name tool name as the runtime reports it
+ * @param {Translate} translate
+ * @returns {string}
+ */
+export function verbOf(name, translate = defaultT) {
+  const key = Object.hasOwn(VERB_KEYS, name) ? VERB_KEYS[name] : null;
+  if (key) return translate(key);
+  return name || translate('tools.verb.tool');
+}
+
+/**
+ * Collapsible tool row of the action log: a state glyph, the verb (sans), the target (mono, one line), the extras on the
+ * right (a diff stat or a duration). `body` is either a Node or a function returning one. A function is called on the
+ * first open (immediately when the row starts open) with the action toolbar, to which it may append controls.
  * @param {{
- *   iconName: string,
  *   title: string,
  *   subtitle?: string,
  *   status?: ToolStatus | null,
@@ -37,7 +78,7 @@ export function statusOf(card) {
  *   extras?: HTMLElement[],
  *   t?: Translate,
  *   family?: string,
- * }} options `extras` are small chips placed after the subtitle (diff counts, for example)
+ * }} options `title` is the verb, `subtitle` the target, `extras` the chips placed at the right (diff counts, for example)
  * @returns {HTMLDetailsElement}
  */
 export function toolShell(options) {
@@ -51,12 +92,11 @@ export function toolShell(options) {
   const summary = h(
     'summary',
     { class: 'tool-head' },
-    h('span', { class: 'tool-icon' }, icon(options.iconName)),
+    statusGlyph(status, translate),
     h('span', { class: 'tool-title', text: options.title }),
     options.subtitle ? h('span', { class: 'tool-subtitle', text: options.subtitle, title: options.subtitle }) : null,
-    options.extras ?? null,
-    statusBadge(status, translate),
-    h('span', { class: 'tool-chevron' }, icon('chevron-down')),
+    options.extras && options.extras.length > 0 ? h('span', { class: 'tool-extras' }, options.extras) : null,
+    h('span', { class: 'tool-chevron', attrs: { 'aria-hidden': 'true' } }, icon('chevron-right')),
   );
   const host = h('div', { class: 'tool-body' });
   details.append(summary, host);
@@ -205,23 +245,52 @@ export function section(options) {
   return details;
 }
 
-const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-const BASE64 = /^[A-Za-z0-9+/=\r\n]+$/;
-
 /**
- * Inline image from base64 data, shown through a data: URL (allowed by the CSP). Returns null for an unsupported
- * media type or data that is not base64.
+ * Inline image from base64 data, shown through a data: URL (allowed by the CSP). The thumbnail is a button: a click opens
+ * the image full size in a dialog. Returns null for a media type, encoding or size that images.js does not allow.
  * @param {unknown} mediaType
  * @param {unknown} data
  * @param {string} alt
+ * @param {Translate} [translate]
  * @returns {HTMLElement | null}
  */
-export function imageNode(mediaType, data, alt) {
-  if (typeof mediaType !== 'string' || !IMAGE_TYPES.has(mediaType)) return null;
-  if (typeof data !== 'string' || data === '' || !BASE64.test(data)) return null;
-  return h('img', {
+export function imageNode(mediaType, data, alt, translate = defaultT) {
+  return imageButton(imageSource(mediaType, data), alt, translate);
+}
+
+/**
+ * The thumbnail button of an image that images.js accepted (see imageNode). Null for no image.
+ * @param {{ src: string } | null} image
+ * @param {string} alt
+ * @param {Translate} [translate]
+ * @returns {HTMLElement | null}
+ */
+export function imageButton(image, alt, translate = defaultT) {
+  if (!image) return null;
+  const openLabel = translate('tools.image.open');
+  return h('button', {
+    class: 'tool-image-button',
+    attrs: { type: 'button', title: openLabel, 'aria-label': `${alt}. ${openLabel}` },
+    on: { click: () => openImageDialog(image.src, alt, translate) },
+  }, h('img', {
     class: 'tool-image',
-    attrs: { src: `data:${mediaType};base64,${data}`, alt, loading: 'lazy', decoding: 'async' },
+    attrs: { src: image.src, alt, loading: 'lazy', decoding: 'async' },
+  }));
+}
+
+/**
+ * The image at full size, in a dialog that closes on Escape or a click outside it.
+ * @param {string} src data: URL of an allowed image
+ * @param {string} alt
+ * @param {Translate} translate
+ */
+function openImageDialog(src, alt, translate) {
+  openDialog({
+    title: alt,
+    body: h('img', { class: 'tool-image-full', attrs: { src, alt } }),
+    size: 'lg',
+    className: 'tool-image-dialog',
+    actions: [{ label: translate('tools.image.close'), kind: 'secondary' }],
   });
 }
 
@@ -229,16 +298,17 @@ export function imageNode(mediaType, data, alt) {
  * Images attached to a tool result (`result.images`, base64 with a media type), as inline images.
  * @param {{ images?: unknown } | null | undefined} result
  * @param {string} alt
+ * @param {Translate} [translate]
  * @returns {HTMLElement[]}
  */
-export function resultImages(result, alt) {
+export function resultImages(result, alt, translate = defaultT) {
   const images = Array.isArray(result?.images) ? result.images : [];
   /** @type {HTMLElement[]} */
   const nodes = [];
   for (const image of images) {
     if (!image || typeof image !== 'object') continue;
     const { mediaType, data } = /** @type {{ mediaType?: unknown, data?: unknown }} */ (image);
-    const node = imageNode(mediaType, data, alt);
+    const node = imageNode(mediaType, data, alt, translate);
     if (node) nodes.push(node);
   }
   return nodes;
@@ -398,20 +468,21 @@ function appendToolbar(host, toolbar) {
 }
 
 /**
+ * The state glyph at the start of a row: a rotating arc while running (static under reduced motion), a dot with a ring
+ * while it waits for the user, an exclamation dot on error. A finished row has no glyph. The state is also named for
+ * assistive technology.
  * @param {ToolStatus | null} status
  * @param {Translate} translate
- * @returns {HTMLElement | null}
+ * @returns {HTMLElement}
  */
-function statusBadge(status, translate) {
-  if (!status) return null;
-  const mark =
-    status === 'running'
-      ? h('span', { class: 'tool-spinner', attrs: { 'aria-hidden': 'true' } })
-      : icon(STATUS_ICON[status]);
+function statusGlyph(status, translate) {
+  if (!status || status === 'done') {
+    return h('span', { class: 'tool-glyph', attrs: { 'aria-hidden': 'true' } });
+  }
+  const label = translate(`tools.status.${status}`);
   return h(
     'span',
-    { class: ['tool-badge', `tool-badge-${status}`] },
-    mark,
-    h('span', { text: translate(`tools.status.${status}`) }),
+    { class: ['tool-glyph', `is-${status}`], attrs: { role: 'img', 'aria-label': label, title: label } },
+    status === 'running' ? h('span', { class: 'tool-arc', attrs: { 'aria-hidden': 'true' } }) : null,
   );
 }

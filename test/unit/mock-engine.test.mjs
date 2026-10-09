@@ -247,6 +247,7 @@ const SCENARIO_PROMPTS = {
   context: '/context',
   usage: '/usage',
   clear: '/clear',
+  browse: 'browse the page and take a screenshot',
   tool: 'please run the tool',
   edit: 'edit the server file',
   question: 'ask me a question',
@@ -265,6 +266,7 @@ const SCENARIO_PROMPTS = {
   think: 'think it through first',
   background: 'start a background build',
   'refusal-none': 'refusal-none please',
+  'refusal-prompt': 'refusal-prompt please',
   refusal: 'trigger a refusal',
   plugin: 'install the plugin',
   default: 'Tell me something about the project',
@@ -1017,7 +1019,7 @@ describe('control methods', () => {
     assert.deepEqual(await query.setMcpServers({}), { added: [], removed: ['docs'], errors: {} });
     assert.deepEqual(await query.setMcpPermissionModeOverride('github', 'auto'), {});
     const warning = await query.setMcpPermissionModeOverride('unknown', 'auto');
-    assert.match(warning.warning, /No MCP server named unknown/);
+    assert.match(warning.warning, /No MCP server named "unknown" is connected\./);
     await assert.rejects(query.setMcpPermissionModeOverride('github', 'always'), /mode must be default, auto or null/);
   });
 
@@ -1110,7 +1112,7 @@ describe('control methods', () => {
     await assert.rejects(query.updateSettings('userSettings', { outputStyle: 3 }), /outputStyle must be a string/);
     const reloaded = await query.reloadPlugins();
     assert.equal(reloaded.error_count, 0);
-    assert.deepEqual(reloaded.mcpServers.map((server) => server.name), ['github', 'filesystem']);
+    assert.deepEqual(reloaded.mcpServers.map((server) => server.name), ['github', 'filesystem', 'mock-oauth']);
     const skills = await query.reloadSkills();
     assert.ok(skills.skills.some((skill) => skill.name === 'code-review'));
     const styles = await query.reloadOutputStyles();

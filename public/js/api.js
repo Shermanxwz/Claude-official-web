@@ -27,7 +27,7 @@ export class ApiError extends Error {
 /** Every event type the gateway can send (docs/PROTOCOL.md, Events). */
 export const EVENT_TYPES = Object.freeze([
   'hello', 'heartbeat', 'resync', 'sessions_changed', 'session_state', 'sdk', 'request', 'request_resolved',
-  'message_accepted', 'notice', 'terminal_state',
+  'message_accepted', 'message_cancelled', 'account_changed', 'notice', 'terminal_state',
 ]);
 
 const RECONNECT_MIN_MS = 1000;
@@ -238,6 +238,10 @@ export const api = {
   /** @param {string} path @param {unknown} body */
   patch(path, body) {
     return sendJson('PATCH', path, body);
+  },
+  /** @param {string} path @param {unknown} body */
+  put(path, body) {
+    return sendJson('PUT', path, body);
   },
   /** @param {string} path */
   del(path) {

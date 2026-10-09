@@ -28,7 +28,6 @@ export function render(card, ctx) {
   const text = resultText(card.result) || (card.structured != null ? prettyJson(card.structured) : '');
   const failed = card.result?.isError === true;
   return toolShell({
-    iconName: 'tool',
     title: str(card.name) || t('tools.generic.unnamed'),
     status: statusOf(card),
     body: () => {
@@ -45,7 +44,7 @@ export function render(card, ctx) {
       }
       return h('div', { class: 'tool-generic' }, parts);
     },
-    open: Boolean(ctx.open || pending),
+    open: Boolean(ctx.open),
     actions: text && !failed ? [copyButton({ text, t, label: t('tools.copyResult') })] : [],
     t,
     family: 'generic',

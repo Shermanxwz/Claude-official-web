@@ -13,6 +13,7 @@ import { createApp } from './app.mjs';
 import { createAuth } from './auth.mjs';
 import { ConfigError, loadConfig } from './config.mjs';
 import { EventHub } from './events.mjs';
+import { engineEnv } from './engine/env.mjs';
 import { createLogger } from './log.mjs';
 import { isLoopbackHost } from './security.mjs';
 
@@ -109,13 +110,23 @@ export async function startServer({ env = process.env, engine, listenHost, liste
     getSeq: () => events.lastSeq,
     isAllowedCwd: (/** @type {string} */ p) => workspaces.isInsideRoots(p),
     isTrustedCwd: (/** @type {string} */ p) => workspaces.isTrusted(p),
+    resolveDir: (/** @type {string} */ p) => workspaces.resolveDir(p),
+  });
+  const account = (await import('./engine/account.mjs')).createAccount({
+    engine: adapter,
+    config,
+    log,
+    publish,
+    env: () => engineEnv(process.env, { clientApp: `claude-official-web/${config.version}` }),
+    liveQuery: () => engineHost.anyLiveQuery(),
+    onSignedIn: () => engineHost.forgetCapabilities(),
   });
   const terminal = await (await import('./terminal.mjs')).createTerminal({ config, log, engineHost, publish });
   const maintenance = await (await import('./maintenance.mjs'))
     .startMaintenance({ config, log, attachments, engineHost });
   const auth = await createAuth(config, { log, bootId, stateStore });
   const app = createApp({
-    config, log, engine: adapter, engineHost, events, auth, workspaces, attachments, terminal, bootId,
+    config, log, engine: adapter, engineHost, events, auth, workspaces, attachments, terminal, account, bootId,
     publicDir: PUBLIC_DIR,
   });
 
@@ -131,6 +142,7 @@ export async function startServer({ env = process.env, engine, listenHost, liste
     events.close();
     await safely(log, 'terminal shutdown failed', () => terminal.closeAll());
     await safely(log, 'maintenance shutdown failed', () => maintenance.stop());
+    await safely(log, 'account shutdown failed', () => account.close());
     await closeEngine();
     server.closeAllConnections();
     await stopped;

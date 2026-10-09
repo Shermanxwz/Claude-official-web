@@ -137,14 +137,15 @@ test('J3 a tool asks first: Allow runs it, Deny with a reason ends it as an erro
     await waitForTurnResult(page, 1);
     await expandTimeline(page);
     await page.locator('.tool-card .tool-code', { hasText: 'package.json' }).waitFor();
-    await page.locator('.tool-card .tool-badge-done').first().waitFor();
+    await page.locator('.tool-card.tool-status-done').first().waitFor();
 
     await sendMessage(page, 'Run another tool and deny it');
     const second = pendingCard(page, 'permission');
     await second.waitFor();
+    await second.locator('.request-note-toggle').click();
     await second.locator('.request-deny-input').fill('Please list the files another way');
     await second.getByRole('button', { name: 'Deny', exact: true }).click();
-    await page.locator('.tool-card .tool-badge-error').first().waitFor();
+    await page.locator('.tool-card.tool-status-error').first().waitFor();
     await waitForTurnResult(page, 2);
     await expandTimeline(page);
     await page.locator('.tool-card', { hasText: 'Please list the files another way' }).first().waitFor();

@@ -3,7 +3,7 @@
  */
 
 import { h } from '../../dom.js';
-import { cappedList, chip, copyButton, errorBlock, statusOf, toolShell } from './shell.js';
+import { cappedList, chip, copyButton, errorBlock, statusOf, toolShell, verbOf } from './shell.js';
 import { displayPath, finiteNumber, globCount, grepStats, isRecord, resultText, str, truncate } from './summaries.js';
 
 const ROW_LIMIT = 200;
@@ -38,15 +38,14 @@ function renderGrep(card, ctx) {
   const rows = grepRows(card, structured, stats.mode, ctx.cwd);
   const pattern = str(input.pattern);
   return toolShell({
-    iconName: 'search',
-    title: 'Grep',
+    title: verbOf('Grep', t),
     subtitle: truncate(pattern, SUBTITLE_MAX),
     status: statusOf(card),
     body: () => {
       const meta = grepFlags(input, ctx.cwd, t);
       return searchBody(card, rows, meta, t);
     },
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: rows.length > 0 ? [copyButton({ text: rows.join('\n'), t, label: t('tools.search.copyResults') })] : [],
     extras: stats.count != null ? [countChip(stats.mode, stats.count, t)] : [],
     t,
@@ -69,8 +68,7 @@ function renderGlob(card, ctx) {
   if (count != null) extras.push(chip(countText(t, 'files', count)));
   if (structured.truncated === true) extras.push(chip(t('tools.search.truncated'), { kind: 'warning' }));
   return toolShell({
-    iconName: 'search',
-    title: 'Glob',
+    title: verbOf('Glob', t),
     subtitle: truncate(str(input.pattern), SUBTITLE_MAX),
     status: statusOf(card),
     body: () => {
@@ -83,7 +81,7 @@ function renderGlob(card, ctx) {
       }
       return searchBody(card, rows, meta, t);
     },
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: rows.length > 0 ? [copyButton({ text: rows.join('\n'), t, label: t('tools.search.copyResults') })] : [],
     extras,
     t,
@@ -101,12 +99,11 @@ function renderLs(card, ctx) {
   const input = recordOf(card.input);
   const rows = listingRows(card);
   return toolShell({
-    iconName: 'folder',
-    title: 'LS',
+    title: verbOf('LS', t),
     subtitle: displayPath(input.path, ctx.cwd) || '.',
     status: statusOf(card),
     body: () => searchBody(card, rows, [], t),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: rows.length > 0 ? [copyButton({ text: rows.join('\n'), t, label: t('tools.search.copyResults') })] : [],
     t,
     family: 'search',

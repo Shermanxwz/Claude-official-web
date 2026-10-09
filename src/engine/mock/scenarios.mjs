@@ -10,6 +10,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { BROWSER_MCP_SERVER } from '../../contracts.mjs';
 
 /** @typedef {import('../../contracts.mjs').SDKMessage} SDKMessage */
 /** @typedef {import('../../contracts.mjs').SDKUserMessage} SDKUserMessage */
@@ -99,10 +100,17 @@ export class ScenarioFailure extends Error {
  * @property {() => {uuid: `${string}-${string}-${string}-${string}-${string}`, session_id: string}} envelope
  * @property {() => number} now
  * @property {boolean} thinkingSummaries     the query was started with --thinking-display summarized
- * @property {(toolUseId: string, description: string) => ForegroundTask} foregroundTask   registers a command that a
- *   backgroundTasks call may move; call it before the tool call is streamed
+ * @property {(toolUseId: string, description: string, output?: string) => ForegroundTask} foregroundTask   registers
+ *   a command that a backgroundTasks call may move, with the output it prints once it completes in the background;
+ *   call it before the tool call is streamed
  * @property {(task: ForegroundTask) => AsyncGenerator<SDKMessage, {taskId: string}|null, unknown>} awaitBackground
  *   waits until the command is moved to the background (`{taskId}`) or the wait ends (`null`)
+ * @property {string[]} dialogKinds          the dialog kinds the host renders (supportedDialogKinds)
+ * @property {string|null} fallbackModel     the model a refused answer is retried on (option fallbackModel)
+ * @property {(dialog: {kind: string, payload: Record<string, unknown>, toolUseId?: string}) =>
+ *   AsyncGenerator<SDKMessage, 'retry_fallback'|'edit_prompt'|'cancelled'|null, unknown>} userDialog
+ *   asks the host through onUserDialog; the result is what the host answered (cancelled when it did not answer)
+ * @property {(uuids: string[]) => void} retract  removes messages from the transcript and the turn's answer
  * @property {(ms: number) => AsyncGenerator<SDKMessage, void, unknown>} pause
  * @property {(toolName: string, input: Record<string, unknown>, detail: PermissionDetail) =>
  *   AsyncGenerator<SDKMessage, PermissionOutcome, unknown>} askPermission
@@ -272,8 +280,8 @@ export function statusMessage(ctx, status, extra = {}) {
 /**
  * Messages the runtime sends that the SDK typings do not declare yet. Each shape is typed here and cast to SDKMessage
  * at the builder boundary, so the rest of the mock treats them like any other message.
- * @typedef {{type: 'command_lifecycle', command_uuid: string, state: 'queued'|'started'|'completed', uuid: string,
- *   session_id: string}} CommandLifecycleMessage
+ * @typedef {{type: 'command_lifecycle', command_uuid: string, state: 'queued'|'started'|'completed'|'cancelled',
+ *   uuid: string, session_id: string}} CommandLifecycleMessage
  * @typedef {{type: 'system', subtype: 'task_summary', detail: string, uuid: string,
  *   session_id: string}} TaskSummaryMessage
  * @typedef {{type: 'system', subtype: 'post_turn_summary', summarizes_uuid: string,
@@ -303,7 +311,7 @@ function asSdk(message) {
  * The lifecycle of one prompt: queued when it is accepted, started when its turn begins, completed after its result.
  * @param {SessionView} ctx
  * @param {string} commandUuid uuid of the prompt message
- * @param {'queued'|'started'|'completed'} state
+ * @param {'queued'|'started'|'completed'|'cancelled'} state
  * @returns {SDKMessage}
  */
 export function commandLifecycle(ctx, commandUuid, state) {
@@ -452,10 +460,12 @@ export function permissionDenied(ctx, { toolName, toolUseId, message, reason }) 
 }
 
 /**
- * A tool_result block inside a user message. Subagent results carry `parentToolUseId` and `agentId`.
+ * A tool_result block inside a user message. Subagent results carry `parentToolUseId` and `agentId`. The content is
+ * text, or a list of text and image blocks (an MCP tool's screenshot, for example).
  * @param {TurnContext} ctx
- * @param {{toolUseId: string, content: string, isError?: boolean, toolUseResult?: unknown,
- *   parentToolUseId?: string|null, agentId?: string|null}} args
+ * @param {{toolUseId: string, content: string|Array<{type: 'text', text: string}|{type: 'image',
+ *   source: {type: 'base64', media_type: 'image/jpeg'|'image/png'|'image/gif'|'image/webp', data: string}}>,
+ *   isError?: boolean, toolUseResult?: unknown, parentToolUseId?: string|null, agentId?: string|null}} args
  * @returns {SDKUserMessage}
  */
 export function toolResult(ctx, {
@@ -724,7 +734,7 @@ export function modelRefusalNoFallback(ctx) {
   return {
     type: 'system',
     subtype: 'model_refusal_no_fallback',
-    original_model: 'claude-opus-mock',
+    original_model: REFUSED_MODEL,
     request_id: null,
     refused_user_message_uuid: ctx.userMessageUuid,
     content: 'Claude Opus (mock) declined this request. No fallback model is configured.',
@@ -732,25 +742,46 @@ export function modelRefusalNoFallback(ctx) {
   };
 }
 
+/** The model whose answers the mock's refusals decline. */
+const REFUSED_MODEL = 'claude-opus-mock';
+/** The fallback model a refused answer is retried on when the query names none. */
+const DEFAULT_FALLBACK_MODEL = 'claude-sonnet-mock';
+/** The names the notices give the mock's models. */
+const MODEL_LABELS = {
+  'claude-opus-mock': 'Claude Opus',
+  'claude-sonnet-mock': 'Claude Sonnet',
+  'claude-haiku-mock': 'Claude Haiku',
+};
+
+/**
+ * @param {string} model
+ * @returns {string} the name a notice gives the model
+ */
+function labelOf(model) {
+  return MODEL_LABELS[model] ?? model;
+}
+
 /**
  * A refused response that was retried on the fallback model. The retracted messages leave the transcript.
  * @param {TurnContext} ctx
- * @param {{retracted: string[]}} refusal
+ * @param {{retracted: string[], originalModel: string, fallbackModel: string}} refusal
  * @returns {import('@anthropic-ai/claude-agent-sdk').SDKModelRefusalFallbackMessage}
  */
-export function modelRefusalFallback(ctx, { retracted }) {
+export function modelRefusalFallback(ctx, { retracted, originalModel, fallbackModel }) {
+  const content = `${labelOf(originalModel)} (mock) declined this request, so it was retried with `
+    + `${labelOf(fallbackModel)} (mock).`;
   return {
     type: 'system',
     subtype: 'model_refusal_fallback',
     trigger: 'refusal',
     direction: 'retry',
     scope: 'session',
-    original_model: 'claude-opus-mock',
-    fallback_model: 'claude-sonnet-mock',
+    original_model: originalModel,
+    fallback_model: fallbackModel,
     request_id: null,
     retracted_message_uuids: retracted,
     refused_user_message_uuid: ctx.userMessageUuid,
-    content: 'Claude Opus (mock) declined this request, so it was retried with Claude Sonnet (mock).',
+    content,
     ...ctx.envelope(),
   };
 }
@@ -1681,7 +1712,9 @@ async function* authScenario(ctx) {
 /** @type {Scenario['run']} */
 async function* slowScenario(ctx) {
   const chunks = Array.from({ length: 60 }, (_, index) => `Part ${index + 1} of 60. `);
-  yield* modelResponse(ctx, [{ type: 'text', text: chunks.join(''), chunks }], { pacing: ctx.delayMs * 4 });
+  yield* modelResponse(ctx, [{ type: 'text', text: chunks.join(''), chunks }], {
+    pacing: Math.max(ctx.delayMs * 4, 50),
+  });
 }
 
 /**
@@ -1702,7 +1735,7 @@ async function* backgroundScenario(ctx) {
   const toolUseId = ctx.nextId('tool');
   const description = 'Build the project';
   const input = { command: 'npm run build', description };
-  const foreground = ctx.foregroundTask(toolUseId, description);
+  const foreground = ctx.foregroundTask(toolUseId, description, 'Build succeeded\n');
   yield* modelResponse(ctx, [
     { type: 'text', text: 'Starting the build.' },
     { type: 'tool_use', id: toolUseId, name: 'Bash', input },
@@ -1740,25 +1773,116 @@ async function* refusalNoFallbackScenario(ctx) {
   yield modelRefusalNoFallback(ctx);
 }
 
+/** What the primary model answers when it refuses, and what the fallback model answers instead. */
+const REFUSED_ANSWER = "I can't help with that request.";
+const FALLBACK_ANSWER = 'Here is the answer from the fallback model.';
+/** The dialog kind the runtime asks the host with before it retries a refused answer. */
+const REFUSAL_DIALOG = 'refusal_fallback_prompt';
+
 /**
- * The primary model refuses and the turn is retried on the fallback model, in the runtime's order: the refused answer
- * is streamed, the fallback's answer names it in `supersedes` (a host evicts it on arrival), and the end-of-turn notice
- * lists it again in `retracted_message_uuids`.
- * @type {Scenario['run']}
+ * The primary model's refused answer, streamed through the turn.
+ * @param {TurnContext} ctx
+ * @returns {AsyncGenerator<SDKMessage, string, unknown>} the uuid of the refused message
  */
-async function* refusalScenario(ctx) {
+async function* refusedAnswer(ctx) {
   let refusedUuid = '';
-  for await (const message of modelResponse(ctx, [{ type: 'text', text: "I can't help with that request." }],
-    { stopReason: 'refusal' })) {
+  for await (const message of modelResponse(ctx, [{ type: 'text', text: REFUSED_ANSWER }], { stopReason: 'refusal' })) {
     if (message.type === 'assistant') refusedUuid = message.uuid;
     yield message;
   }
-  for await (const message of modelResponse(ctx, [{ type: 'text', text: 'Here is the answer from the fallback model.' }])) {
+  return refusedUuid;
+}
+
+/**
+ * The retry on the fallback model, in the runtime's order: the fallback's answer names the refused one in `supersedes`
+ * (a host evicts it on arrival), and the end-of-turn notice lists it again in `retracted_message_uuids`.
+ * @param {TurnContext} ctx
+ * @param {string} refusedUuid
+ * @param {string} fallbackModel
+ * @returns {AsyncGenerator<SDKMessage, void, unknown>}
+ */
+async function* answerOnFallback(ctx, refusedUuid, fallbackModel) {
+  for await (const message of modelResponse(ctx, [{ type: 'text', text: FALLBACK_ANSWER }])) {
     yield message.type === 'assistant'
       ? { ...message, supersedes: [/** @type {import('node:crypto').UUID} */ (refusedUuid)] }
       : message;
   }
-  yield modelRefusalFallback(ctx, { retracted: [refusedUuid] });
+  yield modelRefusalFallback(ctx, { retracted: [refusedUuid], originalModel: REFUSED_MODEL, fallbackModel });
+}
+
+/**
+ * The primary model refuses and the turn is retried on the fallback model without asking. The fallback is the model
+ * the query names, or the default one.
+ * @type {Scenario['run']}
+ */
+async function* refusalScenario(ctx) {
+  const refusedUuid = yield* refusedAnswer(ctx);
+  yield* answerOnFallback(ctx, refusedUuid, ctx.fallbackModel ?? DEFAULT_FALLBACK_MODEL);
+}
+
+/**
+ * The primary model refuses and the runtime asks the host before it retries (a refusal_fallback_prompt dialog). The
+ * answer decides: retry_fallback retries on the fallback model; edit_prompt retracts the refused answer and ends the
+ * turn, so the prompt can be edited and sent again; cancelled keeps the refusal with the notice that no fallback ran.
+ * A host that does not render the dialog gets that same notice.
+ * @type {Scenario['run']}
+ */
+async function* refusalPromptScenario(ctx) {
+  const refusedUuid = yield* refusedAnswer(ctx);
+  if (!ctx.dialogKinds.includes(REFUSAL_DIALOG)) {
+    yield modelRefusalNoFallback(ctx);
+    return;
+  }
+  const fallbackModel = ctx.fallbackModel ?? DEFAULT_FALLBACK_MODEL;
+  const answer = yield* ctx.userDialog({
+    kind: REFUSAL_DIALOG,
+    payload: {
+      originalModel: REFUSED_MODEL,
+      fallbackModel,
+      guidanceText: 'The primary model declined this request. Retry it on the fallback model or edit the prompt.',
+      retractedMessageUuids: [refusedUuid],
+    },
+  });
+  if (answer === 'retry_fallback') {
+    yield* answerOnFallback(ctx, refusedUuid, fallbackModel);
+    return;
+  }
+  if (answer === 'edit_prompt') {
+    ctx.retract([refusedUuid]);
+    return;
+  }
+  yield modelRefusalNoFallback(ctx);
+}
+
+/** A 16 by 16 pixel PNG: the screenshot the browser server returns in the mock. */
+const SCREENSHOT_PNG = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAH0lEQVR4nGOQ9/cjCTHI+/tpV1UQiUY1jGoYaA0kIQ'
+  + 'BstwZU6KpsRgAAAABJRU5ErkJggg==';
+
+/**
+ * A screenshot taken through the browser MCP server, which a session attaches as `browser`. The tool result carries the
+ * screenshot as an image block. Without that server the answer says so, and no tool runs.
+ * @type {Scenario['run']}
+ */
+async function* browseScenario(ctx) {
+  if (!ctx.mcpConnected(BROWSER_MCP_SERVER)) {
+    yield* modelResponse(ctx, [
+      { type: 'text', text: 'The browser server is not connected, so there is no screenshot.' },
+    ]);
+    return;
+  }
+  const toolUseId = ctx.nextId('tool');
+  yield* modelResponse(ctx, [
+    { type: 'text', text: 'Taking a screenshot of the page.' },
+    { type: 'tool_use', id: toolUseId, name: 'mcp__browser__browser_take_screenshot', input: { type: 'png' } },
+  ], { stopReason: 'tool_use' });
+  yield toolResult(ctx, {
+    toolUseId,
+    content: [
+      { type: 'text', text: 'Screenshot of the page.' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: SCREENSHOT_PNG } },
+    ],
+  });
+  yield* modelResponse(ctx, [{ type: 'text', text: 'The screenshot is above.' }]);
 }
 
 /** A headless plugin installation that finishes before the answer. */
@@ -1789,6 +1913,7 @@ const SCENARIOS = [
   { name: 'context', matches: (text) => /^\/context(\s|$)/i.test(text), run: contextScenario },
   { name: 'usage', matches: (text) => /^\/usage(\s|$)/i.test(text), run: usageScenario },
   { name: 'clear', matches: (text) => /^\/clear(\s|$)/i.test(text), run: clearScenario },
+  { name: 'browse', matches: keyword('browse'), run: browseScenario },
   { name: 'tool', matches: keyword('tool'), run: bashScenario },
   { name: 'edit', matches: keyword('edit'), run: editScenario },
   { name: 'question', matches: keyword('question'), run: questionScenario },
@@ -1807,6 +1932,7 @@ const SCENARIOS = [
   { name: 'think', matches: keyword('think'), run: thinkScenario },
   { name: 'background', matches: keyword('background'), run: backgroundScenario },
   { name: 'refusal-none', matches: keyword('refusal-none'), run: refusalNoFallbackScenario },
+  { name: 'refusal-prompt', matches: keyword('refusal-prompt'), run: refusalPromptScenario },
   { name: 'refusal', matches: keyword('refusal'), run: refusalScenario },
   { name: 'plugin', matches: keyword('plugin'), run: pluginScenario },
   { name: 'default', matches: () => true, run: answerScenario },

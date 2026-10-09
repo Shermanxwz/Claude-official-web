@@ -146,7 +146,9 @@ export function createHeader({ container, api, store, t, actions }) {
 
   const cwdText = h('span', { class: 'hdr-cwd-text' });
   const cwdEl = h('div', { class: 'hdr-cwd' }, cwdText);
-  const titles = h('div', { class: 'hdr-titles' }, titleBtn, cwdEl);
+  const agentChip = h('span', { class: 'hdr-agent', attrs: { hidden: true } });
+  const titleRow = h('div', { class: 'hdr-title-row' }, titleBtn, agentChip);
+  const titles = h('div', { class: 'hdr-titles' }, titleRow, cwdEl);
   const left = h('div', { class: 'hdr-left' }, menuBtn, titles);
 
   const modelSel = /** @type {HTMLSelectElement} */ (h('select', {
@@ -157,7 +159,7 @@ export function createHeader({ container, api, store, t, actions }) {
   const modeSel = /** @type {HTMLSelectElement} */ (h('select', {
     class: 'hdr-select hdr-mode',
     attrs: { 'aria-label': t('header.permissionMode') },
-    on: { change: () => commitChange({ permissionMode: modeSel.value }) },
+    on: { change: () => { if (modeSel.value) commitChange({ permissionMode: modeSel.value }); } },
   }));
   const effortSel = /** @type {HTMLSelectElement} */ (h('select', {
     class: 'hdr-select hdr-effort',
@@ -177,13 +179,13 @@ export function createHeader({ container, api, store, t, actions }) {
     on: { click: () => actions.openPanel('tasks') },
   }, icon('layers'), tasksText));
 
-  const ctxFill = h('span', { class: 'ctx-fill' });
-  const ctxLabel = h('span', { class: 'ctx-label' });
+  // The context ring: an 18 px circle filled to the percentage (--pct); the exact number is in the tooltip.
+  const ctxRing = h('span', { class: 'ctx-ring', attrs: { 'aria-hidden': 'true' } });
   const ctxBtn = h('button', {
     class: 'ctx-meter',
     attrs: { type: 'button' },
     on: { click: () => actions.openPanel('context') },
-  }, h('span', { class: 'ctx-track', attrs: { 'aria-hidden': 'true' } }, ctxFill), ctxLabel);
+  }, ctxRing);
 
   const spinner = h('span', { class: 'state-spinner', attrs: { 'aria-hidden': 'true' } });
   const badgeText = h('span', { class: 'state-text' });
@@ -222,8 +224,8 @@ export function createHeader({ container, api, store, t, actions }) {
   function effectiveSettings(id, live, meta) {
     const defaults = meta?.defaults ?? {};
     const base = live
-      ? { model: live.model ?? null, permissionMode: live.permissionMode ?? 'default', effort: live.effort ?? null }
-      : { model: defaults.model ?? null, permissionMode: defaults.permissionMode ?? 'default',
+      ? { model: live.model ?? null, permissionMode: live.permissionMode ?? null, effort: live.effort ?? null }
+      : { model: defaults.model ?? null, permissionMode: defaults.permissionMode ?? null,
         effort: defaults.effort ?? null };
     return { ...base, fastMode: live?.fastMode ?? null, ...(id ? view.overrides.get(id) : null) };
   }
@@ -284,6 +286,10 @@ export function createHeader({ container, api, store, t, actions }) {
     const editable = hasSession && !readOnly && !locked;
 
     root.classList.toggle('is-empty', !hasSession);
+    const agent = hasSession && typeof live?.agent === 'string' ? live.agent : '';
+    agentChip.hidden = !agent;
+    agentChip.textContent = agent;
+    agentChip.title = t('header.agent', { name: agent });
     if (hasSession) {
       titleText.textContent = live?.title || summary?.customTitle || summary?.summary || t('header.untitled');
       titleBtn.disabled = readOnly;
@@ -319,13 +325,15 @@ export function createHeader({ container, api, store, t, actions }) {
     const levels = effortLevelsFor(effortModelFor(models, settings.model, defaults.model ?? null));
 
     const modes = meta?.features?.bypass ? [...PERMISSION_MODES, 'bypassPermissions'] : PERMISSION_MODES;
-    const modeValue = settings.permissionMode;
+    // null means Claude Code's own settings decide the mode; the runtime then reports the real one after init.
+    const modeValue = settings.permissionMode ?? '';
     const modeOptions = modes.map((m) => ({
       value: m,
       label: t(`common.mode.${m}`),
       title: t(`common.mode.${m}.hint`),
     }));
-    if (!modes.includes(modeValue)) modeOptions.push({ value: modeValue, label: modeValue, title: '' });
+    if (!modeValue) modeOptions.unshift({ value: '', label: t('header.mode.settings'), title: t('composer.modeWord.settings') });
+    else if (!modes.includes(modeValue)) modeOptions.push({ value: modeValue, label: modeValue, title: '' });
 
     const effortValue = settings.effort ?? '';
     const effortOptions = [{ value: '', label: t('header.effortDefault') }];
@@ -338,7 +346,7 @@ export function createHeader({ container, api, store, t, actions }) {
     modelSel.disabled = !editable;
     modeSel.disabled = !editable;
     effortSel.disabled = !editable;
-    modeSel.title = t(`common.mode.${modeValue}.hint`);
+    modeSel.title = modeValue ? t(`common.mode.${modeValue}.hint`) : t('composer.modeWord.settings');
     effortSel.hidden = levels.length === 0;
 
     const fast = fastView(models, defaults.model ?? null, live, settings);
@@ -371,8 +379,7 @@ export function createHeader({ container, api, store, t, actions }) {
         max: formatCount(view.ctx.max, locale),
         percent,
       });
-      ctxFill.style.setProperty('width', `${view.ctx.percent}%`);
-      ctxLabel.textContent = `${percent}%`;
+      ctxRing.style.setProperty('--pct', String(Math.min(100, Math.max(0, view.ctx.percent))));
       ctxBtn.classList.toggle('is-warning', view.ctx.percent >= CONTEXT_WARN_PERCENT);
       ctxBtn.title = tip;
       ctxBtn.setAttribute('aria-label', tip);
@@ -550,7 +557,7 @@ export function createHeader({ container, api, store, t, actions }) {
         pick('header.model', 'cpu', view.options.model, view.selected.model,
           (value) => commitChange({ model: value || null }));
         pick('header.permissionMode', 'shield', view.options.mode, view.selected.mode,
-          (value) => commitChange({ permissionMode: value }));
+          (value) => { if (value) commitChange({ permissionMode: value }); });
         if (view.options.effort.length > 0) {
           const effortChoices = [{ value: '', label: t('header.effortDefault') }, ...view.options.effort];
           pick('header.effortLabel', 'gauge', effortChoices, view.selected.effort,

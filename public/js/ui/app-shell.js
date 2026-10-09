@@ -5,7 +5,7 @@
  */
 
 import { h, clear, icon } from '../dom.js';
-import { connectEvents, createUuid, errorText } from '../api.js';
+import { ApiError, connectEvents, createUuid, errorText } from '../api.js';
 import { getLocale, onLocaleChange } from '../i18n.js';
 import { createHeader } from './header.js';
 import { createComposer } from './composer.js';
@@ -13,9 +13,12 @@ import { createSidebar } from './sidebar.js';
 import { createToasts } from './toasts.js';
 import { closeAllDialogs, confirmDialog, hasOpenDialog } from './dialog.js';
 import { closeMenu } from './menu.js';
-import { closePanel, hasOpenSheet, openPanel, refreshSessionList, renameSessionDialog } from './panels.js';
+import { closePanel, hasOpenSheet, openPanel, openTaskOutput, refreshSessionList, renameSessionDialog } from './panels.js';
 import { openNewSessionDialog } from './new-session.js';
-import { formatClock, retitledState } from './sidebar-model.js';
+import { formatClock, projectName, retitledState, sessionCwd } from './sidebar-model.js';
+import { eventLog } from './devtools.js';
+import { nextPermissionMode } from './runtime-panels.js';
+import { openQuickSwitcher, shortcutLabel } from './quick-switcher.js';
 import { createTimeline } from '../timeline/view.js';
 import { openForkDialog, openRewindDialog } from '../timeline/rewind.js';
 import { createTerminalPanel } from '../terminal.js';
@@ -23,10 +26,14 @@ import { createTerminalPanel } from '../terminal.js';
 const MOBILE_QUERY = '(max-width: 767.98px)';
 const SESSIONS_DEBOUNCE_MS = 300;
 const CONNECTION_GRACE_MS = 2000;
-const FORWARDED_EVENTS = new Set(['message_accepted', 'sdk', 'request', 'request_resolved', 'session_state',
-  'resync', 'notice']);
+const FORWARDED_EVENTS = new Set(['message_accepted', 'message_cancelled', 'sdk', 'request', 'request_resolved',
+  'session_state', 'resync', 'notice']);
 /** The session settings the gateway accepts (POST /api/sessions/:id/settings); nothing else is forwarded. */
 const SETTING_FIELDS = ['model', 'permissionMode', 'effort', 'fastMode'];
+/** The side sheets, in the order the quick switcher lists them. */
+const PANEL_NAMES = ['session', 'capabilities', 'context', 'tasks', 'settings', 'runtime', 'developer'];
+/** How many folders the welcome page offers as one-click rows. */
+const RECENT_PROJECTS = 3;
 
 /**
  * @param {string} hash
@@ -139,6 +146,49 @@ export function createAppShell({ root, api, store, t }) {
     history.replaceState(history.state, '', `${location.pathname}${location.search}${hash}`);
   }
 
+  /**
+   * The folders of the most recent sessions, newest first, one entry per folder.
+   * @param {Array<Record<string, any>>} sessions
+   * @returns {Array<{cwd: string, name: string}>}
+   */
+  function recentProjects(sessions) {
+    const seen = new Set();
+    const projects = [];
+    for (const session of sessions) {
+      const cwd = sessionCwd(session);
+      if (!cwd || seen.has(cwd)) continue;
+      seen.add(cwd);
+      projects.push({ cwd, name: projectName(cwd) });
+      if (projects.length === RECENT_PROJECTS) break;
+    }
+    return projects;
+  }
+
+  /** The shortcuts a new user needs first, listed on the welcome page. */
+  function welcomeKeys() {
+    const rows = [
+      [shortcutLabel('k'), t('shell.welcome.keySwitcher')],
+      [shortcutLabel('o', { shift: true }), t('shell.welcome.keyNew')],
+      ['/', t('shell.welcome.keyCommands')],
+      ['@', t('shell.welcome.keyFiles')],
+    ];
+    return h('dl', { class: 'welcome-keys' }, rows.flatMap(([keys, label]) => [
+      h('dt', null, h('kbd', { class: 'kbd', text: keys })),
+      h('dd', { text: label }),
+    ]));
+  }
+
+  /** @param {string} cwd a folder the user used before: one click starts a session there */
+  async function startSessionAt(cwd) {
+    try {
+      const { live } = await api.post('/api/sessions', { cwd });
+      if (destroyed) return;
+      await selectSession(live.sessionId);
+    } catch (err) {
+      toast(errorText(err, t), 'error');
+    }
+  }
+
   function renderWelcome() {
     clear(welcomeHost);
     const state = store.get();
@@ -156,6 +206,16 @@ export function createAppShell({ root, api, store, t }) {
         }, icon('refresh'), h('span', { text: t('common.retry') })));
       return;
     }
+    const projects = recentProjects(state.sessions);
+    const projectRows = projects.map((project) => h('li', null,
+      h('button', {
+        class: 'welcome-project',
+        attrs: { type: 'button', title: project.cwd },
+        on: { click: () => startSessionAt(project.cwd) },
+      },
+      icon('folder'),
+      h('span', { class: 'welcome-project-name', text: project.name }),
+      h('span', { class: 'welcome-project-path mono', text: project.cwd }))));
     welcomeHost.append(
       h('img', { class: 'welcome-logo', attrs: { src: '/img/logo.svg', alt: '', width: 56, height: 56 } }),
       h('h2', { class: 'welcome-title', text: t('shell.welcome.title') }),
@@ -164,7 +224,14 @@ export function createAppShell({ root, api, store, t }) {
         class: 'btn btn-primary btn-lg',
         attrs: { type: 'button' },
         on: { click: () => actions.newSession() },
-      }, icon('plus'), h('span', { text: t('shell.sidebar.newSession') })));
+      }, icon('plus'), h('span', { text: t('shell.welcome.start') })),
+      // A null child would be appended as the text "null", so the section is spread in only when there are projects.
+      ...(projects.length > 0
+        ? [h('section', { class: 'welcome-projects', attrs: { 'aria-labelledby': 'welcome-projects-title' } },
+          h('h3', { class: 'welcome-heading', attrs: { id: 'welcome-projects-title' }, text: t('shell.welcome.recent') }),
+          h('ul', { class: 'welcome-project-list' }, projectRows))]
+        : []),
+      welcomeKeys());
   }
 
   function mountParts() {
@@ -172,16 +239,27 @@ export function createAppShell({ root, api, store, t }) {
     timelineSlot.replaceChildren(welcomeHost, timelineHost);
     // The terminal panel is created once: a language change rebuilds the other parts but must not close its socket.
     const terminal = parts.terminal ?? createTerminalPanel({ container: terminalSlot, api, store, t });
+    // The timeline hands the composer its todo list and its running line.
+    const composer = createComposer({ container: composerSlot, api, store, t, actions });
+    const timeline = createTimeline({
+      container: timelineHost,
+      api,
+      store,
+      t,
+      actions,
+      onTodos: (todos) => composer.setTodos?.(todos),
+      onActivity: (activity) => composer.setActivity?.(activity),
+    });
     parts = {
       terminal,
       header: createHeader({ container: headerSlot, api, store, t, actions }),
-      composer: createComposer({ container: composerSlot, api, store, t, actions }),
-      timeline: createTimeline({ container: timelineHost, api, store, t, actions }),
+      composer,
+      timeline,
       sidebar: createSidebar({ container: sidebarEl, api, store, t, actions }),
     };
     const id = currentSessionId();
     parts.header.setSession(id);
-    parts.composer.setSession(id);
+    composer.setSession(id);
     renderWelcome();
     renderBanners();
   }
@@ -295,13 +373,205 @@ export function createAppShell({ root, api, store, t }) {
     }
   }
 
-  async function interrupt() {
+  /**
+   * Stops the current turn (POST /interrupt). With `cancelQueued`, the messages that wait behind it are dropped too. The
+   * receipt lists what still runs and what was dropped; the dropped messages leave the timeline at once.
+   * @param {{cancelQueued?: boolean}} [options]
+   * @returns {Promise<{stillQueued: string[], cancelled: string[]} | null>} null when the request failed
+   */
+  async function interrupt(options) {
     const sessionId = currentSessionId();
-    if (!sessionId) return;
+    if (!sessionId) return { stillQueued: [], cancelled: [] };
+    const dropQueued = options?.cancelQueued === true;
     try {
-      await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/interrupt`, {});
+      const receipt = await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/interrupt`,
+        dropQueued ? { cancelQueued: true } : {});
+      const ids = (/** @type {unknown} */ value) => (Array.isArray(value) ? value.filter((id) => typeof id === 'string') : []);
+      const cancelled = ids(receipt?.cancelled);
+      for (const clientMessageId of cancelled) {
+        parts.timeline?.applyEvent('message_cancelled', { sessionId, clientMessageId });
+      }
+      return { stillQueued: ids(receipt?.stillQueued), cancelled };
     } catch (err) {
       toast(errorText(err, t), 'error');
+      return null;
+    }
+  }
+
+  /**
+   * Drops one message that waits behind a running turn (DELETE /queued/:id). True when the runtime dropped it, false when
+   * the message had already started. Errors reject; the timeline shows them.
+   * @param {string} clientMessageId
+   * @returns {Promise<boolean>}
+   */
+  async function cancelQueued(clientMessageId) {
+    const sessionId = currentSessionId();
+    if (!sessionId || typeof clientMessageId !== 'string' || clientMessageId === '') return false;
+    const answer = await api.del(
+      `/api/sessions/${encodeURIComponent(sessionId)}/queued/${encodeURIComponent(clientMessageId)}`);
+    return answer?.cancelled === true;
+  }
+
+  /**
+   * A quick question about the conversation (POST /side-question). It rejects with the error; the caller shows it.
+   * @param {string} question
+   */
+  function sideQuestion(question) {
+    const sessionId = currentSessionId();
+    if (!sessionId) return Promise.reject(new ApiError(404, 'SESSION_NOT_FOUND', t('shell.send.noSession')));
+    return api.post(`/api/sessions/${encodeURIComponent(sessionId)}/side-question`, { question });
+  }
+
+  /**
+   * Saves the conversation as a text file (GET /export): the runtime's text behind a temporary download link, named the
+   * way the runtime names it.
+   */
+  async function exportConversation() {
+    const sessionId = currentSessionId();
+    if (!sessionId) {
+      toast(t('shell.send.noSession'), 'warning');
+      return;
+    }
+    try {
+      const data = await api.get(`/api/sessions/${encodeURIComponent(sessionId)}/export`);
+      const name = typeof data?.filename === 'string' && data.filename !== '' ? data.filename : 'conversation.txt';
+      const text = typeof data?.text === 'string' ? data.text : '';
+      const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+      const link = h('a', { attrs: { href: url, download: name, hidden: '' } });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast(t('shell.export.saved', { name }), 'success');
+    } catch (err) {
+      toast(errorText(err, t), 'error');
+    }
+  }
+
+  /** @param {string} taskId a shell or Monitor task of the current session */
+  function showTaskOutput(taskId) {
+    const sessionId = currentSessionId();
+    if (!sessionId || typeof taskId !== 'string' || taskId === '') return null;
+    return openTaskOutput({ api, store, t, sessionId, taskId });
+  }
+
+  /**
+   * Shift+Tab: the next permission mode in the terminal's order, applied to the session (to the live query, or kept for
+   * its next open). Resolves to the new mode, or null when there is no session or the change failed.
+   * @returns {Promise<string | null>}
+   */
+  async function cyclePermissionMode() {
+    const sessionId = currentSessionId();
+    if (!sessionId) return null;
+    const state = store.get();
+    const current = state.live[sessionId]?.permissionMode ?? state.meta?.defaults?.permissionMode ?? null;
+    const next = nextPermissionMode(current, { bypass: state.meta?.features?.bypass === true });
+    try {
+      const result = await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/settings`, { permissionMode: next });
+      if (result?.live) store.set({ live: { ...store.get().live, [sessionId]: result.live } });
+      return next;
+    } catch (err) {
+      toast(errorText(err, t), 'error');
+      return null;
+    }
+  }
+
+  /**
+   * Ends the live query and opens it again with its stored settings, so a changed fallback model or memory takes effect.
+   * Asks first when background tasks run. Resolves true when the session restarted.
+   * @returns {Promise<boolean>}
+   */
+  async function restartSession() {
+    const sessionId = currentSessionId();
+    if (!sessionId) return false;
+    if (!(await confirmEndBackground(sessionId))) return false;
+    try {
+      const id = encodeURIComponent(sessionId);
+      await api.post(`/api/sessions/${id}/close`, {});
+      const result = await api.post(`/api/sessions/${id}/open`, {});
+      if (destroyed) return false;
+      if (result?.live) store.set({ live: { ...store.get().live, [sessionId]: result.live } });
+      toast(t('shell.session.restarted'), 'success');
+      return true;
+    } catch (err) {
+      toast(errorText(err, t), 'error');
+      return false;
+    }
+  }
+
+  /**
+   * The user prompts of the loaded transcript, oldest first: the composer's ↑ history.
+   * @param {string} sessionId
+   * @returns {string[]}
+   */
+  function sessionPrompts(sessionId) {
+    if (sessionId !== currentSessionId() || !parts.timeline?.getUserMessages) return [];
+    return parts.timeline.getUserMessages().map((message) => message.text);
+  }
+
+  /** The GUI commands the quick switcher lists. Each runs what the matching menu item or palette command runs. */
+  function switcherCommands() {
+    const state = store.get();
+    const profile = state.meta?.profile ?? state.auth?.profile ?? 'read';
+    const commands = [{ id: 'new-session', label: t('shell.sidebar.newSession'), run: () => actions.newSession() }];
+    if (state.currentSessionId) {
+      commands.push({ id: 'export', label: t('shell.session.export'), run: () => actions.exportConversation() });
+      if (profile !== 'read') {
+        commands.push(
+          { id: 'rename', label: t('shell.sidebar.rename'), run: () => actions.renameSession() },
+          { id: 'fork', label: t('shell.session.fork'), run: () => actions.openFork() },
+          { id: 'rewind', label: t('shell.session.rewind'), run: () => actions.openRewind() },
+        );
+      }
+      if (state.meta?.features?.terminal === true && profile === 'full') {
+        commands.push({ id: 'terminal', label: t('shell.session.terminal'), run: () => actions.openTerminal() });
+      }
+    }
+    return commands;
+  }
+
+  /** Opens the quick switcher: ⌘K / Ctrl+K, and the search button of the sidebar. */
+  function openSwitcher() {
+    return openQuickSwitcher({
+      api,
+      store,
+      t,
+      actions,
+      commands: switcherCommands(),
+      panels: PANEL_NAMES.map((name) => ({
+        id: name,
+        label: t(`shell.panel.${name}`),
+        run: () => actions.openPanel(name),
+      })),
+    });
+  }
+
+  /** The sign-in state (GET /api/account). account_changed keeps it current after a sign-in in this page. */
+  async function loadAccount() {
+    try {
+      const data = await api.get('/api/account');
+      if (destroyed) return;
+      store.set({ account: { account: data?.account ?? null, signInPending: data?.signInPending === true } });
+    } catch {
+      if (!destroyed) store.set({ account: { account: null, signInPending: false, failed: true } });
+    }
+  }
+
+  /**
+   * ⌘K / Ctrl+K opens the quick switcher and ⌘⇧O / Ctrl+Shift+O starts a session, from anywhere on the page. Typing is
+   * never intercepted: only the chord with the modifier, not during IME composition, and not while a dialog is open.
+   * @param {KeyboardEvent} event
+   */
+  function onGlobalKeydown(event) {
+    if (destroyed || event.defaultPrevented || event.isComposing || event.altKey) return;
+    if (!(event.metaKey || event.ctrlKey) || hasOpenDialog()) return;
+    const key = event.key.toLowerCase();
+    if (key === 'k' && !event.shiftKey) {
+      event.preventDefault();
+      openSwitcher();
+    } else if (key === 'o' && event.shiftKey) {
+      event.preventDefault();
+      actions.newSession();
     }
   }
 
@@ -399,19 +669,31 @@ export function createAppShell({ root, api, store, t }) {
     });
   }
 
-  /** @type {any} */
+  /**
+   * What the parts call (docs/FRONTEND.md, "Actions"). Every action that talks to the gateway reports its own errors as a
+   * toast unless its caller needs the error (sideQuestion rejects with it).
+   * @type {any}
+   */
   const actions = {
     selectSession: (sessionId) => selectSession(sessionId ?? null),
     newSession: () => openNewSessionDialog({ api, store, t, actions }),
     sendMessage,
     interrupt,
+    cancelQueued,
+    sideQuestion,
+    exportConversation,
+    showTaskOutput,
+    cyclePermissionMode,
+    restartSession,
+    sessionPrompts,
     updateSettings,
     openRewind,
     openFork,
     openTerminal,
     confirmEndBackground,
     toggleFastMode: () => parts.header?.toggleFast() ?? false,
-    openPanel: (name) => openPanel(name, { api, store, t, actions }),
+    openPanel: (name, opts) => openPanel(name, { api, store, t, actions }, opts ?? {}),
+    openQuickSwitcher: () => openSwitcher(),
     renameSession: renameCurrent,
     toast,
     insertIntoComposer: (text) => parts.composer?.insertText(text),
@@ -424,6 +706,8 @@ export function createAppShell({ root, api, store, t }) {
    */
   function handleEvent(type, data) {
     if (destroyed) return;
+    // The developer console keeps every event this page receives, from the moment the page loaded.
+    eventLog.record(type, data);
     switch (type) {
       case 'hello':
         if (lastBootId && data.bootId !== lastBootId) reloadAll();
@@ -452,6 +736,9 @@ export function createAppShell({ root, api, store, t }) {
         break;
       case 'sdk':
         onSdk(data);
+        break;
+      case 'account_changed':
+        store.set({ account: { account: data?.account ?? null, signInPending: false } });
         break;
       default:
         break;
@@ -609,8 +896,10 @@ export function createAppShell({ root, api, store, t }) {
       };
     }
     if (!patch) return;
+    // The task kind (shell, Monitor, agent...) decides whether the task has an output to show.
+    const taskType = typeof msg.task_type === 'string' ? msg.task_type : previous.taskType;
     store.set({
-      tasks: { ...store.get().tasks, [sessionId]: { ...tasks, [msg.task_id]: { ...previous, ...patch } } },
+      tasks: { ...store.get().tasks, [sessionId]: { ...tasks, [msg.task_id]: { ...previous, ...patch, taskType } } },
     });
   }
 
@@ -799,6 +1088,7 @@ export function createAppShell({ root, api, store, t }) {
       if (destroyed || token !== bootToken) return;
       lastBootId = meta.bootId ?? null;
       store.set({ meta });
+      loadAccount();
       if (!events) {
         events = connectEvents({
           watch: null,
@@ -901,6 +1191,7 @@ export function createAppShell({ root, api, store, t }) {
   });
   window.addEventListener('hashchange', onHashChange);
   document.addEventListener('keydown', onDrawerKeydown);
+  document.addEventListener('keydown', onGlobalKeydown);
   mobileQuery?.addEventListener?.('change', onViewportChange);
   boot();
 
@@ -916,6 +1207,7 @@ export function createAppShell({ root, api, store, t }) {
       unsubscribeLocale();
       window.removeEventListener('hashchange', onHashChange);
       document.removeEventListener('keydown', onDrawerKeydown);
+      document.removeEventListener('keydown', onGlobalKeydown);
       mobileQuery?.removeEventListener?.('change', onViewportChange);
       main.inert = false;
       closePanel();

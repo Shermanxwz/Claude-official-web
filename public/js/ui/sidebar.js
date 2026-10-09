@@ -1,6 +1,7 @@
 /**
- * Session sidebar: brand, new session, search, sessions grouped by project with live state, row menus, paging,
- * and a footer with settings, connection state and sign out. Rendering follows the store; the shell owns loading.
+ * Session sidebar (docs/DESIGN.md, "Sidebar"): brand, a quiet new-session button with its shortcut, the search field with
+ * the switcher's shortcut, sessions grouped by project with state glyphs, "Search all conversations" with snippets, paging
+ * and a footer with the connection state, settings and sign out. Rendering follows the store; the shell owns loading.
  */
 
 import { h, clear, icon } from '../dom.js';
@@ -12,11 +13,15 @@ import {
   deleteSessionFlow, refreshSessionList, renameSessionDialog, tagSessionDialog,
 } from './panels.js';
 import {
-  filterSessions, formatRelativeTime, groupSessions, liveTone, mergeLive, sessionActivity, sessionCwd, sessionTitle,
+  filterSessions, formatRelativeTime, groupSessions, liveTone, mergeLive, projectName, sessionActivity, sessionCwd,
+  sessionTitle,
 } from './sidebar-model.js';
+import { SEARCH_LIMIT, searchRowVisible, segmentText, shortcutLabel, termRanges } from './quick-switcher.js';
 
 const PAGE_SIZE = 100;
 const TIME_REFRESH_MS = 60 * 1000;
+/** The tones that show a glyph in a list. Idle and closing sessions show none. */
+const GLYPH_TONES = new Set(['running', 'starting', 'attention', 'error']);
 
 /**
  * @param {{
@@ -34,6 +39,13 @@ export function createSidebar({ container, api, store, t, actions }) {
   let loadingMore = false;
   /** @type {Set<string>} */
   const collapsed = new Set();
+  /**
+   * The deep search (GET /api/sessions/search) for `query`. While it is the search for the current query, the list shows
+   * its results instead of the session groups.
+   * @type {{query: string, status: 'loading'|'ready'|'failed', results: any[], truncated: boolean, error: string} | null}
+   */
+  let deep = null;
+  let deepToken = 0;
 
   const logo = h('img', { class: 'sidebar-logo', attrs: { src: '/img/logo.svg', alt: '', width: 26, height: 26 } });
   const appNameEl = h('span', { class: 'sidebar-app' });
@@ -51,11 +63,15 @@ export function createSidebar({ container, api, store, t, actions }) {
       on: { click: () => setSidebarOpen(false) },
     }, icon('menu')));
 
+  // The shortcut is decorative: hidden from assistive technology so the button's name stays "New session".
   const newButton = h('button', {
-    class: 'btn btn-primary btn-block sidebar-new',
+    class: 'btn btn-secondary btn-block sidebar-new',
     attrs: { type: 'button' },
     on: { click: () => actions.newSession() },
-  }, icon('plus'), h('span', { text: t('shell.sidebar.newSession') }));
+  },
+  icon('plus'),
+  h('span', { class: 'sidebar-new-label', text: t('shell.sidebar.newSession') }),
+  h('kbd', { class: 'kbd sidebar-new-hint', attrs: { 'aria-hidden': 'true' }, text: shortcutLabel('o', { shift: true }) }));
 
   const searchInput = h('input', {
     class: 'sidebar-search-input',
@@ -71,9 +87,28 @@ export function createSidebar({ container, api, store, t, actions }) {
         query = searchInput.value;
         renderList();
       },
+      keydown: (event) => {
+        if (event.isComposing) return;
+        if (event.key === 'Enter' && searchRowVisible(query)) {
+          event.preventDefault();
+          runDeepSearch(query);
+        } else if (event.key === 'Escape' && searchInput.value !== '') {
+          // Escape clears the field; the drawer keeps open until the field is empty.
+          event.preventDefault();
+          event.stopPropagation();
+          searchInput.value = '';
+          query = '';
+          renderList();
+        }
+      },
     },
   });
-  const search = h('label', { class: 'sidebar-search' }, icon('search'), searchInput);
+  const switchButton = h('button', {
+    class: 'sidebar-switch',
+    attrs: { type: 'button', 'aria-label': t('shell.sidebar.switcher'), title: t('shell.sidebar.switcher') },
+    on: { click: () => actions.openQuickSwitcher() },
+  }, h('kbd', { class: 'kbd', attrs: { 'aria-hidden': 'true' }, text: shortcutLabel('k') }));
+  const search = h('div', { class: 'sidebar-search' }, icon('search'), searchInput, switchButton);
 
   const listEl = h('nav', { class: 'sidebar-list', attrs: { 'aria-label': t('shell.sidebar.sessions') } });
 
@@ -168,6 +203,23 @@ export function createSidebar({ container, api, store, t, actions }) {
   }
 
   /**
+   * The state glyph of a live session: a rotating arc while it runs, a ringed dot while it waits for you, an exclamation
+   * when it failed (docs/DESIGN.md, "State glyphs"). Idle and closed sessions get an empty slot of the same width, so
+   * the titles stay on one edge.
+   * @param {Record<string, any> | null} live
+   * @returns {HTMLElement}
+   */
+  function stateGlyph(live) {
+    const tone = liveTone(live);
+    if (!tone || !GLYPH_TONES.has(tone)) return h('span', { class: 'state-glyph state-empty', attrs: { 'aria-hidden': 'true' } });
+    const label = t(`common.state.${live.state}`);
+    return h('span', {
+      class: ['state-glyph', `state-${tone}`],
+      attrs: { 'data-state': tone, role: 'img', 'aria-label': label, title: label },
+    });
+  }
+
+  /**
    * @param {any} session
    * @param {string | null} activeId
    */
@@ -175,7 +227,6 @@ export function createSidebar({ container, api, store, t, actions }) {
     const state = store.get();
     const live = state.live[session.sessionId] ?? session.live ?? null;
     const pendingCount = live?.pendingCount ?? state.pending[session.sessionId]?.length ?? 0;
-    const tone = liveTone(live);
     const selected = session.sessionId === activeId;
     const title = sessionTitle(session, t('shell.untitled'));
     const when = formatRelativeTime(sessionActivity(session), {
@@ -183,13 +234,6 @@ export function createSidebar({ container, api, store, t, actions }) {
       locale: getLocale(),
       justNow: t('common.time.justNow'),
     });
-
-    const dot = tone
-      ? h('span', {
-        class: ['state-dot', `state-${tone}`],
-        attrs: { title: t(`common.state.${live.state}`), 'aria-label': t(`common.state.${live.state}`), role: 'img' },
-      })
-      : null;
 
     const main = h('button', {
       class: 'session-main',
@@ -201,12 +245,12 @@ export function createSidebar({ container, api, store, t, actions }) {
       },
       on: { click: () => actions.selectSession(session.sessionId) },
     },
-    h('span', { class: 'session-line' }, dot, h('span', { class: 'session-title', text: title })),
+    h('span', { class: 'session-line' }, stateGlyph(live), h('span', { class: 'session-title', text: title })),
     h('span', { class: 'session-meta' },
       session.tag ? h('span', { class: 'chip chip-tag', text: session.tag }) : null,
       h('span', { class: 'session-time', text: when }),
       pendingCount > 0
-        ? h('span', { class: 'badge badge-attention', attrs: { title: t('shell.sidebar.pending', { count: pendingCount }) } },
+        ? h('span', { class: 'badge badge-attention session-pending', attrs: { title: t('shell.sidebar.pending', { count: pendingCount }) } },
           String(pendingCount))
         : null));
 
@@ -222,7 +266,7 @@ export function createSidebar({ container, api, store, t, actions }) {
     }, icon('more'));
 
     return h('li', {
-      class: ['session-row', selected ? 'is-active' : '', tone === 'running' ? 'is-running' : ''],
+      class: ['session-row', selected ? 'is-active' : '', liveTone(live) === 'running' ? 'is-running' : ''],
       dataset: { sessionId: session.sessionId },
     }, main, more);
   }
@@ -264,6 +308,103 @@ export function createSidebar({ container, api, store, t, actions }) {
       [0, 1, 2, 3].map((i) => h('div', { class: 'skeleton skeleton-row', style: { width: `${88 - i * 9}%` } })));
   }
 
+  /**
+   * Runs the deep search for `text` (at least two characters) and shows its results in the list.
+   * @param {string} text
+   */
+  async function runDeepSearch(text) {
+    const trimmed = text.trim();
+    if (!searchRowVisible(trimmed)) return;
+    const token = ++deepToken;
+    deep = { query: trimmed, status: 'loading', results: [], truncated: false, error: '' };
+    renderList();
+    try {
+      const data = await api.get(`/api/sessions/search?q=${encodeURIComponent(trimmed)}&limit=${SEARCH_LIMIT}`);
+      if (destroyed || token !== deepToken) return;
+      deep = {
+        query: trimmed,
+        status: 'ready',
+        results: Array.isArray(data?.results) ? data.results : [],
+        truncated: data?.truncated === true,
+        error: '',
+      };
+    } catch (err) {
+      if (destroyed || token !== deepToken) return;
+      deep = { query: trimmed, status: 'failed', results: [], truncated: false, error: errorText(err, t) };
+    }
+    renderList();
+  }
+
+  /** @param {string} query */
+  function searchAllRow(query) {
+    return h('button', {
+      class: 'sidebar-deep',
+      attrs: { type: 'button', 'data-focus-key': 'search-all' },
+      on: { click: () => runDeepSearch(query) },
+    }, icon('search'), h('span', { text: t('shell.sidebar.searchAll') }));
+  }
+
+  /**
+   * A snippet with the matches in <mark> elements, built as DOM nodes.
+   * @param {string} text
+   * @param {string} query
+   */
+  function snippetNodes(text, query) {
+    return segmentText(text, termRanges(text, query)).map((part) => (part.hit ? h('mark', { text: part.text }) : part.text));
+  }
+
+  /**
+   * @param {Record<string, any>} match one entry of GET /api/sessions/search
+   * @param {string} query the query the match answers
+   */
+  function searchResult(match, query) {
+    const title = typeof match.title === 'string' && match.title !== '' ? match.title : t('shell.untitled');
+    const cwd = typeof match.cwd === 'string' ? match.cwd : '';
+    const when = formatRelativeTime(match.lastModified, {
+      now: Date.now(),
+      locale: getLocale(),
+      justNow: t('common.time.justNow'),
+    });
+    const snippets = Array.isArray(match.snippets)
+      ? match.snippets.filter((item) => typeof item === 'string').slice(0, 3)
+      : [];
+    return h('li', { class: 'search-result' },
+      h('button', {
+        class: 'search-result-main',
+        attrs: { type: 'button', title: cwd || title },
+        on: { click: () => actions.selectSession(match.sessionId) },
+      },
+      h('span', { class: 'search-result-head' },
+        h('span', { class: 'search-result-title' }, snippetNodes(title, query)),
+        h('span', { class: 'session-time', text: when })),
+      cwd ? h('span', { class: 'search-result-project mono', text: projectName(cwd) }) : null,
+      snippets.map((snippet) => h('span', { class: 'search-snippet' }, snippetNodes(snippet, query)))));
+  }
+
+  /** @param {NonNullable<typeof deep>} result */
+  function deepResults(result) {
+    let status = '';
+    if (result.status === 'loading') status = t('shell.sidebar.searching');
+    else if (result.status === 'failed') status = result.error;
+    else if (result.results.length === 0) status = t('shell.sidebar.noConversations');
+    else {
+      const key = result.results.length === 1 ? 'shell.sidebar.resultCount.one' : 'shell.sidebar.resultCount.other';
+      status = t(key, { count: result.results.length });
+    }
+    if (result.status === 'ready' && result.truncated) status = `${status} ${t('shell.sidebar.truncated')}`;
+    return h('section', { class: 'sidebar-deep-results', attrs: { 'aria-label': t('shell.sidebar.searchResults') } },
+      h('div', { class: 'sidebar-deep-head' },
+        h('p', { class: 'sidebar-deep-status', attrs: { role: 'status' }, text: status }),
+        h('button', {
+          class: 'btn btn-ghost btn-sm',
+          attrs: { type: 'button', 'data-focus-key': 'search-back' },
+          on: { click: () => { deep = null; renderList(); } },
+        }, t('shell.sidebar.backToList'))),
+      result.results.length > 0
+        ? h('ul', { class: 'search-results' }, result.results.map((match) => searchResult(match, result.query)))
+        : null);
+  }
+
   function renderList() {
     if (destroyed) return;
     const state = store.get();
@@ -276,28 +417,34 @@ export function createSidebar({ container, api, store, t, actions }) {
       return;
     }
 
-    const searching = query.trim() !== '';
-    const visible = filterSessions(state.sessions, query);
-    if (state.sessions.length === 0) {
-      listEl.appendChild(h('div', { class: 'sidebar-empty' },
-        icon('spark'),
-        h('p', { class: 'sidebar-empty-title', text: t('shell.sidebar.emptyTitle') }),
-        h('p', { class: 'sidebar-empty-text', text: t('shell.sidebar.emptyText') })));
-    } else if (visible.length === 0) {
-      listEl.appendChild(h('p', { class: 'sidebar-empty-text', text: t('shell.sidebar.noMatches') }));
+    const trimmed = query.trim();
+    if (deep !== null && deep.query === trimmed) {
+      listEl.appendChild(deepResults(deep));
     } else {
-      for (const group of groupSessions(visible)) {
-        listEl.appendChild(groupSection(group, state.currentSessionId, searching));
+      if (searchRowVisible(trimmed)) listEl.appendChild(searchAllRow(trimmed));
+      const searching = trimmed !== '';
+      const visible = filterSessions(state.sessions, query);
+      if (state.sessions.length === 0) {
+        listEl.appendChild(h('div', { class: 'sidebar-empty' },
+          icon('spark'),
+          h('p', { class: 'sidebar-empty-title', text: t('shell.sidebar.emptyTitle') }),
+          h('p', { class: 'sidebar-empty-text', text: t('shell.sidebar.emptyText') })));
+      } else if (visible.length === 0) {
+        listEl.appendChild(h('p', { class: 'sidebar-empty-text', text: t('shell.sidebar.noMatches') }));
+      } else {
+        for (const group of groupSessions(visible)) {
+          listEl.appendChild(groupSection(group, state.currentSessionId, searching));
+        }
       }
-    }
 
-    if (state.sessionsHasMore && !searching) {
-      const more = h('button', {
-        class: 'btn btn-ghost btn-block sidebar-more',
-        attrs: { type: 'button', disabled: loadingMore },
-        on: { click: () => loadMore() },
-      }, t('shell.sidebar.loadMore'));
-      listEl.appendChild(more);
+      if (state.sessionsHasMore && !searching) {
+        const more = h('button', {
+          class: 'btn btn-ghost btn-block sidebar-more',
+          attrs: { type: 'button', disabled: loadingMore },
+          on: { click: () => loadMore() },
+        }, t('shell.sidebar.loadMore'));
+        listEl.appendChild(more);
+      }
     }
 
     if (focusKey) {

@@ -9,7 +9,7 @@ import {
   codeBlock,
   copyButton,
   errorBlock,
-  imageNode,
+  imageButton,
   keyValueList,
   mutedNote,
   prettyJson,
@@ -17,7 +17,8 @@ import {
   statusOf,
   toolShell,
 } from './shell.js';
-import { isRecord, parseMcpToolName, resultText, str, truncate } from './summaries.js';
+import { imageFromBlock } from './images.js';
+import { isRecord, parseMcpToolName, resultText, truncate } from './summaries.js';
 
 const SUBTITLE_MAX = 240;
 
@@ -33,12 +34,11 @@ export function render(card, ctx) {
   const text = resultText(card.result);
   const copyable = text || (card.result ? prettyJson(card.result.content) : '');
   return toolShell({
-    iconName: 'plug',
     title: tool || card.name,
     subtitle: truncate(firstStringValue(input), SUBTITLE_MAX),
     status: statusOf(card),
     body: () => mcpBody(card, input, ctx),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: copyable ? [copyButton({ text: copyable, t, label: t('tools.mcp.copyResult') })] : [],
     extras: server ? [chip(server, { kind: 'accent', mono: true, title: t('tools.mcp.server') })] : [],
     t,
@@ -106,10 +106,8 @@ function blockNodes(block, t) {
   if (!isRecord(block)) return [];
   if (block.type === 'text' && typeof block.text === 'string') return textOutput(block.text);
   if (block.type === 'image') {
-    const source = isRecord(block.source) ? block.source : {};
-    const mediaType = str(block.mimeType) || str(source.media_type);
-    const data = str(block.data) || str(source.data);
-    const image = imageNode(mediaType, data, t('tools.mcp.image'));
+    // Only a web image type within the size limit is shown; anything else says so instead of showing raw data.
+    const image = imageButton(imageFromBlock(block), t('tools.mcp.image'), t);
     return [image ?? mutedNote(t('tools.mcp.imageUnavailable'))];
   }
   return [codeBlock(prettyJson(block))];

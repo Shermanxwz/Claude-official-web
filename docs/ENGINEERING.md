@@ -43,5 +43,5 @@ These rules are binding for every change. `npm run seal` enforces the mechanical
 ## Ownership during parallel work
 
 Each worker edits only the files assigned to it. If a change is needed elsewhere, describe it precisely in the final
-report instead of editing. Contracts (`docs/PROTOCOL.md`, `docs/FRONTEND.md`, `src/contracts.mjs`) change only through
-the integrator.
+report instead of editing. Contracts (`docs/PROTOCOL.md`, `docs/FRONTEND.md`, `docs/DESIGN.md`, `src/contracts.mjs`)
+change only through the integrator.

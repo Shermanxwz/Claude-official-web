@@ -58,6 +58,8 @@ const INTERRUPT_NOTICES = new Map([
  * @property {boolean} closed      set by a result, an inactive session state or a conversation reset
  * @property {boolean} sendPending set while a message sent from this browser waits for the session to report running
  * @property {Flow|null} main
+ * @property {number|null} startedAt   epoch ms of the turn's first event (its first live message or its local send)
+ * @property {Map<string, number>} tokens  output tokens of each main-thread message of the turn, by message id
  */
 
 /**
@@ -97,11 +99,13 @@ const INTERRUPT_NOTICES = new Map([
  *   getRunState: () => {running: boolean, status: string|null, compactResult: string|null, activity: string|null}
  * }}
  */
-export function createModel() {
+export function createModel({ now = Date.now, describeTool = null } = {}) {
   /** @type {Array<{op: string, [key: string]: any}>} */
   let log = [];
   let counter = 0;
   let seq = 0;
+  /** Time of the operation being applied (epoch ms), so a replay keeps the times the live events had. */
+  let eventTime = 0;
 
   /** @type {Flow[]} */
   let turns = [];
@@ -109,7 +113,8 @@ export function createModel() {
   let current = null;
   /** @type {Flow|null} the turn the SDK message being applied names through its user message uuid(s), else null */
   let named = null;
-  /** @type {{messageId: string, blocks: Array<Record<string, any>|undefined>, finalized: number, stopped: boolean, version: number}|null} */
+  /** @type {{messageId: string, blocks: Array<Record<string, any>|undefined>, finalized: number, stopped: boolean,
+   *   version: number, settled: Set<string>}|null} */
   let draft = null;
   /** @type {Map<string, Record<string, any>>} */
   let toolIndex = new Map();
@@ -140,6 +145,9 @@ export function createModel() {
   let activity = null;
   /** @type {Array<{request: Record<string, any>, version: number}>} */
   let pending = [];
+  /** Requests the model was told about and that are not resolved yet, by id (a resolution may arrive after the list changed). */
+  /** @type {Map<string, Record<string, any>>} */
+  let known = new Map();
   /** @type {string|null} */
   let sessionState = null;
 
@@ -280,7 +288,7 @@ export function createModel() {
   /** @returns {Flow} */
   const newTurn = () => {
     /** @type {Turn} */
-    const state = { live: false, closed: false, sendPending: false, main: null };
+    const state = { live: false, closed: false, sendPending: false, main: null, startedAt: null, tokens: new Map() };
     /** @type {Flow} */
     const flow = { entries: [], owner: null, parent: null, state };
     state.main = flow;
@@ -389,6 +397,7 @@ export function createModel() {
     if (state.live) return;
     state.live = true;
     state.sendPending = false;
+    if (state.startedAt === null) state.startedAt = eventTime || now();
     if (state.main) syncFlow(state.main);
   };
 
@@ -780,6 +789,23 @@ export function createModel() {
     touchOwners(flow);
   };
 
+  /**
+   * A final assistant message settles the streaming draft of the same message id: its blocks count as finalized, so only
+   * the blocks it does not cover stay visible. Each message settles a draft once, by uuid.
+   * @param {Record<string, any>} raw
+   */
+  const settleDraft = (raw) => {
+    if (!draft || raw.type !== 'assistant') return;
+    const message = isObject(raw.message) ? raw.message : {};
+    if (message.id !== draft.messageId) return;
+    const uuid = typeof raw.uuid === 'string' ? raw.uuid : null;
+    if (uuid && draft.settled.has(uuid)) return;
+    if (uuid) draft.settled.add(uuid);
+    draft.finalized += normalizeContent(message.content).length;
+    touch(draft);
+    maybeClearDraft();
+  };
+
   /** @param {Record<string, any>} raw @param {boolean} live @returns {Flow|null} */
   const onAssistant = (raw, live) => {
     const message = isObject(raw.message) ? raw.message : {};
@@ -791,11 +817,7 @@ export function createModel() {
     if (live) markLive(flow.state);
     // A refusal-fallback retry names the refused messages it replaces; they leave the timeline without a marker.
     withdrawMessages(uuidSet(raw, 'supersedes'), { marker: false });
-    if (live && draft && messageId === draft.messageId) {
-      draft.finalized += content.length;
-      touch(draft);
-      maybeClearDraft();
-    }
+    if (live) settleDraft(raw);
     for (const block of content) appendAssistantBlock(flow, block, messageId, uuid, raw);
     if (typeof raw.error === 'string' && raw.error) {
       addNotice(flow, 'error', 'assistant-error', { error: raw.error }, '', uuid ? `n:${uuid}:error` : null);
@@ -1196,7 +1218,7 @@ export function createModel() {
 
   /** @param {string} messageId @returns {void} */
   const ensureDraft = (messageId) => {
-    if (!draft) draft = { messageId, blocks: [], finalized: 0, stopped: false, version: 0 };
+    if (!draft) draft = { messageId, blocks: [], finalized: 0, stopped: false, version: 0, settled: new Set() };
   };
 
   /** @param {number} index @param {Record<string, any>} block */
@@ -1261,6 +1283,13 @@ export function createModel() {
           maybeClearDraft();
         }
         break;
+      case 'message_delta': {
+        // The runtime reports the message's output tokens so far; the turn's count sums its messages (see activity).
+        const usage = isObject(event.usage) ? event.usage : {};
+        const tokens = Number(usage.output_tokens);
+        if (draft && Number.isFinite(tokens)) flow.state.tokens.set(draft.messageId, tokens);
+        break;
+      }
       default:
         break;
     }
@@ -1334,6 +1363,8 @@ export function createModel() {
         if (isActivity(raw)) markLive(known.state);
         // A subagent's flow is not a turn: the turn it belongs to becomes current.
         current = known.state.main ?? known;
+        // A replayed final message still settles the draft its stream built (rule 1).
+        if (raw.type === 'assistant') settleDraft(raw);
       }
       return;
     }
@@ -1399,6 +1430,7 @@ export function createModel() {
 
   /** @param {{op: string, [key: string]: any}} operation */
   const apply = (operation) => {
+    eventTime = typeof operation.at === 'number' ? operation.at : 0;
     switch (operation.op) {
       case 'transcript':
         for (const message of operation.messages) guard(() => ingest(message, false), message, false);
@@ -1417,6 +1449,12 @@ export function createModel() {
         break;
       case 'discard':
         discardEntry(operation.clientMessageId);
+        break;
+      case 'cancel':
+        cancelQueuedEntry(operation.clientMessageId);
+        break;
+      case 'evict':
+        withdrawMessages(new Set(operation.uuids), { marker: false });
         break;
       case 'notice':
         addInlineNotice(operation);
@@ -1524,6 +1562,7 @@ export function createModel() {
   const startLocalTurn = (entry) => {
     const turn = newTurn();
     turn.state.sendPending = true;
+    turn.state.startedAt = eventTime || now();
     placeUser(turn, entry);
     if (sessionState === null || ACTIVE_STATES.has(sessionState)) markLive(turn.state);
     return turn;
@@ -1706,7 +1745,113 @@ export function createModel() {
     locals = locals.filter((entry) => !(entry.status === 'sent' && containerOf.get(entry) === flow));
   };
 
-  // ---------------------------------------------------------------------------------------------------------------
+  /**
+   * The runtime dropped a message that waited in its queue (message_cancelled). A message the runtime started is not
+   * in the queue any more, so the cancellation leaves it alone.
+   * @param {string} clientMessageId
+   */
+  const cancelQueuedEntry = (clientMessageId) => {
+    const entry = userEntries.get(clientMessageId);
+    if (!entry || !entry.local) return;
+    if (entry.echoed && !queued.includes(entry)) return;
+    discardEntry(clientMessageId);
+  };
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Activity and todos (the composer's running line and todo bar)
+
+  /**
+   * The running tool card of a turn: the last tool in its own work groups that has no result yet.
+   * @param {Flow} flow
+   * @returns {Record<string, any>|null}
+   */
+  const runningToolOf = (flow) => {
+    let found = null;
+    for (const entry of flow.entries) {
+      if (entry.kind !== 'work') continue;
+      for (const item of entry.items) {
+        if (item.kind === 'tool' && item.running) found = item;
+      }
+    }
+    return found;
+  };
+
+  /**
+   * One line for what the running turn does: the runtime's task summary, else the running tool described by the caller.
+   * @returns {string|null}
+   */
+  const activityText = () => {
+    if (activity) return activity;
+    const tool = current ? runningToolOf(current) : null;
+    if (!tool || typeof describeTool !== 'function') return null;
+    const text = describeTool(tool);
+    return typeof text === 'string' && text.trim() ? text.trim() : null;
+  };
+
+  /**
+   * The running turn as the composer shows it, or null while the session is idle. `waiting` is true while a request
+   * (a permission, a question, a plan or a dialog) waits for the user.
+   * @returns {{running: boolean, startedAt: number, text: string|null, outputTokens: number, queued: number,
+   *   waiting: boolean}|null}
+   */
+  const activityView = () => {
+    if (!turnRunning() || !current) return null;
+    let outputTokens = 0;
+    for (const value of current.state.tokens.values()) outputTokens += value;
+    return {
+      running: true,
+      startedAt: current.state.startedAt ?? 0,
+      text: activityText(),
+      outputTokens,
+      queued: queued.length,
+      waiting: pending.length > 0,
+    };
+  };
+
+  /**
+   * The latest TodoWrite of the main thread (subagent todo lists are not part of the turn's flow). Null when none.
+   * @returns {Array<{content: string, activeForm: string, status: 'pending'|'in_progress'|'completed'}>|null}
+   */
+  const todosView = () => {
+    let latest = null;
+    for (const turn of turns) {
+      for (const entry of turn.entries) {
+        if (entry.kind !== 'work') continue;
+        for (const item of entry.items) {
+          if (item.kind === 'tool' && item.name === 'TodoWrite' && isObject(item.input) && Array.isArray(item.input.todos)) {
+            latest = item.input.todos;
+          }
+        }
+      }
+    }
+    if (!latest) return null;
+    /** @type {Array<{content: string, activeForm: string, status: 'pending'|'in_progress'|'completed'}>} */
+    const todos = [];
+    for (const todo of latest) {
+      if (!isObject(todo) || typeof todo.content !== 'string' || !todo.content.trim()) continue;
+      const content = todo.content.trim();
+      const activeForm = typeof todo.activeForm === 'string' && todo.activeForm.trim() ? todo.activeForm.trim() : content;
+      const status = todo.status === 'in_progress' || todo.status === 'completed' ? todo.status : 'pending';
+      todos.push({ content, activeForm, status });
+    }
+    return todos;
+  };
+
+  /**
+   * The user prompt a refusal dialog offers to edit: the message that started the turn the dialog belongs to.
+   * @returns {string}
+   */
+  const promptOfCurrentTurn = () => {
+    const turn = current ?? turns[turns.length - 1];
+    if (!turn) return '';
+    for (let index = turn.entries.length - 1; index >= 0; index -= 1) {
+      const entry = turn.entries[index];
+      if (entry.kind === 'user' && entry.text) return entry.text;
+    }
+    return '';
+  };
+
+  // ---------------------------------------------------------------------------------------------------------------------
   // Public API
 
   return {
@@ -1733,8 +1878,8 @@ export function createModel() {
 
     /** @param {Record<string, any>} msg a live SDK message, or a message from the snapshot's liveEvents */
     applyLiveEvent(msg) {
-      log.push({ op: 'live', msg });
-      guard(() => ingest(msg, true), msg, true);
+      log.push({ op: 'live', msg, at: now() });
+      apply({ op: 'live', msg, at: log[log.length - 1].at });
       relinkPending();
     },
 
@@ -1743,6 +1888,7 @@ export function createModel() {
       if (!isObject(message) || typeof message.clientMessageId !== 'string') return;
       const operation = {
         op: 'opt',
+        at: now(),
         clientMessageId: message.clientMessageId,
         text: message.text,
         attachments: message.attachments,
@@ -1805,13 +1951,40 @@ export function createModel() {
         }
       }
       pending = next;
+      for (const entry of next) known.set(entry.request.id, entry.request);
       relinkPending();
     },
 
-    /** @param {string} requestId */
+    /**
+     * A request was answered or dropped. A refusal dialog that resolves evicts the refused messages it retracted, without
+     * a marker: the retry replaces them. The eviction is logged, so a replay keeps it.
+     * @param {string} requestId
+     */
     resolvePending(requestId) {
+      const request = known.get(requestId);
+      known.delete(requestId);
       pending = pending.filter((entry) => entry.request.id !== requestId);
       relinkPending();
+      if (request && request.kind === 'dialog') {
+        const uuids = Array.isArray(request.dialog?.retractedMessageUuids)
+          ? request.dialog.retractedMessageUuids.filter((id) => typeof id === 'string' && id !== '')
+          : [];
+        if (uuids.length > 0) {
+          const operation = { op: 'evict', uuids };
+          log.push(operation);
+          apply(operation);
+        }
+      }
+    },
+
+    /**
+     * Removes a queued message the runtime dropped (message_cancelled). It is logged, so a replay keeps it gone.
+     * @param {string} clientMessageId
+     */
+    cancelQueued(clientMessageId) {
+      const operation = { op: 'cancel', clientMessageId };
+      log.push(operation);
+      apply(operation);
     },
 
     /**
@@ -1856,7 +2029,8 @@ export function createModel() {
         }
       }
       for (const entry of pending) {
-        out.push({ kind: 'request', key: `req:${entry.request.id}`, request: entry.request, version: entry.version });
+        const prompt = entry.request.kind === 'dialog' ? promptOfCurrentTurn() : '';
+        out.push({ kind: 'request', key: `req:${entry.request.id}`, request: entry.request, version: entry.version, prompt });
       }
       out.push(...queued);
       return out;
@@ -1879,6 +2053,24 @@ export function createModel() {
         }
       }
       return found;
+    },
+
+    /**
+     * The latest TodoWrite of the main thread, or null when there is none (docs/FRONTEND.md).
+     * @returns {Array<{content: string, activeForm: string, status: 'pending'|'in_progress'|'completed'}>|null}
+     */
+    getTodos() {
+      return todosView();
+    },
+
+    /**
+     * The running turn: its start, what it does, its output tokens, the queued messages, and whether a request waits
+     * for the user (`waiting`). Null while idle.
+     * @returns {{running: boolean, startedAt: number, text: string|null, outputTokens: number, queued: number,
+     *   waiting: boolean}|null}
+     */
+    getActivity() {
+      return activityView();
     },
 
     /**

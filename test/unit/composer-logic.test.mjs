@@ -7,14 +7,19 @@ import {
   draftKey,
   effortLevelsFor,
   effortModelFor,
+  escapeAction,
   fastModeView,
   filterCommands,
   findModelInfo,
   formatBytes,
+  isModeCycleKey,
   isSendShortcut,
   joinRestoredText,
   mergeCommands,
+  modeWordKey,
   modelSelectPlan,
+  parseSideQuestion,
+  runtimeHasCommand,
 } from '../../public/js/ui/composer-logic.js';
 
 describe('detectTrigger', () => {
@@ -198,48 +203,48 @@ describe('mergeCommands', () => {
 
   test('lists GUI commands first, then Claude Code commands in their original order', () => {
     const merged = mergeCommands(sdk, gui);
-    assert.deepEqual(merged.map((c) => c.name), ['rewind', 'effort', 'compact', 'model', 'my-skill']);
+    assert.deepEqual(merged.map((c) => `${c.source}:${c.name}`), [
+      'gui:model', 'gui:rewind', 'gui:effort', 'gui:c', 'sdk:compact', 'sdk:model', 'sdk:my-skill',
+    ]);
   });
 
-  test('drops GUI commands whose name is already a Claude Code command or alias', () => {
-    const names = mergeCommands(sdk, gui).filter((c) => c.source === 'gui').map((c) => c.name);
-    assert.deepEqual(names, ['rewind', 'effort']);
+  test('marks a GUI row shadowed only when a Claude Code name or alias matches it', () => {
+    const rows = mergeCommands(sdk, gui).filter((c) => c.source === 'gui');
+    assert.deepEqual(rows.map((c) => [c.name, c.shadowed]), [
+      ['model', true], ['rewind', false], ['effort', false], ['c', true],
+    ]);
   });
 
-  test('never lists the same name twice', () => {
-    const merged = mergeCommands(sdk, gui);
-    const lower = merged.map((c) => c.name.toLowerCase());
-    assert.equal(new Set(lower).size, lower.length);
+  test('matches names and aliases case-insensitively', () => {
+    const named = mergeCommands([{ name: 'Model' }], [{ id: 'model', name: 'model' }]);
+    assert.equal(named[0].shadowed, true);
+    const aliased = mergeCommands([{ name: 'x', aliases: ['REW'] }], [{ id: 'rew', name: 'rew' }]);
+    assert.equal(aliased[0].shadowed, true);
   });
 
   test('keeps Claude Code metadata and defaults missing fields', () => {
     const merged = mergeCommands(sdk, gui);
-    const compact = merged.find((c) => c.name === 'compact');
-    const model = merged.find((c) => c.name === 'model');
+    const compact = merged.find((c) => c.source === 'sdk' && c.name === 'compact');
+    const model = merged.find((c) => c.source === 'sdk' && c.name === 'model');
     const mySkill = merged.find((c) => c.name === 'my-skill');
-    assert.equal(compact.source, 'sdk');
     assert.equal(compact.argumentHint, '[instructions]');
     assert.deepEqual(compact.aliases, ['c']);
     assert.equal(model.builtin, true);
     assert.equal(mySkill.builtin, false);
     assert.deepEqual(mySkill.aliases, []);
+    assert.equal(mySkill.description, 'Custom');
   });
 
-  test('carries the GUI identifier on GUI rows', () => {
+  test('carries the GUI identifier on GUI rows and an empty description when none is given', () => {
     const rewind = mergeCommands(sdk, gui).find((c) => c.name === 'rewind');
     assert.equal(rewind.source, 'gui');
     assert.equal(rewind.guiId, 'rewind');
+    assert.equal(mergeCommands([], [{ id: 'x', name: 'x' }])[0].description, '');
   });
 
-  test('treats names case-insensitively and compares aliases too', () => {
-    const merged = mergeCommands([{ name: 'Model' }], [{ id: 'model', name: 'model' }]);
-    assert.deepEqual(merged.map((c) => c.name), ['Model']);
-    const aliased = mergeCommands([{ name: 'x', aliases: ['REW'] }], [{ id: 'rew', name: 'rew' }]);
-    assert.deepEqual(aliased.map((c) => c.name), ['x']);
-  });
-
-  test('ignores malformed Claude Code entries', () => {
+  test('ignores malformed Claude Code and GUI entries', () => {
     assert.deepEqual(mergeCommands([null, { name: '' }, { description: 'no name' }, { name: 42 }], []), []);
+    assert.deepEqual(mergeCommands([], [null, { id: 'a' }, { id: 'b', name: '' }]), []);
   });
 
   test('returns GUI commands alone when the Claude Code list is missing', () => {
@@ -247,6 +252,87 @@ describe('mergeCommands', () => {
     assert.equal(merged.length, 1);
     assert.equal(merged[0].name, 'alpha');
     assert.equal(merged[0].source, 'gui');
+    assert.equal(merged[0].shadowed, false);
+  });
+});
+
+describe('parseSideQuestion', () => {
+  test('returns the trimmed question after /btw', () => {
+    assert.equal(parseSideQuestion('/btw   what does this module do?  '), 'what does this module do?');
+  });
+
+  test('keeps the question intact, including its line breaks', () => {
+    assert.equal(parseSideQuestion('/btw first\nsecond'), 'first\nsecond');
+  });
+
+  test('is not a side question when nothing follows the command or the word only starts with it', () => {
+    assert.equal(parseSideQuestion('/btw'), null);
+    assert.equal(parseSideQuestion('/btw   '), null);
+    assert.equal(parseSideQuestion('/btwx hello'), null);
+    assert.equal(parseSideQuestion('say /btw hello'), null);
+  });
+
+  test('ignores input that is not a string', () => {
+    assert.equal(parseSideQuestion(undefined), null);
+  });
+});
+
+describe('runtimeHasCommand', () => {
+  const commands = [{ name: 'compact', aliases: ['c'] }, { name: 'model' }];
+
+  test('finds a runtime command by its name or one of its aliases', () => {
+    assert.equal(runtimeHasCommand(commands, 'compact'), true);
+    assert.equal(runtimeHasCommand(commands, 'c'), true);
+    assert.equal(runtimeHasCommand(commands, 'btw'), false);
+  });
+
+  test('is false for a missing list or malformed entries', () => {
+    assert.equal(runtimeHasCommand(undefined, 'model'), false);
+    assert.equal(runtimeHasCommand([null, {}], 'model'), false);
+  });
+});
+
+describe('modeWordKey', () => {
+  test('maps each permission mode to its footer word', () => {
+    assert.equal(modeWordKey('default'), 'composer.modeWord.default');
+    assert.equal(modeWordKey('acceptEdits'), 'composer.modeWord.acceptEdits');
+    assert.equal(modeWordKey('plan'), 'composer.modeWord.plan');
+    assert.equal(modeWordKey('auto'), 'composer.modeWord.auto');
+    assert.equal(modeWordKey('bypassPermissions'), 'composer.modeWord.bypassPermissions');
+    assert.equal(modeWordKey('dontAsk'), 'composer.modeWord.dontAsk');
+  });
+
+  test('says that Claude Code settings decide when the mode is null or unknown', () => {
+    assert.equal(modeWordKey(null), 'composer.modeWord.settings');
+    assert.equal(modeWordKey(undefined), 'composer.modeWord.settings');
+    assert.equal(modeWordKey('mystery'), 'composer.modeWord.settings');
+  });
+});
+
+describe('isModeCycleKey', () => {
+  test('matches Shift+Tab and nothing that adds another modifier', () => {
+    assert.equal(isModeCycleKey({ key: 'Tab', shiftKey: true }), true);
+    assert.equal(isModeCycleKey({ key: 'Tab', shiftKey: false }), false);
+    assert.equal(isModeCycleKey({ key: 'Tab', shiftKey: true, ctrlKey: true }), false);
+    assert.equal(isModeCycleKey({ key: 'Tab', shiftKey: true, altKey: true }), false);
+    assert.equal(isModeCycleKey({ key: 'Tab', shiftKey: true, metaKey: true }), false);
+    assert.equal(isModeCycleKey({ key: 'Enter', shiftKey: true }), false);
+    assert.equal(isModeCycleKey(null), false);
+  });
+});
+
+describe('escapeAction', () => {
+  test('leaves the prompt history first', () => {
+    assert.equal(escapeAction({ browsing: true, running: true, blocked: false }), 'leave-history');
+  });
+
+  test('interrupts a running turn when nothing else is open', () => {
+    assert.equal(escapeAction({ browsing: false, running: true, blocked: false }), 'interrupt');
+  });
+
+  test('only leaves the field when idle, or when a menu or dialog is open', () => {
+    assert.equal(escapeAction({ browsing: false, running: false, blocked: false }), 'blur');
+    assert.equal(escapeAction({ browsing: false, running: true, blocked: true }), 'blur');
   });
 });
 

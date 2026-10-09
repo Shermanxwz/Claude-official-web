@@ -25,6 +25,19 @@ no `eval`, no `innerHTML` with untrusted data (use `h()`/`textContent`; Markdown
 | `public/js/timeline/requests.js` | permission / question / plan / elicitation cards |
 | `public/js/timeline/rewind.js` | rewind + fork dialogs |
 | `public/js/terminal.js` | terminal panel (xterm.js) |
+| `public/js/ui/runtime-panels.js` | the Runtime panel: status, permission rules, hooks, memory, usage, skills, sandbox, settings, Claude in Chrome |
+| `public/js/ui/account.js` | account section of Settings: Claude Code's own sign-in flow |
+| `public/js/ui/devtools.js` | developer console: raw runtime views + bounded event log |
+| `public/js/ui/quick-switcher.js` | ⌘K / Ctrl+K quick switcher: sessions, panels, GUI commands |
+| `public/js/ui/side-question.js` | `/btw` side-question overlay above the composer |
+| `public/js/ui/activity.js` | running line (activity, elapsed time, output tokens) and the pinned todo bar above the composer |
+
+Owners in this round: **shell** (`app-shell.js`, `api.js`, `store.js`, `main.js`, `sidebar.js`, `panels.js`,
+`dialog.js`, `menu.js`, `toasts.js`, `login.js`, `runtime-panels.js`, `account.js`, `devtools.js`,
+`quick-switcher.js`, `locales/*.core.js`, `css/app.css`, `test/e2e/helpers.mjs`) and **conversation**
+(`composer.js`, `composer-logic.js`, `header.js`, `new-session.js`, `side-question.js`, `activity.js`, `timeline/**`,
+`locales/*.composer.js`, `*.cards.js`, `*.tools.js`, `css/composer.css`, `cards.css`, `tools.css`). The conversation
+owner reaches shell behavior only through the `actions` contract below.
 
 Vendored libraries are served by the gateway from `node_modules`:
 `/vendor/marked.esm.js`, `/vendor/purify.es.mjs`, `/vendor/xterm/xterm.mjs`, `/vendor/xterm/xterm.css`,
@@ -53,7 +66,8 @@ namespaced: `shell.*`, `cards.*`, `terminal.*`, `common.*` (shell owner defines 
 
 ```js
 class ApiError extends Error { status; code; retryAfter }
-api.get(path, {signal}?) / api.post(path, body?) / api.patch(path, body) / api.del(path)  // JSON in/out, throws ApiError
+api.get(path, {signal}?) / api.post(path, body?) / api.patch(path, body) / api.put(path, body) / api.del(path)
+                                                   // JSON in/out, throws ApiError
 api.upload(cwd, file /* File|Blob */, name) -> Promise<{path,name,size,mediaType,kind}>
 connectEvents({ watch, after, onEvent(type, data), onStatus(status /* 'connecting'|'open'|'closed' */) })
   -> { close(), reconnect({watch, after}) }
@@ -75,6 +89,7 @@ state = {
   pending: { [sessionId]: PendingRequest[] },
   currentSessionId: string | null,
   capabilities: { [sessionId]: Capabilities },
+  account: { account: AccountInfo|null, signInPending: boolean } | null,   // GET /api/account, account_changed
   prefs: { theme: 'system'|'light'|'dark', locale, fontSize: 'sm'|'md'|'lg', notify: boolean, sidebarOpen: boolean },
 }
 ```
@@ -92,6 +107,16 @@ createTimeline({ container, api, store, t }) -> {
   destroy() }
 ```
 `load()` resolves to `{ seq }` so the shell can (re)connect SSE with `after=seq`.
+`createTimeline` also takes `onTodos(todos|null)` and `onActivity(activity|null)` callbacks, which the shell forwards
+to the composer (`setTodos`, `setActivity`):
+```js
+todos = [{ content: string, activeForm: string, status: 'pending'|'in_progress'|'completed' }]  // latest TodoWrite of
+                                     // the main thread in the current session; null when none
+activity = { running: true, startedAt: number /* ms epoch of the turn's first event */, text: string|null
+             /* system/task_summary or the running tool, e.g. "Reading src/app.js" */, outputTokens: number
+             /* sum of message_delta usage.output_tokens of the turn's main-thread messages */ }  // null when idle
+```
+`applyEvent('message_cancelled', {sessionId, clientMessageId})` removes that queued user message from the model.
 Pending request cards are part of the timeline (rendered at the bottom of the current turn, sticky above the composer
 on mobile) and answered via `POST /api/sessions/:id/requests/:rid`.
 
@@ -109,10 +134,12 @@ listed methods):
 createSidebar({ container, api, store, t, actions })                    // sessions, projects, search, new session
 createHeader({ container, api, store, t, actions }) -> { setSession(sessionId|null), toggleFast() -> boolean }
 createComposer({ container, api, store, t, actions }) -> { setSession(sessionId|null), focus(), insertText(text),
-                                                            setSuggestion(text|null) }
-createTimeline({ container, api, store, t, actions })                   // see below
+                                                            setSuggestion(text|null), setTodos(todos|null),
+                                                            setActivity(activity|null), setText(text) }
+createTimeline({ container, api, store, t, actions, onTodos, onActivity })   // see below
 createTerminalPanel({ container, api, store, t }) -> { open({sessionId}|{cwd}), close(), isOpen() }
-openPanel(name, { api, store, t, actions })   // panels.js: 'session'|'capabilities'|'context'|'tasks'|'settings'
+openPanel(name, { api, store, t, actions }, opts)   // panels.js: 'session'|'capabilities'|'context'|'tasks'|'settings'
+                                                    // |'runtime'|'developer'; opts: { tab?, section? }
 ```
 
 `actions` is created once by the shell and passed to every part:
@@ -131,6 +158,19 @@ actions = {
                                        // rewind while LiveInfo.backgroundTasks > 0 (ending the query stops them)
   toggleFastMode() -> boolean,         // the header's fast toggle (false when not offered); used by `/fast`
   insertIntoComposer(text),            // e.g. prompt suggestions, file mentions
+  // ---- added in this round (implemented by the shell owner in app-shell.js) ----
+  openPanel(name, opts?),              // opts: { tab?: string, section?: string } (see openPanel)
+  interrupt({ cancelQueued } = {}),    // POST /interrupt; returns the receipt; cancelled ids leave the timeline
+  cancelQueued(clientMessageId) -> Promise<boolean>,   // DELETE /queued/:id; true when the runtime dropped it
+  sideQuestion(question) -> Promise<{ response, synthetic, refusalFallback }>,   // POST /side-question
+  exportConversation() -> Promise<void>,   // GET /export, then saves `filename` (Blob + a[download]); toasts
+  showTaskOutput(taskId),              // opens the task output viewer (GET /tasks/:taskId/output, refresh button)
+  cyclePermissionMode() -> PermissionMode|null,   // Shift+Tab, like the terminal: default → acceptEdits → plan →
+                                       // auto → bypassPermissions (only when meta.features.bypass) → default; from
+                                       // any other mode (dontAsk, unknown, null) to acceptEdits; updateSettings;
+                                       // returns the new mode (null when no live/known session or profile read)
+  openQuickSwitcher(),                 // ⌘K / Ctrl+K
+  restartSession() -> Promise<void>,   // close + open the current session (after memory edits, fallback model)
 }
 ```
 
@@ -143,7 +183,15 @@ Locale files per owner: `en.core.js`/`zh-CN.core.js` (shell: app-shell, sidebar,
 
 Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveEvents`, then live `sdk` events.
 
-1. Entries are keyed by `uuid`; a message with a uuid already present is ignored (transcript/live overlap).
+1. Entries are keyed by `uuid`; a message with a uuid already present is ignored (transcript/live overlap) — except
+   that an assistant message whose uuid is already present still settles streaming state: a draft with the same
+   `message.id` counts its blocks as finalized exactly as if the message were new. Reloading a session whose snapshot
+   `liveEvents` replay the stream (`stream_event`s) of a message the transcript already holds must not leave a draft
+   ("generating…" with raw partial JSON) on screen. Covered by unit tests built from a real snapshot shape:
+   transcript `[user, assistant(text, id X), assistant(tool_use ExitPlanMode, id X)]` plus `liveEvents`
+   `[system/init, …, stream_event message_start(X) … content_block_* … message_stop, assistant(text, X),
+   assistant(tool_use, X)]` while a plan request is pending.
+   `message_cancelled` removes the queued user message with that `clientMessageId` (no row is left).
 2. Assistant messages: consecutive assistant entries with the same `message.id` render as one bubble; blocks are
    `text` (Markdown), `thinking`/`redacted_thinking` (collapsed "Thinking" disclosure; a block whose text is empty —
    summaries off, or redacted — renders as a muted, non-expandable "Thinking" label instead of an empty disclosure),
@@ -206,6 +254,13 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
    - Any other type/subtype is kept as a diagnostic generic entry (never thrown away, never throws) and rendered as a
      collapsed JSON row only when Settings → "Show runtime events" (`prefs.showRuntimeEvents`) is on.
 
+9. Pending request cards (`requests.js`) gain kind `dialog` (`dialog.dialogKind === 'refusal_fallback_prompt'`): a
+   warning-styled card "{originalModel} declined this request" with `guidanceText` (plain text) and three actions:
+   "Retry with {fallbackModel}" (`retry_fallback`, primary), "Edit prompt" (`edit_prompt`: after the answer the
+   composer receives the text of the user message that started the turn via `composer.setText`), "Cancel"
+   (`cancelled`). When the request resolves, entries whose uuid is in `retractedMessageUuids` are evicted without a
+   marker (as for `supersedes`). Keys 1/2/3 answer it like the permission card.
+
 ## Tool renderers (`public/js/timeline/tools/`)
 
 Each module exports `render(card, ctx) -> HTMLElement` where
@@ -226,6 +281,10 @@ NotebookEdit — Edit/Write show a unified diff computed from `old_string`/`new_
 `search.js` (Grep, Glob, LS), `web.js` (WebFetch, WebSearch), `agent.js` (Agent/Task with nested children),
 `todo.js` (TodoWrite checklist), `plan.js` (ExitPlanMode, EnterPlanMode), `mcp.js` (`mcp__<server>__<tool>`),
 `generic.js` (fallback). `tools/index.js` exports `renderTool(card, ctx)` choosing the family by name.
+MCP results (`mcp.js`, also used for the browser server's and Claude in Chrome's tools) render `image` content blocks
+(`{type: 'image', source: {type: 'base64', media_type, data}}` or MCP `{type: 'image', data, mimeType}`) as images
+(`data:` URL built only for `image/png|jpeg|gif|webp`, max 5 MiB decoded, click opens a full-size view in a dialog)
+and text blocks as text; other block types fall back to the generic JSON view.
 Tool inputs follow `node_modules/@anthropic-ai/claude-agent-sdk/sdk-tools.d.ts`.
 
 ## Design tokens (defined once in `app.css`, used by every stylesheet)
@@ -278,6 +337,82 @@ command, at.
   confirming repeats the call with `force: true`.
 - Accessibility: semantic buttons, `aria-label`s, visible focus, dialogs trap focus and close on Esc,
   `prefers-reduced-motion` respected, color contrast ≥ 4.5:1 in both themes.
+
+### Conversation owner (composer, header, new session, timeline)
+
+- Keyboard, as in the terminal: **Shift+Tab** in the composer calls `actions.cyclePermissionMode()` and shows the new
+  mode for 2 s in the composer footer (the footer always shows the current mode in small text, e.g. "Asks before
+  each action"); **Esc** in the composer while a turn runs (no palette, menu or dialog open) calls
+  `actions.interrupt()`; **↑ / ↓** in an empty composer (caret at the start/end) walk this session's earlier prompts
+  (user messages of the loaded transcript plus ones sent in this page, newest first; Esc or editing leaves history
+  mode). Shortcuts are listed in the palette's footer hint.
+- Running line (`activity.js`, above the composer while `activity` is set): an animated glyph (static when reduced
+  motion), `activity.text` or "Working", elapsed time (`12s`, `1m 05s`), output tokens (`↓ 1.2k tokens`) and "Esc to
+  stop" on desktop. Replaces the inline "Processing…" row of the timeline.
+- Pinned todo bar (`activity.js`): when `todos` has items and not all are completed, or a turn is running, a one-line
+  bar above the composer shows "{done}/{total}" and the `activeForm` of the item in progress; clicking expands the
+  full checklist (statuses as icons). Hidden otherwise. Never covers a pending request card.
+- Queued messages: a queued user bubble shows "Queued" plus a "Cancel" button → `actions.cancelQueued(id)`; true →
+  the bubble disappears (the `message_cancelled` event does the same in other tabs); false → toast "This message
+  already started". The Stop button gains a menu (secondary click, long press, or a small chevron): "Stop" and "Stop
+  and clear the queue" (`actions.interrupt({cancelQueued: true})`), the latter shown only while a message is queued.
+- Side question (`side-question.js`): the palette's GUI command `/btw` and typed text that starts with `/btw ` (only
+  when the runtime's command list has no `btw`) open an overlay above the composer with the question, a spinner, then
+  the answer as Markdown, a "Copy" button and "Close"; nothing enters the transcript; errors show inline. Only one at
+  a time.
+- New-session dialog: "Permission mode" defaults to "Follow Claude Code settings" (`permissionMode` omitted); an
+  "Advanced" disclosure holds Agent (select from the capabilities' `agents`, default none; free text when no list is
+  known), Additional directories (folder pickers inside the roots, removable chips), Fallback model (select from the
+  model list or none) and, when `meta.features.browserTools` and the profile is `full`, "Browser tools" (checkbox).
+- Header: shows the agent as a small chip next to the title when `LiveInfo.agent` is set.
+- `@` suggestions pass `session=<id>` so the runtime's own index answers.
+- Palette GUI commands (run only when picked, or `/btw` as above): `/model`, `/permissions` (Runtime panel →
+  Permission rules), `/effort`, `/fast`, `/rewind`, `/fork`, `/rename`, `/mcp`, `/terminal`, `/status`, `/hooks`,
+  `/memory`, `/usage` (Runtime panel → Usage; typing `/usage` still sends the runtime's own command), `/export`, `/btw`,
+  `/login` (Settings → Account), `/add-dir` (Session panel → Directories), `/devtools` (Developer console). When the
+  runtime offers a command with the same name, the palette lists both and marks the GUI one "Panel".
+
+### Shell owner (panels, sidebar, account, developer console)
+
+- Runtime panel (`openPanel('runtime', {tab})`, `runtime-panels.js`): tabs for the views `GET /runtime` lists —
+  Status (sections as label/value rows), Permission rules (table: behavior badge, rule in monospace, source,
+  description; note "Edit rules with /permissions in the terminal tab"), Hooks (events with counts, then hooks with
+  matcher, type, command text in monospace, source label; disabled rows muted), Memory (each file: label, path,
+  exists; editable ones open in a monospace textarea with Save → `PUT /memory`, then "Restart the session to apply"
+  → `actions.restartSession()`), Usage (session cost, durations, lines changed; plan windows with utilization bars
+  and reset times when `rate_limits_available`, otherwise "Plan limits do not apply to this sign-in"), Skills, Sandbox,
+  Settings (profile `full`: effective settings as formatted JSON, then each source), Claude in Chrome (when
+  `meta.features.chrome`). Every tab has Refresh, shows "Updated {time}", handles 409 with "Open the session" →
+  `POST /open`, 501 with "Not offered by this Claude Code version — use the terminal tab", other errors inline.
+  Values from the runtime are text, never HTML.
+- Developer console (`openPanel('developer')`, `devtools.js`): a view picker over `GET /runtime/:view` showing the raw
+  JSON (pretty-printed, copy button), and an event log of every SSE event this page received for the current
+  session (`sdk` messages and gateway events): at most 200 entries and 1 MiB; an entry over 128 KiB is replaced by
+  `{type, subtype, bytes}`; filter by type; Clear; cleared on reload. The log starts when the page loads, not when the
+  panel opens.
+- Quick switcher (`quick-switcher.js`, ⌘K / Ctrl+K anywhere, or the sidebar's search button): one list for sessions
+  (title, project, relative time; fuzzy match on title and project), panels and GUI commands; ↑/↓/Enter/Esc; typing
+  then "Search message text" runs `GET /api/sessions/search` and lists matches with snippets.
+- Sidebar search: the filter box filters titles locally as before; when the query has 2+ characters a "Search all
+  conversations" row runs the deep search and shows results with snippets (matches highlighted with `<mark>` built by
+  DOM, never HTML strings).
+- Session panel: Directories (list of `LiveInfo.additionalDirectories`, add with the folder picker, remove; applying
+  restarts the session, confirm first when background tasks run), Agent (select; applies live), Fallback model
+  (applies after restart; shows "Restart to apply" button), Browser tools (toggle; `full` profile and
+  `meta.features.browserTools`), Export conversation (`actions.exportConversation()`).
+- Tasks panel: each shell/Monitor task row gets "Show output" → `actions.showTaskOutput(taskId)`: a dialog with the
+  output in monospace (keeps the end in view), "Showing the last 8 KB" when truncated, Refresh, auto-refresh every 2 s
+  while the task runs.
+- Settings → Account (`account.js`): signed-in account (email, organization, plan, API provider) or "Not signed in";
+  for profile `full`: "Sign in with Claude account" and "Sign in with Anthropic Console"; the flow shows step 1 "Open
+  the sign-in page" (link, opens a new tab, `rel="noopener noreferrer"`), step 2 a code field ("Paste the code shown
+  after signing in"), Submit, Cancel; success → toast "Signed in as {email}" and the note "Reopen sessions to use the
+  new sign-in". "Sign out" is not offered; the note points to `/logout` in the terminal tab.
+- Capabilities → MCP: a `needs-auth` server row gets "Authenticate": shows the auth link (new tab) and a field "Paste
+  the address of the page you land on" → `callback`; polls capabilities every 3 s for up to 5 minutes until the server
+  is `connected`; rows with credentials offer "Clear authentication"; each row has "Permission override" (Default /
+  Auto / None) with the hint that it only tightens bypass and auto modes.
+- `message_cancelled` and `account_changed` are forwarded to the timeline / store.
 - Never block the UI on a failed request: show a toast with the localized error and keep state consistent.
 - Branding: product name comes from `meta.appName`; do not use "Claude Code" as the product name and do not imitate
   Claude Code visual assets.

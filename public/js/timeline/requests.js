@@ -1,7 +1,8 @@
 /**
- * Pending request cards: permission prompts, AskUserQuestion questions, ExitPlanMode plans and MCP elicitations.
- * Answers are posted to /api/sessions/:id/requests/:requestId (docs/PROTOCOL.md). A card leaves the timeline when the
- * gateway reports request_resolved. Text goes through textContent and Markdown through renderMarkdown().
+ * Pending request cards: permission prompts, AskUserQuestion questions, ExitPlanMode plans, MCP elicitations and the
+ * refusal fallback dialog. Answers are posted to /api/sessions/:id/requests/:requestId (docs/PROTOCOL.md). A card leaves
+ * the timeline when the gateway reports request_resolved. Text goes through textContent and Markdown through
+ * renderMarkdown().
  */
 import { h, clear, icon } from '../dom.js';
 import { errorText } from '../api.js';
@@ -11,7 +12,7 @@ import { isDefaultChecked, describeSuggestion, checkedIndexes } from './suggesti
 import { displayPath, isRecord } from './tools/summaries.js';
 import { renderTool } from './tools/index.js';
 
-const KINDS = Object.freeze(['permission', 'question', 'plan', 'elicitation']);
+const KINDS = Object.freeze(['permission', 'question', 'plan', 'elicitation', 'dialog']);
 const PREVIEW_LIMIT = 4000;
 const TEXT_LIMIT = 2000;
 const SHORT_LIMIT = 500;
@@ -36,12 +37,15 @@ const GONE_CODES = new Set(['REQUEST_NOT_FOUND', 'SESSION_NOT_FOUND', 'SESSION_N
 const SKIP = Object.freeze({ skip: true });
 const INVALID = Object.freeze({ invalid: true });
 
-const KIND_ICONS = Object.freeze({ permission: 'shield', question: 'user', plan: 'list', elicitation: 'plug', unknown: 'alert' });
+const KIND_ICONS = Object.freeze({
+  permission: 'shield', question: 'user', plan: 'list', elicitation: 'plug', dialog: 'alert', unknown: 'alert',
+});
 const KIND_LABELS = Object.freeze({
   permission: 'cards.request.kind.permission',
   question: 'cards.request.kind.question',
   plan: 'cards.request.kind.plan',
   elicitation: 'cards.request.kind.elicitation',
+  dialog: 'cards.request.kind.dialog',
   unknown: 'cards.request.kind.unknown',
 });
 const PLAN_MODE_LABELS = Object.freeze({
@@ -62,7 +66,17 @@ let cardCounter = 0;
  *   profile: string | null,
  *   toast: (message: string, level?: string) => void,
  *   cwd: string | null,
+ *   prompt?: string,
+ *   insertPrompt?: (text: string) => void,
  * }} RequestContext
+ * @typedef {{
+ *   key: string,
+ *   kind: 'primary'|'secondary'|'deny'|'ghost',
+ *   label: string,
+ *   body: () => Record<string, unknown>,
+ *   after?: () => void,
+ *   enabled?: () => boolean,
+ * }} ShortcutOption
  * @typedef {{
  *   uid: string,
  *   kind: string,
@@ -75,7 +89,7 @@ let cardCounter = 0;
  *   actionsEl: HTMLElement,
  *   endpoint: string | null,
  *   controls: HTMLElement[],
- *   keys: Map<string, {body: () => Record<string, unknown>, enabled?: () => boolean}> | null,
+ *   keys: Map<string, ShortcutOption> | null,
  *   focusTarget: HTMLElement | null,
  *   gate?: () => void,
  * }} RequestView
@@ -167,6 +181,7 @@ const BUILDERS = {
   question: buildQuestion,
   plan: buildPlan,
   elicitation: buildElicitation,
+  dialog: buildDialog,
 };
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -205,46 +220,48 @@ function buildPermission(view, request) {
   // grants, other mode changes and deny or ask rules start unchecked.
   const always = suggestions.length > 0 && request.suppressAlwaysAllowRule !== true ? suggestionList(view, suggestions) : null;
   if (always) details.push(always.element);
-  details.push(h('label', { class: 'field request-deny-field' },
-    h('span', { class: 'field-label', text: t('cards.request.denyReason') }),
-    denyReason));
+  // The note to Claude is optional: it hides behind "Add a note" and goes with a denial.
+  details.push(h('details', { class: 'request-note' },
+    h('summary', { class: 'request-note-toggle', text: t('cards.request.addNote') }),
+    h('label', { class: 'field request-deny-field' },
+      h('span', { class: 'field-label', text: t('cards.request.denyReason') }),
+      denyReason)));
   view.bodyEl.append(...details);
   view.controls.push(denyReason);
 
-  /** @type {Array<{kind: 'primary'|'secondary', label: string, title: string|null, enabled?: () => boolean, body: () => Record<string, unknown>}>} */
+  /** @type {ShortcutOption[]} */
   const options = [{
+    key: '1',
     kind: 'primary',
     label: t('cards.request.allow'),
-    title: null,
     body: () => ({ decision: 'allow' }),
   }];
   if (always) {
     options.push({
+      key: '2',
       kind: 'secondary',
       label: t('cards.request.alwaysAllow'),
-      title: null,
       enabled: () => always.checked().length > 0,
       body: () => ({ decision: 'allow_always', suggestionIndexes: always.checked() }),
     });
   }
   options.push({
-    kind: 'secondary',
+    key: SHORTCUT_KEYS[options.length],
+    kind: 'deny',
     label: t('cards.request.deny'),
-    title: null,
     body: () => {
       const message = denyReason.value.trim().slice(0, TEXT_LIMIT);
       return message ? { decision: 'deny', message } : { decision: 'deny' };
     },
   });
 
-  const buttons = options.map((option, index) => actionButton(view, {
+  const buttons = options.map((option) => actionButton(view, {
     kind: option.kind,
     label: option.label,
-    title: option.title,
-    hint: h('kbd', { class: 'request-key', attrs: { 'aria-hidden': 'true' }, text: SHORTCUT_KEYS[index] }),
+    hint: h('kbd', { class: 'request-key', attrs: { 'aria-hidden': 'true' }, text: option.key }),
     onClick: () => submit(view, option.body()),
   }));
-  view.keys = new Map(options.slice(0, SHORTCUT_KEYS.length).map((option, index) => [SHORTCUT_KEYS[index], option]));
+  view.keys = new Map(options.map((option) => [option.key, option]));
   view.focusTarget = request.defaultToNo === true ? buttons[buttons.length - 1] : buttons[0];
   // The button needs one checked suggestion, and its tooltip names the checked ones. setState re-applies this rule.
   const alwaysButton = always ? buttons[1] : null;
@@ -523,22 +540,77 @@ function buildPlan(view, request) {
       h('span', { class: 'field-label', text: t('cards.request.plan.feedback') }),
       feedback));
   view.controls.push(modeSelect, feedback);
-  actionButton(view, {
+  /** @type {ShortcutOption[]} */
+  const options = [{
+    key: '1',
     kind: 'primary',
     label: t('cards.request.plan.approve'),
-    onClick: () => {
-      const nextMode = PLAN_MODES.includes(modeSelect.value) ? modeSelect.value : 'default';
-      submit(view, { decision: 'approve', nextMode });
-    },
-  });
-  actionButton(view, {
+    body: () => ({ decision: 'approve', nextMode: PLAN_MODES.includes(modeSelect.value) ? modeSelect.value : 'default' }),
+  }, {
+    key: '2',
     kind: 'secondary',
     label: t('cards.request.plan.reject'),
-    onClick: () => {
+    body: () => {
       const message = feedback.value.trim().slice(0, TEXT_LIMIT);
-      submit(view, message ? { decision: 'reject', message } : { decision: 'reject' });
+      return message ? { decision: 'reject', message } : { decision: 'reject' };
     },
-  });
+  }];
+  const buttons = options.map((option) => actionButton(view, {
+    kind: option.kind,
+    label: option.label,
+    hint: h('kbd', { class: 'request-key', attrs: { 'aria-hidden': 'true' }, text: option.key }),
+    onClick: () => submit(view, option.body()),
+  }));
+  view.keys = new Map(options.map((option) => [option.key, option]));
+  view.focusTarget = buttons[0];
+}
+
+/**
+ * The refusal fallback dialog: the runtime asks before it retries a refused answer on the fallback model. The
+ * answers are retry (1), edit the refused prompt (2, which puts it back into the composer) and cancel (3).
+ * @param {RequestView} view
+ * @param {Record<string, any>} request
+ */
+function buildDialog(view, request) {
+  const { t } = view.ctx;
+  const dialog = isRecord(request.dialog) ? request.dialog : {};
+  const original = textOf(dialog.originalModel) || t('cards.request.dialog.unknownModel');
+  const fallback = textOf(dialog.fallbackModel) || t('cards.request.dialog.unknownModel');
+  setTitle(view, t('cards.request.dialog.title', { model: original }));
+  const guidance = textOf(dialog.guidanceText);
+  view.bodyEl.append(h('p', {
+    class: 'request-text',
+    text: guidance || t('cards.request.dialog.guidance', { model: fallback }),
+  }));
+  const category = textOf(dialog.apiRefusalCategory);
+  if (category) view.bodyEl.append(keyValue(t('cards.request.dialog.category'), category));
+  const prompt = typeof view.ctx.prompt === 'string' ? view.ctx.prompt : '';
+  /** @type {ShortcutOption[]} */
+  const options = [{
+    key: '1',
+    kind: 'primary',
+    label: t('cards.request.dialog.retry', { model: fallback }),
+    body: () => ({ result: 'retry_fallback' }),
+  }, {
+    key: '2',
+    kind: 'secondary',
+    label: t('cards.request.dialog.edit'),
+    body: () => ({ result: 'edit_prompt' }),
+    after: () => view.ctx.insertPrompt?.(prompt),
+  }, {
+    key: '3',
+    kind: 'secondary',
+    label: t('cards.request.cancel'),
+    body: () => ({ result: 'cancelled' }),
+  }];
+  const buttons = options.map((option) => actionButton(view, {
+    kind: option.kind,
+    label: option.label,
+    hint: h('kbd', { class: 'request-key', attrs: { 'aria-hidden': 'true' }, text: option.key }),
+    onClick: () => submit(view, option.body(), option.after),
+  }));
+  view.keys = new Map(options.map((option) => [option.key, option]));
+  view.focusTarget = buttons[0];
 }
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -728,10 +800,12 @@ function buildUnsupported(view, request) {
 
 /**
  * Posts one answer. The card stays locked until the gateway reports request_resolved (or the request is gone).
+ * `after` runs once the gateway accepted the answer (the edit-prompt answer puts the refused prompt back).
  * @param {RequestView} view
  * @param {Record<string, unknown>} payload
+ * @param {() => void} [after]
  */
-async function submit(view, payload) {
+async function submit(view, payload, after) {
   const { t, api, toast } = view.ctx;
   if (!view.endpoint || view.card.dataset.state !== 'ready') return;
   setState(view, 'sending');
@@ -740,6 +814,7 @@ async function submit(view, payload) {
     await api.post(view.endpoint, payload);
     setState(view, 'sent');
     setStatus(view, t('cards.request.sent'), 'info');
+    if (after) after();
   } catch (error) {
     const gone = GONE_CODES.has(/** @type {any} */ (error)?.code);
     setState(view, gone ? 'stale' : 'ready');
@@ -750,10 +825,11 @@ async function submit(view, payload) {
 }
 
 /**
- * Number keys 1 to 3 answer the oldest pending permission prompt while focus is not in a field.
+ * Number keys 1 to 3 answer the oldest pending keyed card (permission, plan or dialog) while focus is not in a field.
  * @param {RequestView} view
  */
 function bindShortcuts(view) {
+  view.card.dataset.keyed = 'true';
   const onKey = (/** @type {KeyboardEvent} */ event) => {
     if (!view.card.isConnected) {
       document.removeEventListener('keydown', onKey);
@@ -763,9 +839,9 @@ function bindShortcuts(view) {
     const option = view.keys?.get(event.key);
     if (!option || view.card.dataset.state !== 'ready' || !keyboardIsFree(event.target)) return;
     if (option.enabled && !option.enabled()) return;
-    if (firstReadyPermission() !== view.card) return;
+    if (firstReadyKeyed() !== view.card) return;
     event.preventDefault();
-    submit(view, option.body());
+    submit(view, option.body(), option.after);
   };
   document.addEventListener('keydown', onKey);
 }
@@ -773,7 +849,7 @@ function bindShortcuts(view) {
 /** @param {RequestView} view */
 function focusIfIdle(view) {
   if (!view.card.isConnected || view.card.dataset.state !== 'ready' || !view.focusTarget) return;
-  if (!keyboardIsFree(null) || firstReadyPermission() !== view.card) return;
+  if (!keyboardIsFree(null) || firstReadyKeyed() !== view.card) return;
   view.focusTarget.focus({ preventScroll: true });
 }
 
@@ -790,14 +866,14 @@ function keyboardIsFree(target) {
   return active.closest('.tl-root') !== null;
 }
 
-/** @returns {Element|null} the oldest permission card that still accepts an answer */
-function firstReadyPermission() {
-  return document.querySelector('.request-card[data-kind="permission"][data-state="ready"]');
+/** @returns {Element|null} the oldest keyed card (permission, plan, dialog) that still accepts an answer */
+function firstReadyKeyed() {
+  return document.querySelector('.request-card[data-keyed="true"][data-state="ready"]');
 }
 
 /**
  * @param {RequestView} view
- * @param {{kind: 'primary'|'secondary'|'ghost'|'danger', label: string, onClick: () => void, hint?: HTMLElement|null, title?: string|null}} options
+ * @param {{kind: 'primary'|'secondary'|'deny'|'ghost', label: string, onClick: () => void, hint?: HTMLElement|null, title?: string|null}} options
  * @returns {HTMLButtonElement}
  */
 function actionButton(view, { kind, label, onClick, hint = null, title = null }) {

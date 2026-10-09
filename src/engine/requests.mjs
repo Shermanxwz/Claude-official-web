@@ -5,9 +5,11 @@
  * aborts the request, or the session closes. Bodies are validated per kind (docs/PROTOCOL.md) before they settle.
  */
 
-import { AppError } from '../contracts.mjs';
+import { AppError, DIALOG_KINDS, REFUSAL_DIALOG_RESULTS } from '../contracts.mjs';
 
 /** @typedef {import('../contracts.mjs').PendingRequest} PendingRequest */
+/** @typedef {import('../contracts.mjs').RefusalFallbackDialog} RefusalFallbackDialog */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').UserDialogResult} UserDialogResult */
 /** @typedef {import('../contracts.mjs').Publish} Publish */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').PermissionResult} PermissionResult */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').PermissionUpdate[]} PermissionUpdateList */
@@ -234,6 +236,19 @@ function normalizeContent(value) {
 }
 
 /**
+ * A refusal-fallback answer: one of the three results the runtime's dialog accepts.
+ * @param {Record<string, unknown>} body
+ * @returns {{body: RequestBody, outcome: ResolutionOutcome}}
+ */
+function normalizeDialog(body) {
+  assertKeys(body, ['result']);
+  if (!includes(REFUSAL_DIALOG_RESULTS, body.result)) {
+    throw new AppError(422, 'INVALID_ARGUMENT', 'result must be retry_fallback, edit_prompt or cancelled.');
+  }
+  return { body: { result: body.result }, outcome: 'answered' };
+}
+
+/**
  * @param {Record<string, unknown>} body
  * @returns {{body: RequestBody, outcome: ResolutionOutcome}}
  */
@@ -267,9 +282,20 @@ function normalizeRequestBody(request, body, allowBypass) {
       return normalizePlan(body);
     case 'elicitation':
       return normalizeElicitation(body);
+    case 'dialog':
+      return normalizeDialog(body);
     default:
       throw new TypeError(`Unknown request kind: ${String(request.kind)}`);
   }
+}
+
+/**
+ * @param {unknown} list
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function includes(list, value) {
+  return Array.isArray(list) && list.includes(value);
 }
 
 /**
@@ -486,6 +512,51 @@ export function toPermissionResult(request, outcome) {
     default:
       throw new TypeError(`Unknown request kind: ${String(request.kind)}`);
   }
+}
+
+/**
+ * Maps a settled refusal-fallback dialog to the SDK's onUserDialog answer. A cancelled dialog leaves the runtime's
+ * default in place.
+ * @param {RequestOutcome} outcome
+ * @returns {UserDialogResult}
+ */
+export function toDialogResult(outcome) {
+  if ('cancelled' in outcome) return { behavior: 'cancelled' };
+  return { behavior: 'completed', result: outcome.body.result };
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function textOrNull(value) {
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+/**
+ * The refusal-fallback dialog the gateway shows, copied from the runtime's payload: string fields as given, a missing
+ * optional string as null, the list of retracted message ids as strings only. A dialog without both model names, or
+ * of a kind the gateway does not render, is null and must be cancelled by the caller.
+ * @param {{dialogKind?: unknown, payload?: unknown}} request the runtime's request_user_dialog
+ * @returns {RefusalFallbackDialog|null}
+ */
+export function refusalDialogOf(request) {
+  if (!DIALOG_KINDS.includes(/** @type {'refusal_fallback_prompt'} */ (request?.dialogKind))) return null;
+  const payload = request.payload !== null && typeof request.payload === 'object'
+    ? /** @type {Record<string, unknown>} */ (request.payload)
+    : {};
+  const originalModel = textOrNull(payload.originalModel);
+  const fallbackModel = textOrNull(payload.fallbackModel);
+  if (originalModel === null || fallbackModel === null) return null;
+  const retracted = Array.isArray(payload.retractedMessageUuids) ? payload.retractedMessageUuids : [];
+  return {
+    dialogKind: 'refusal_fallback_prompt',
+    originalModel,
+    fallbackModel,
+    apiRefusalCategory: textOrNull(payload.apiRefusalCategory),
+    guidanceText: textOrNull(payload.guidanceText),
+    retractedMessageUuids: retracted.filter((uuid) => typeof uuid === 'string'),
+  };
 }
 
 /**

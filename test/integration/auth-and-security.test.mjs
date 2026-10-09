@@ -220,8 +220,9 @@ describe('auth and security', { timeout: 120000 }, () => {
       assert.equal(res.json.claudeCodeVersion, null, 'no session has been started on this gateway yet');
       assert.equal(res.json.profile, 'full');
       assert.deepEqual(res.json.roots, [fresh.root]);
-      assert.deepEqual(res.json.defaults, { model: null, permissionMode: 'default', effort: null });
-      assert.deepEqual(res.json.features, { terminal: false, bypass: false, uploads: true, backgroundTasks: true });
+      assert.deepEqual(res.json.defaults, { model: null, permissionMode: null, effort: null, fallbackModel: null });
+      assert.deepEqual(res.json.features, { terminal: false, bypass: false, uploads: true, backgroundTasks: true,
+        accountLogin: true, browserTools: false, chrome: false });
       assert.deepEqual(res.json.limits, { uploadMaxBytes: 26214400, imageMaxBytes: 5242880, maxLiveSessions: 4 });
       assert.equal(res.json.bootId, (await client(fresh.url).get('/api/session')).json.bootId);
     } finally {

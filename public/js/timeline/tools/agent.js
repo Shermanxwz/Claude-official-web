@@ -16,6 +16,7 @@ import {
   section,
   statusOf,
   toolShell,
+  verbOf,
 } from './shell.js';
 import { finiteNumber, firstLine, isRecord, resultText, str, summarizeTool, truncate } from './summaries.js';
 
@@ -43,12 +44,11 @@ export function render(card, ctx) {
   const background = backgroundAction(card, ctx);
   if (background) actions.push(background);
   return toolShell({
-    iconName: 'bot',
-    title: card.name,
+    title: verbOf(card.name, t),
     subtitle: truncate(firstLine(input.description) || subagent, SUBTITLE_MAX),
     status: statusOf(card),
     body: () => agentBody(card, input, structured, finalText, ctx),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions,
     extras,
     t,

@@ -138,6 +138,8 @@ export const store = createStore({
   pending: {},
   currentSessionId: null,
   capabilities: {},
+  /** GET /api/account, then account_changed: `{ account: AccountInfo | null, signInPending }`; null until loaded. */
+  account: null,
   terminal: {},
   tasks: {},
   prefs: { ...defaultPrefs(), ...loadPrefs() },

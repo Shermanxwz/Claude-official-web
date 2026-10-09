@@ -50,6 +50,7 @@ import {
   sessionCwd,
   sessionTitle,
 } from '../../public/js/ui/sidebar-model.js';
+import { accountFacts, validSignInCode } from '../../public/js/ui/account.js';
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -72,6 +73,10 @@ const OWNED_MODULES = [
   '../../public/js/ui/toasts.js',
   '../../public/js/ui/menu.js',
   '../../public/js/ui/panels.js',
+  '../../public/js/ui/runtime-panels.js',
+  '../../public/js/ui/devtools.js',
+  '../../public/js/ui/quick-switcher.js',
+  '../../public/js/ui/account.js',
 ];
 
 /** Every error code in docs/PROTOCOL.md, plus NETWORK for requests that never reached the gateway. */
@@ -393,10 +398,10 @@ describe('ApiError and event types', () => {
     assert.equal(error.retryAfter, 3);
   });
 
-  it('lists the eleven event types from docs/PROTOCOL.md, and the list is frozen', () => {
+  it('lists the thirteen event types from docs/PROTOCOL.md, and the list is frozen', () => {
     assert.deepEqual([...EVENT_TYPES].sort(), [
-      'heartbeat', 'hello', 'message_accepted', 'notice', 'request', 'request_resolved', 'resync', 'sdk',
-      'session_state', 'sessions_changed', 'terminal_state',
+      'account_changed', 'heartbeat', 'hello', 'message_accepted', 'message_cancelled', 'notice', 'request',
+      'request_resolved', 'resync', 'sdk', 'session_state', 'sessions_changed', 'terminal_state',
     ]);
     assert.equal(Object.isFrozen(EVENT_TYPES), true);
   });
@@ -455,6 +460,16 @@ describe('api client', () => {
   it('resolves null for an empty success body', async (ctx) => {
     stubFetch(ctx, () => new Response(null, { status: 204 }));
     assert.equal(await api.del('/api/sessions/s1'), null);
+  });
+
+  it('sends PUT with a JSON body, like the memory save route expects', async (ctx) => {
+    const calls = stubFetch(ctx, () => jsonResponse(200, { ok: true, bytes: 7 }));
+    assert.deepEqual(await api.put('/api/sessions/s1/memory', { path: '/w/CLAUDE.md', content: 'hi' }), {
+      ok: true, bytes: 7,
+    });
+    assert.equal(calls[0].init.method, 'PUT');
+    assert.equal(calls[0].init.body, '{"path":"/w/CLAUDE.md","content":"hi"}');
+    assert.equal(calls[0].init.headers['Content-Type'], 'application/json');
   });
 
   it('posts JSON bodies, and sends an empty object when no body is given', async (ctx) => {
@@ -833,6 +848,13 @@ describe('createStore', () => {
 });
 
 describe('preferences and the application store', () => {
+  it('starts with no account loaded, and keeps the account shape for the settings section', () => {
+    assert.equal(store.get().account, null);
+    const local = createStore({ account: null });
+    local.set({ account: { account: { email: 'a@example.com' }, signInPending: false } });
+    assert.deepEqual(local.get().account, { account: { email: 'a@example.com' }, signInPending: false });
+  });
+
   it('exposes the valid choices and the defaults', () => {
     assert.deepEqual([...THEMES], ['system', 'light', 'dark']);
     assert.deepEqual([...FONT_SIZES], ['sm', 'md', 'lg']);
@@ -1148,5 +1170,25 @@ describe('sidebar-model', () => {
       assert.equal(formatClock(Number.NaN), '');
       assert.equal(formatClock(0), '');
     });
+  });
+});
+
+describe('account section helpers', () => {
+  it('lists the signed-in account facts that have text, in a fixed order', () => {
+    assert.deepEqual(accountFacts({ email: 'a@example.com', organization: '', subscriptionType: 'Max', apiProvider: 'firstParty' }), [
+      { label: 'email', value: 'a@example.com' },
+      { label: 'subscription', value: 'Max' },
+      { label: 'provider', value: 'firstParty' },
+    ]);
+    assert.deepEqual(accountFacts(null), []);
+  });
+
+  it('accepts only a sign-in code with a non-empty part on each side of the #', () => {
+    assert.equal(validSignInCode(' mock-code#state-1 '), 'mock-code#state-1');
+    assert.equal(validSignInCode('no-separator'), null);
+    assert.equal(validSignInCode('#state-only'), null);
+    assert.equal(validSignInCode('code-only#'), null);
+    assert.equal(validSignInCode('a#b#c'), null);
+    assert.equal(validSignInCode(undefined), null);
   });
 });

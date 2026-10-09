@@ -40,9 +40,37 @@ export const EFFORT_LEVELS = /** @type {const} */ (['low', 'medium', 'high', 'xh
 export const ACCESS_PROFILES = /** @type {const} */ (['read', 'standard', 'full']);
 export const LIVE_STATES = /** @type {const} */ (['starting', 'idle', 'running', 'requires_action', 'closing',
   'error']);
-export const REQUEST_KINDS = /** @type {const} */ (['permission', 'question', 'plan', 'elicitation']);
+export const REQUEST_KINDS = /** @type {const} */ (['permission', 'question', 'plan', 'elicitation', 'dialog']);
 export const EVENT_TYPES = /** @type {const} */ (['hello', 'heartbeat', 'resync', 'sessions_changed',
-  'session_state', 'sdk', 'request', 'request_resolved', 'message_accepted', 'notice', 'terminal_state']);
+  'session_state', 'sdk', 'request', 'request_resolved', 'message_accepted', 'message_cancelled', 'account_changed',
+  'notice', 'terminal_state']);
+/** Dialog kinds of the runtime's request_user_dialog that the gateway renders (declared as supportedDialogKinds). */
+export const DIALOG_KINDS = /** @type {const} */ (['refusal_fallback_prompt']);
+/** Answers of a refusal_fallback_prompt dialog. */
+export const REFUSAL_DIALOG_RESULTS = /** @type {const} */ (['retry_fallback', 'edit_prompt', 'cancelled']);
+
+/**
+ * Read-only runtime views (docs/PROTOCOL.md "Runtime views"): name → method of the live SDK query, the access
+ * profile a client needs, and the control timeout. A view is offered only when the query has the method.
+ * @type {Readonly<Record<string, {method: string, profile: 'read'|'standard'|'full', timeoutMs: number}>>}
+ */
+export const RUNTIME_VIEWS = Object.freeze({
+  status: Object.freeze({ method: 'getStatus', profile: 'standard', timeoutMs: 10000 }),
+  permissions: Object.freeze({ method: 'listPermissionRules', profile: 'read', timeoutMs: 10000 }),
+  hooks: Object.freeze({ method: 'getHooksListing', profile: 'standard', timeoutMs: 10000 }),
+  settings: Object.freeze({ method: 'getSettings', profile: 'full', timeoutMs: 10000 }),
+  skills: Object.freeze({ method: 'getSkillsDialog', profile: 'read', timeoutMs: 10000 }),
+  sandbox: Object.freeze({ method: 'getSandboxDialog', profile: 'read', timeoutMs: 10000 }),
+  plan: Object.freeze({ method: 'getPlan', profile: 'read', timeoutMs: 10000 }),
+  usage: Object.freeze({ method: 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET', profile: 'read',
+    timeoutMs: 15000 }),
+  account: Object.freeze({ method: 'accountInfo', profile: 'read', timeoutMs: 10000 }),
+  init: Object.freeze({ method: 'initializationResult', profile: 'standard', timeoutMs: 10000 }),
+  mcp: Object.freeze({ method: 'mcpServerStatus', profile: 'read', timeoutMs: 10000 }),
+  chrome: Object.freeze({ method: 'getChromeDialog', profile: 'read', timeoutMs: 10000 }),
+});
+/** Name of the operator's browser MCP server when a session attaches it (docs/PROTOCOL.md "Browser tools"). */
+export const BROWSER_MCP_SERVER = 'browser';
 /** Event types delivered only to clients watching the event's session. */
 export const SESSION_SCOPED_EVENTS = /** @type {const} */ (['sdk']);
 export const UPLOAD_DIR_NAME = '.caw-uploads';
@@ -51,7 +79,8 @@ export const SESSION_COOKIE = 'caw_session';
 /**
  * @typedef {'read'|'standard'|'full'} AccessProfile
  * @typedef {'starting'|'idle'|'running'|'requires_action'|'closing'|'error'} LiveState
- * @typedef {'permission'|'question'|'plan'|'elicitation'} RequestKind
+ * @typedef {'permission'|'question'|'plan'|'elicitation'|'dialog'} RequestKind
+ * @typedef {'accepted'|'already'|'failed'|'skipped'} RuntimeTrust
  */
 
 /**
@@ -70,9 +99,12 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {string} stateDir
  * @property {'sdk'|'mock'} engine
  * @property {string|null} claudeBin        pathToClaudeCodeExecutable override
- * @property {{model: string|null, permissionMode: PermissionMode, effort: EffortLevel|null}} defaults
+ * @property {{model: string|null, permissionMode: PermissionMode|null, effort: EffortLevel|null,
+ *   fallbackModel: string|null}} defaults   permissionMode null (default) = Claude Code's settings decide
  * @property {boolean} terminal
  * @property {boolean} allowBypass
+ * @property {boolean} chrome               CAW_CHROME=1: queries start with the CLI's --chrome flag
+ * @property {string[]|null} browserMcpCommand   CAW_BROWSER_MCP_COMMAND (command + args), null when unset
  * @property {boolean} backgroundTasksDisabled   CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is set (non-empty, not 0/false)
  *   in the environment the gateway was started with, which the runtime inherits
  * @property {number} idleTimeoutMs
@@ -91,9 +123,13 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {string} cwd
  * @property {LiveState} state
  * @property {string|null} model
- * @property {PermissionMode} permissionMode
+ * @property {PermissionMode|null} permissionMode   null until system/init reports the mode the runtime started in
  * @property {EffortLevel|null} effort
  * @property {string|null} title
+ * @property {string|null} agent            main-thread agent the query runs as (option `agent`)
+ * @property {string[]} additionalDirectories   extra working directories the query started with
+ * @property {string|null} fallbackModel    fallback model the query started with
+ * @property {boolean} browserTools         the operator's browser MCP server is attached
  * @property {'terminal'|null} lockedBy
  * @property {number} pendingCount
  * @property {number} lastActivity
@@ -126,6 +162,18 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {boolean} [defaultToNo]
  * @property {{name: string, source: string}} [mcpServer]
  * @property {ElicitationRequest} [elicitation]
+ * @property {RefusalFallbackDialog} [dialog]   kind 'dialog' only
+ */
+
+/**
+ * The runtime's request_user_dialog of kind 'refusal_fallback_prompt', copied as plain strings.
+ * @typedef {Object} RefusalFallbackDialog
+ * @property {'refusal_fallback_prompt'} dialogKind
+ * @property {string} originalModel
+ * @property {string} fallbackModel
+ * @property {string|null} apiRefusalCategory
+ * @property {string|null} guidanceText
+ * @property {string[]} retractedMessageUuids
  */
 
 /** @typedef {SDKSessionInfo & {live: LiveInfo|null}} SessionSummary */
@@ -204,9 +252,45 @@ export const SESSION_COOKIE = 'caw_session';
 /**
  * @typedef {Object} SessionSettings
  * @property {string|null} [model]
- * @property {PermissionMode} [permissionMode]
+ * @property {PermissionMode|null} [permissionMode]   null = not passed; Claude Code's settings decide
  * @property {EffortLevel|null} [effort]
  * @property {boolean|null} [fastMode]
+ * @property {string|null} [agent]
+ * @property {string[]} [additionalDirectories]
+ * @property {string|null} [fallbackModel]
+ * @property {boolean} [browserTools]
+ */
+
+/**
+ * @typedef {Object} MemoryFile
+ * @property {string} kind
+ * @property {string} path
+ * @property {string} label
+ * @property {string} description
+ * @property {boolean} exists
+ * @property {string|null} content
+ * @property {boolean} truncated
+ * @property {boolean} editable
+ */
+
+/**
+ * @typedef {Object} SessionSearchResult
+ * @property {string} sessionId
+ * @property {string|null} cwd
+ * @property {string|null} title
+ * @property {number} lastModified
+ * @property {'title'|'content'} matchedIn
+ * @property {string[]} snippets
+ */
+
+/**
+ * Claude Code's own sign-in, run by the runtime (src/engine/account.mjs).
+ * @typedef {Object} AccountApi
+ * @property {() => Promise<{account: AccountInfo|null, signInPending: boolean}>} status
+ * @property {(method: 'claudeai'|'console') => Promise<{manualUrl: string, automaticUrl: string|null}>} startLogin
+ * @property {(code: string) => Promise<{account: AccountInfo}>} completeLogin
+ * @property {() => Promise<void>} cancelLogin
+ * @property {() => Promise<void>} close   ends the account query (shutdown)
  */
 
 /**
@@ -222,13 +306,34 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {(sessionId: string) => Promise<void>} closeSession
  * @property {(sessionId: string, msg: {clientMessageId: string, text: string,
  *   images?: Array<{mediaType: string, data: string}>}) => Promise<{accepted: true, duplicate: boolean}>} sendMessage
- * @property {(sessionId: string) => Promise<void>} interrupt
- * @property {(sessionId: string, settings: SessionSettings) => Promise<LiveInfo|null>} updateSettings
+ * @property {(sessionId: string, opts?: {cancelQueued?: boolean}) =>
+ *   Promise<{stillQueued: string[], cancelled: string[]}>} interrupt
+ * @property {(sessionId: string, clientMessageId: string) => Promise<{cancelled: boolean}>} cancelQueued
+ * @property {(sessionId: string, settings: SessionSettings) =>
+ *   Promise<{live: LiveInfo|null, restartRequired: boolean}>} updateSettings
  * @property {(sessionId: string, requestId: string, body: Record<string, unknown>) => Promise<void>} respond
- * @property {(sessionId: string) => Promise<ContextUsage>} getContextUsage
+ * @property {(sessionId: string, detail?: 'summary'|'full') => Promise<ContextUsage>} getContextUsage
  * @property {(sessionId: string) => Promise<Capabilities>} getCapabilities
- * @property {(sessionId: string, server: string, action: {action: 'toggle'|'reconnect', enabled?: boolean}) =>
- *   Promise<McpServerStatus[]>} mcpAction
+ * @property {(sessionId: string, server: string, action: {action: 'toggle'|'reconnect'|'permission-mode',
+ *   enabled?: boolean, mode?: 'default'|'auto'|null}) => Promise<{mcpServers: McpServerStatus[], warning?: string}>}
+ *   mcpAction
+ * @property {(sessionId: string, server: string, action: {action: 'start'|'callback'|'clear', callbackUrl?: string}) =>
+ *   Promise<Record<string, unknown>>} mcpAuth
+ * @property {(sessionId: string) => Promise<{views: string[]}>} runtimeViews
+ * @property {(sessionId: string, view: string) => Promise<{view: string, data: unknown, fetchedAt: number}>} runtimeView
+ *   the caller (app.mjs) checks RUNTIME_VIEWS[view].profile first
+ * @property {(sessionId: string) => Promise<{files: MemoryFile[], folders: unknown[], autoMemory: unknown,
+ *   autoDream: unknown}>} getMemory
+ * @property {(sessionId: string, path: string, content: string) => Promise<{bytes: number}>} writeMemory
+ * @property {(sessionId: string) => Promise<{text: string, filename: string}>} exportConversation
+ * @property {(sessionId: string, taskId: string) => Promise<{output: string, totalBytes: number, truncated: boolean}>}
+ *   taskOutput
+ * @property {(sessionId: string, question: string) => Promise<{response: string|null, synthetic: boolean,
+ *   refusalFallback: {originalModel: string, fallbackModel: string}|null}>} sideQuestion
+ * @property {(sessionId: string, cwd: string, query: string, limit: number) =>
+ *   Promise<Array<{path: string, type: 'file'|'dir'}>|null>} fileSuggestions
+ *   the runtime's @ index; null when it cannot answer (not live, other cwd, missing, failed, timed out or empty)
+ * @property {(dir: string) => Promise<RuntimeTrust>} recordRuntimeTrust   the runtime's own trust handshake
  * @property {(sessionId: string, what: 'plugins'|'skills'|'output-styles', opts?: {force?: boolean}) =>
  *   Promise<ReloadResult>} reload
  * @property {(sessionId: string, toolUseId?: string) => Promise<{backgrounded: boolean}>} backgroundTasks

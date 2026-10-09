@@ -23,6 +23,7 @@ import {
   resultImages,
   statusOf,
   toolShell,
+  verbOf,
 } from './shell.js';
 import { displayPath, finiteNumber, isRecord, resultText, str } from './summaries.js';
 
@@ -67,12 +68,11 @@ function renderRead(card, ctx) {
   const range = readRange(input);
   const filePath = str(input.file_path);
   return toolShell({
-    iconName: 'file',
-    title: 'Read',
+    title: verbOf('Read', t),
     subtitle: range ? `${path}:${range}` : path,
     status: statusOf(card),
     body: () => readBody(card, input, structured, t),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: filePath ? [copyButton({ text: filePath, t, label: t('tools.file.copyPath') })] : [],
     t,
     family: 'file',
@@ -171,8 +171,7 @@ function renderWrite(card, ctx) {
   const groups = patch.length > 0 ? [{ label: null, hunks: patch }] : [];
   const filePath = str(input.file_path);
   return toolShell({
-    iconName: 'file',
-    title: 'Write',
+    title: verbOf('Write', t),
     subtitle: displayPath(input.file_path, ctx.cwd),
     status: statusOf(card),
     body: (toolbar) => {
@@ -191,7 +190,7 @@ function renderWrite(card, ctx) {
       if (card.result?.isError) parts.push(errorBlock(resultText(card.result), t));
       return h('div', { class: 'tool-file' }, parts);
     },
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: filePath ? [copyButton({ text: filePath, t, label: t('tools.file.copyPath') })] : [],
     extras: diffStat(counts, t),
     t,
@@ -212,12 +211,11 @@ function renderEdit(card, ctx) {
   const counts = totalCounts(groups);
   const filePath = str(input.file_path);
   return toolShell({
-    iconName: 'edit',
-    title: card.name === 'MultiEdit' ? 'MultiEdit' : 'Edit',
+    title: verbOf(card.name === 'MultiEdit' ? 'MultiEdit' : 'Edit', t),
     subtitle: displayPath(input.file_path, ctx.cwd),
     status: statusOf(card),
     body: (toolbar) => editBody(card, input, structured, groups, t, toolbar),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: filePath ? [copyButton({ text: filePath, t, label: t('tools.file.copyPath') })] : [],
     extras: counts.added + counts.removed > 0 ? diffStat(counts, t) : [],
     t,
@@ -294,8 +292,7 @@ function renderNotebook(card, ctx) {
   const editMode = NOTEBOOK_MODES.has(requestedMode) ? requestedMode : 'replace';
   const notebookPath = str(input.notebook_path);
   return toolShell({
-    iconName: 'layers',
-    title: 'NotebookEdit',
+    title: verbOf('NotebookEdit', t),
     subtitle: displayPath(notebookPath, ctx.cwd),
     status: statusOf(card),
     body: (toolbar) => {
@@ -316,7 +313,7 @@ function renderNotebook(card, ctx) {
       }
       return h('div', { class: 'tool-file' }, parts);
     },
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: newSource ? [copyButton({ text: newSource, t, label: t('tools.notebook.copySource') })] : [],
     t,
     family: 'file',

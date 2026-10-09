@@ -4,20 +4,11 @@
 
 import { h } from '../../dom.js';
 import { formatDuration, stripAnsi } from '../format.js';
-import { backgroundAction, chip, codeBlock, copyButton, prettyJson, statusOf, toolShell } from './shell.js';
+import { backgroundAction, chip, codeBlock, copyButton, prettyJson, statusOf, toolShell, verbOf } from './shell.js';
 import { finiteNumber, firstLine, isRecord, resultText, str, truncate } from './summaries.js';
 
 const TAIL_LINES = 40;
 const SUBTITLE_MAX = 240;
-
-const ICONS = {
-  Bash: 'terminal',
-  BashOutput: 'terminal',
-  Monitor: 'monitor',
-  KillShell: 'stop',
-  KillBash: 'stop',
-  TaskStop: 'stop',
-};
 
 /**
  * @param {import('./index.js').ToolCard} card
@@ -37,12 +28,11 @@ export function render(card, ctx) {
   const background = card.name === 'Bash' ? backgroundAction(card, ctx) : null;
   if (background) actions.push(background);
   return toolShell({
-    iconName: ICONS[card.name] ?? 'terminal',
-    title: card.name,
+    title: verbOf(card.name, ctx.t),
     subtitle: subtitleOf(card.name, input, command),
     status: statusOf(card),
     body: () => buildBody(card, input, structured, command, { stdout, stderr }, ctx.t),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions,
     t: ctx.t,
     family: 'bash',

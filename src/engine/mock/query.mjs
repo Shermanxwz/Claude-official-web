@@ -11,8 +11,24 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { EFFORT_LEVELS, isUuid, PERMISSION_MODES } from '../../contracts.mjs';
+import {
+  builtInServers,
+  dialogResultOf,
+  dynamicServerOf,
+  FILE_INDEX_WARMUP_MS,
+  hasPlanLimitsOf,
+  loginMethodOf,
+  mcpAuthorizationOf,
+  parseAddress,
+  serverEntry,
+  serverStatusOf,
+  sideAnswerOf,
+  startModeOf,
+  taskOutputOf,
+} from './answers.mjs';
 import {
   activeGoal,
   autocompactState,
@@ -37,7 +53,22 @@ import {
   toolResult,
   usageOf,
 } from './scenarios.mjs';
-import { newRecord, sliceRecord } from './store.mjs';
+import { createMemoryStore, newRecord, sliceRecord } from './store.mjs';
+import { createRuntimeState } from './runtime.mjs';
+import {
+  chromeDialogOf,
+  exportFilenameOf,
+  exportTextOf,
+  fileSuggestionsOf,
+  hooksListingOf,
+  memoryDialogOf,
+  permissionRulesOf,
+  readDeniedBy,
+  sandboxDialogOf,
+  settingsOf,
+  skillsDialogOf,
+  statusOf,
+} from './views.mjs';
 
 /** @typedef {import('../../contracts.mjs').SDKMessage} SDKMessage */
 /** @typedef {import('../../contracts.mjs').SDKUserMessage} SDKUserMessage */
@@ -49,8 +80,11 @@ import { newRecord, sliceRecord } from './store.mjs';
 /** @typedef {import('../../contracts.mjs').ElicitationResult} ElicitationResult */
 /** @typedef {import('../../contracts.mjs').Logger} Logger */
 /** @typedef {import('../../contracts.mjs').SDKSessionInfo} SDKSessionInfo */
-/** @typedef {import('./store.mjs').MockStore} MockStore */
+/** @typedef {import('./store.mjs').RecordStore} RecordStore */
 /** @typedef {import('./store.mjs').MockSessionRecord} MockSessionRecord */
+/** @typedef {import('./runtime.mjs').RuntimeState} RuntimeState */
+/** @typedef {import('./answers.mjs').McpEntry} McpEntry */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').OnUserDialog} OnUserDialog */
 /** @typedef {import('./store.mjs').MockEntry} MockEntry */
 /** @typedef {import('./scenarios.mjs').SessionView} SessionView */
 /** @typedef {import('./scenarios.mjs').TurnContext} TurnContext */
@@ -71,11 +105,6 @@ import { newRecord, sliceRecord } from './store.mjs';
  *   webSearch: number, webFetch: number, topLevel: boolean}} ResponseUsage
  */
 
-/**
- * One configured MCP server as the mock tracks it.
- * @typedef {{status: 'connected'|'failed'|'needs-auth'|'pending'|'disabled', error?: string,
- *   enabled: boolean}} McpEntry
- */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').NonNullableUsage} NonNullableUsage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').ModelUsage} ModelUsage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKControlInterruptResponse} SDKControlInterruptResponse */
@@ -240,6 +269,34 @@ class InputQueue {
     return this.items.splice(0);
   }
 
+  /**
+   * The uuids of the prompts that wait behind the running turn, in order.
+   * @returns {string[]}
+   */
+  waiting() {
+    return this.items.map((prompt) => prompt.uuid);
+  }
+
+  /**
+   * Removes one waiting prompt. False when no waiting prompt has that uuid: it is running already, or it is unknown.
+   * @param {string} uuid
+   * @returns {boolean}
+   */
+  remove(uuid) {
+    const index = this.items.findIndex((prompt) => prompt.uuid === uuid);
+    if (index < 0) return false;
+    this.items.splice(index, 1);
+    return true;
+  }
+
+  /**
+   * Removes every waiting prompt and returns their uuids.
+   * @returns {string[]}
+   */
+  cancelAll() {
+    return this.items.splice(0).map((prompt) => prompt.uuid);
+  }
+
   /** @returns {Promise<IteratorResult<LinkedPrompt, void>>} */
   take() {
     if (this.failure !== undefined) return Promise.reject(this.failure);
@@ -303,12 +360,13 @@ async function* singlePrompt(text) {
  */
 
 /**
- * A foreground task as the session keeps it: the scenario's handle plus the resolver a backgroundTasks call uses.
- * @typedef {ForegroundTask & {resolve: (task: {taskId: string}) => void}} ForegroundEntry
+ * A foreground task as the session keeps it: the scenario's handle, the resolver a backgroundTasks call uses and the
+ * output the command writes once it completes in the background.
+ * @typedef {ForegroundTask & {resolve: (task: {taskId: string}) => void, output: string}} ForegroundEntry
  */
 /**
  * A task running in the background. Its completion is scheduled on `timer`, which ends early when the task is stopped.
- * @typedef {{taskId: string, toolUseId: string, description: string, startedAt: number,
+ * @typedef {{taskId: string, toolUseId: string, description: string, output: string, startedAt: number,
  *   timer: ReturnType<typeof setTimeout>}} BackgroundTask
  */
 
@@ -317,12 +375,14 @@ async function* singlePrompt(text) {
  * @typedef {Object} SessionCore
  * @property {string} sessionId
  * @property {string} cwd
+ * @property {string} home the HOME the query runs with (the user's ~/.claude is read under it)
  * @property {string} model
  * @property {PermissionMode} permissionMode
  * @property {EffortLevel|null} effort
  * @property {string} outputStyle
  * @property {number} delayMs
- * @property {MockStore} store
+ * @property {RecordStore} store
+ * @property {RuntimeState} runtime                 the trust record, account and sign-in the queries share
  * @property {Logger|undefined} log
  * @property {AbortController} sessionAbort         ends the query
  * @property {AbortController|null} turnAbort       interrupts the running turn
@@ -334,8 +394,15 @@ async function* singlePrompt(text) {
  * @property {number} turnIndex                     completed turns
  * @property {Record<string, ModelUsage>} modelUsage  cumulative per model, as the result reports it
  * @property {number} fiveHourUtilization           percent of the five-hour window, from rate_limit_event
- * @property {Map<string, McpEntry>} mcp
- * @property {Set<string>} dynamicServers           servers set through setMcpServers
+ * @property {Map<string, McpEntry>} mcp            every configured server, by name
+ * @property {Map<string, {state: string}>} mcpFlows  sign-ins in progress, by server name
+ * @property {string|null} agent                    the main-thread agent (option agent, or applyFlagSettings)
+ * @property {string[]} additionalDirectories       extra working directories (option additionalDirectories)
+ * @property {string|null} fallbackModel            the model a refused answer is retried on (option fallbackModel)
+ * @property {string[]} dialogKinds                 dialog kinds the host renders (option supportedDialogKinds)
+ * @property {boolean} chrome                       the query starts with the CLI's --chrome flag
+ * @property {number} fileIndexReadyAt              time (ms) from which the @ index answers
+ * @property {Map<string, string>} shellOutputs     output of every shell task that ran in the background, by task id
  * @property {Map<string, {toolUseId: string, stopped: boolean}>} tasks
  * @property {Set<string>} stoppedToolUseIds        tool_use ids whose task was stopped
  * @property {string[]} userMessageUuids            prompts the turn in progress answers; empty between turns
@@ -449,7 +516,8 @@ export function validateOptions(options) {
   if (sessionId !== undefined && (resume !== undefined || continueLatest === true) && forkSession !== true) {
     throw new TypeError('sessionId combined with resume or continue needs forkSession.');
   }
-  if (permissionMode !== undefined && !PERMISSION_MODES.some((mode) => mode === permissionMode)) {
+  if (permissionMode !== undefined && permissionMode !== null &&
+    !PERMISSION_MODES.some((mode) => mode === permissionMode)) {
     throw new TypeError(`Unknown permission mode: ${String(permissionMode)}`);
   }
   if (effort !== undefined && effort !== null && !EFFORT_LEVELS.some((level) => level === effort)) {
@@ -476,6 +544,42 @@ export function validateOptions(options) {
     || settingSources.some((source) => !SETTING_SOURCES.some((known) => known === source)))) {
     throw new TypeError(`settingSources must only list ${SETTING_SOURCES.join(', ')}.`);
   }
+  validateRuntimeOptions(options);
+}
+
+/**
+ * Rejects the options that shape the runtime answers: the dialog kinds (which need their callback), the agent, the
+ * extra directories, the fallback model, the MCP servers and the persistence flag.
+ * @param {SdkOptions} options
+ * @returns {void}
+ */
+function validateRuntimeOptions(options) {
+  const { supportedDialogKinds, onUserDialog, persistSession, agent, additionalDirectories, fallbackModel, mcpServers,
+    allowDangerouslySkipPermissions } = options;
+  if (supportedDialogKinds !== undefined && (!Array.isArray(supportedDialogKinds)
+    || supportedDialogKinds.some((kind) => typeof kind !== 'string'))) {
+    throw new TypeError('supportedDialogKinds must be a list of strings.');
+  }
+  if (Array.isArray(supportedDialogKinds) && supportedDialogKinds.length > 0 && typeof onUserDialog !== 'function') {
+    throw new TypeError('supportedDialogKinds requires onUserDialog.');
+  }
+  if (persistSession !== undefined && typeof persistSession !== 'boolean') {
+    throw new TypeError('persistSession must be a boolean.');
+  }
+  if (agent !== undefined && (typeof agent !== 'string' || agent.trim() === '')) {
+    throw new TypeError('agent must be a non-empty string.');
+  }
+  if (additionalDirectories !== undefined && (!Array.isArray(additionalDirectories)
+    || additionalDirectories.some((dir) => typeof dir !== 'string' || !isAbsolute(dir)))) {
+    throw new TypeError('additionalDirectories must be a list of absolute paths.');
+  }
+  if (fallbackModel !== undefined && (typeof fallbackModel !== 'string' || fallbackModel.trim() === '')) {
+    throw new TypeError('fallbackModel must be a non-empty string.');
+  }
+  if (mcpServers !== undefined && !isObject(mcpServers)) throw new TypeError('mcpServers must be an object.');
+  if (allowDangerouslySkipPermissions !== undefined && typeof allowDangerouslySkipPermissions !== 'boolean') {
+    throw new TypeError('allowDangerouslySkipPermissions must be a boolean.');
+  }
 }
 
 /**
@@ -485,7 +589,7 @@ export function validateOptions(options) {
  * - continue: the most recent record of cwd.
  * - forkSession: a new record copied from the source, cut at resumeSessionAt; the source is not changed.
  * - resumeSessionAt without a fork: the stored record is cut at that message, so later turns continue from there.
- * @param {{store: MockStore, options: SdkOptions, cwd: string, now: number}} args
+ * @param {{store: RecordStore, options: SdkOptions, cwd: string, now: number}} args
  * @returns {MockSessionRecord}
  */
 export function openRecord({ store, options, cwd, now }) {
@@ -555,23 +659,49 @@ function thinkingDisplayOf(extraArgs) {
 }
 
 /**
+ * The servers a session starts with: the built-in ones, then the servers the mcpServers option names.
+ * @param {Record<string, unknown>|undefined} mcpServers
+ * @returns {Map<string, McpEntry>}
+ */
+function configuredServersOf(mcpServers) {
+  const servers = builtInServers();
+  for (const [name, config] of Object.entries(mcpServers ?? {})) servers.set(name, dynamicServerOf(name, config));
+  return servers;
+}
+
+/**
+ * The status of a configured server by name: undefined when no server has that name.
+ * @param {SessionCore} core
+ * @param {string} serverName
+ * @returns {string|undefined}
+ */
+export function statusNamed(core, serverName) {
+  const server = core.mcp.get(serverName);
+  return server === undefined ? undefined : serverStatusOf(server).status;
+}
+
+/**
  * Builds the shared state of one session from its stored record.
- * @param {{record: MockSessionRecord, options: SdkOptions, store: MockStore, delayMs: number, log: Logger|undefined,
- *   fileSettings: Record<string, unknown>, backgroundDisabled: boolean, backgroundTiming: BackgroundTiming}} args
+ * @param {{record: MockSessionRecord, options: SdkOptions, store: RecordStore, delayMs: number, log: Logger|undefined,
+ *   fileSettings: Record<string, unknown>, backgroundDisabled: boolean, backgroundTiming: BackgroundTiming,
+ *   runtime: RuntimeState}} args
  * @returns {SessionCore}
  */
 export function createCore({
-  record, options, store, delayMs, log, fileSettings, backgroundDisabled, backgroundTiming,
+  record, options, store, delayMs, log, fileSettings, backgroundDisabled, backgroundTiming, runtime,
 }) {
   const { uuid: uuidSequence = 0, ...counters } = record.counters;
   const settingSources = Array.isArray(options.settingSources) ? [...options.settingSources] : [...SETTING_SOURCES];
+  const loaded = settingSources.length > 0 ? { ...fileSettings } : {};
+  const flagLayer = isObject(options.settings) ? options.settings : {};
   let pending = signalPair();
   /** @type {SessionCore} */
   const core = {
     sessionId: record.sessionId,
     cwd: record.cwd,
+    home: typeof options.env?.HOME === 'string' && options.env.HOME !== '' ? options.env.HOME : homedir(),
     model: typeof options.model === 'string' ? options.model : MODEL_DEFAULT,
-    permissionMode: options.permissionMode ?? 'default',
+    permissionMode: startModeOf(options.permissionMode, { ...loaded, ...flagLayer }),
     effort: options.effort ?? null,
     outputStyle: 'default',
     delayMs,
@@ -591,16 +721,21 @@ export function createCore({
     turnIndex: countPrompts(record),
     modelUsage: {},
     fiveHourUtilization: 0,
-    dynamicServers: new Set(),
-    mcp: new Map([
-      ['github', { status: 'connected', enabled: true }],
-      ['filesystem', { status: 'failed', enabled: true, error: 'spawn npx ENOENT' }],
-    ]),
+    runtime,
+    mcp: configuredServersOf(options.mcpServers),
+    mcpFlows: new Map(),
+    agent: typeof options.agent === 'string' ? options.agent : null,
+    additionalDirectories: Array.isArray(options.additionalDirectories) ? [...options.additionalDirectories] : [],
+    fallbackModel: typeof options.fallbackModel === 'string' ? options.fallbackModel : null,
+    dialogKinds: Array.isArray(options.supportedDialogKinds) ? [...options.supportedDialogKinds] : [],
+    chrome: isObject(options.extraArgs) && Object.hasOwn(options.extraArgs, 'chrome'),
+    fileIndexReadyAt: Date.now() + FILE_INDEX_WARMUP_MS,
+    shellOutputs: new Map(),
     tasks: new Map(),
     stoppedToolUseIds: new Set(),
     userMessageUuids: [],
-    flagSettings: isObject(options.settings) ? { ...options.settings } : {},
-    fileSettings: settingSources.length > 0 ? { ...fileSettings } : {},
+    flagSettings: { ...flagLayer },
+    fileSettings: loaded,
     settingSources,
     perTaskStopAffordance: options.perTaskStopAffordance === true,
     thinkingDisplay: thinkingDisplayOf(options.extraArgs),
@@ -697,7 +832,22 @@ export class TurnObserver {
     this.stopReason = null;
     /** @type {string|null} uuid of the last top-level assistant message, which the turn summary names */
     this.lastAssistantUuid = null;
+    /** @type {string|null} uuid of the top-level message whose text is the turn's answer */
+    this.finalUuid = null;
     this.finalText = '';
+  }
+
+  /**
+   * Forgets the answer of messages that were retracted from the transcript: when the turn's answer is one of them, the
+   * turn ends without an answer. Their usage stays counted, because the model did produce them.
+   * @param {string[]} uuids
+   * @returns {void}
+   */
+  forget(uuids) {
+    if (this.finalUuid === null || !uuids.includes(this.finalUuid)) return;
+    this.finalUuid = null;
+    this.finalText = '';
+    this.stopReason = null;
   }
 
   /**
@@ -766,7 +916,10 @@ export class TurnObserver {
           agentId: message.agent_id ?? null,
         });
       }
-      if (topLevel && block.type === 'text') this.finalText = block.text;
+      if (topLevel && block.type === 'text') {
+        this.finalText = block.text;
+        this.finalUuid = message.uuid;
+      }
     }
     if (topLevel) {
       this.lastAssistantUuid = message.uuid;
@@ -811,6 +964,7 @@ function userBlocks(message) {
  * @property {AbortSignal} signal                             aborted by interrupt or when the session ends
  * @property {CanUseTool|undefined} canUseTool
  * @property {OnElicitation|undefined} onElicitation
+ * @property {OnUserDialog|undefined} onUserDialog            the host's dialog callback, when it renders dialogs
  * @property {SDKPermissionDenial[]} denials                  denied tool calls of this turn
  * @property {number} startedAt
  * @property {string} userMessageUuid                         uuid of the batch's last prompt, as the SDK reports it
@@ -856,7 +1010,7 @@ export function describeSessionOf(core) {
   const messageTokens = record ? messageTokensOf(record) : 0;
   const rows = [
     ...FIXED_CONTEXT_ROWS,
-    ...(core.mcp.get('github')?.status === 'connected' ? [{ name: 'MCP tools', tokens: GITHUB_TOOL_TOKENS }] : []),
+    ...(statusNamed(core, 'github') === 'connected' ? [{ name: 'MCP tools', tokens: GITHUB_TOOL_TOKENS }] : []),
     { name: 'Messages', tokens: messageTokens },
   ];
   const used = rows.reduce((sum, row) => sum + row.tokens, 0);
@@ -969,11 +1123,35 @@ export async function* elicitationOf(core, turn, request) {
 }
 
 /**
+ * Asks the host through onUserDialog and waits for its answer. The answer is the dialog's result: retry_fallback,
+ * edit_prompt or cancelled. Without a callback nothing is asked and the result is null.
+ * @param {SessionCore} core
+ * @param {TurnState} turn
+ * @param {{kind: string, payload: Record<string, unknown>, toolUseId?: string}} dialog
+ * @returns {AsyncGenerator<SDKMessage, 'retry_fallback'|'edit_prompt'|'cancelled'|null, unknown>}
+ */
+export async function* userDialogOf(core, turn, { kind, payload, toolUseId }) {
+  if (turn.onUserDialog === undefined) return null;
+  const onUserDialog = turn.onUserDialog;
+  const view = sessionView(core);
+  yield stateChanged(view, 'requires_action');
+  const requestId = randomUUID();
+  const answer = yield* waitFor(core, Promise.resolve().then(() => onUserDialog({
+    dialogKind: kind,
+    payload,
+    toolUseID: toolUseId,
+  }, { signal: turn.signal, requestId })), turn.signal);
+  yield stateChanged(view, 'running');
+  return dialogResultOf(answer);
+}
+
+/**
  * The context one scenario reads for one turn.
- * @param {{core: SessionCore, turn: TurnState, userText: string, streamPartials: boolean}} args
+ * @param {{core: SessionCore, turn: TurnState, userText: string, streamPartials: boolean,
+ *   observer: TurnObserver}} args
  * @returns {TurnContext}
  */
-export function turnContextOf({ core, turn, userText, streamPartials }) {
+export function turnContextOf({ core, turn, userText, streamPartials, observer }) {
   return {
     sessionId: core.sessionId,
     cwd: core.cwd,
@@ -994,11 +1172,18 @@ export function turnContextOf({ core, turn, userText, streamPartials }) {
     },
     askPermission: (toolName, input, detail) => askPermission(core, turn, toolName, input, detail),
     elicitation: (request) => elicitationOf(core, turn, request),
-    mcpConnected: (serverName) => core.mcp.get(serverName)?.status === 'connected',
+    mcpConnected: (serverName) => statusNamed(core, serverName) === 'connected',
     describeSession: () => describeSessionOf(core),
     thinkingSummaries: core.thinkingDisplay === 'summarized',
-    foregroundTask: (toolUseId, description) => foregroundTaskOf(core, toolUseId, description),
+    foregroundTask: (toolUseId, description, output) => foregroundTaskOf(core, toolUseId, description, output),
     awaitBackground: (task) => awaitBackgroundOf(core, turn, task),
+    dialogKinds: [...core.dialogKinds],
+    fallbackModel: core.fallbackModel,
+    userDialog: (dialog) => userDialogOf(core, turn, dialog),
+    retract: (uuids) => {
+      evictRetracted(core, uuids);
+      observer.forget(uuids);
+    },
   };
 }
 
@@ -1022,9 +1207,10 @@ function evictRetracted(core, uuids) {
  * @param {SessionCore} core
  * @param {string} toolUseId
  * @param {string} description
+ * @param {string} [output] what the command prints when it completes in the background
  * @returns {ForegroundEntry}
  */
-export function foregroundTaskOf(core, toolUseId, description) {
+export function foregroundTaskOf(core, toolUseId, description, output = '') {
   /** @type {(task: {taskId: string}) => void} */
   let resolve = () => {};
   /** @type {Promise<{taskId: string}>} */
@@ -1032,7 +1218,7 @@ export function foregroundTaskOf(core, toolUseId, description) {
     resolve = resolveMoved;
   });
   /** @type {ForegroundEntry} */
-  const entry = { toolUseId, description, moved, resolve };
+  const entry = { toolUseId, description, moved, resolve, output };
   core.foreground.set(toolUseId, entry);
   return entry;
 }
@@ -1061,19 +1247,21 @@ export async function* awaitBackgroundOf(core, turn, task) {
 }
 
 /**
- * Starts a task in the background. Its completion is scheduled, and the end of the session clears the schedule.
+ * Starts a shell task in the background. Its output is kept for get_task_output from the start. Its completion is
+ * scheduled, and the end of the session clears the schedule.
  * @param {SessionCore} core
- * @param {{taskId: string, toolUseId: string, description: string}} task
+ * @param {{taskId: string, toolUseId: string, description: string, output: string}} task
  * @returns {void}
  */
-function startBackground(core, { taskId, toolUseId, description }) {
+function startBackground(core, { taskId, toolUseId, description, output }) {
   const timer = setTimeout(() => {
     const notice = endBackground(core, taskId, 'completed', `Background command "${description}" completed`);
     if (notice === null) return;
     core.outbox.push(notice, backgroundTasksChanged(sessionView(core), backgroundListOf(core)));
     core.notify();
   }, core.backgroundTiming.runMs);
-  core.background.set(taskId, { taskId, toolUseId, description, startedAt: Date.now(), timer });
+  core.background.set(taskId, { taskId, toolUseId, description, output, startedAt: Date.now(), timer });
+  core.shellOutputs.set(taskId, '');
   core.sessionAbort.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
 }
 
@@ -1090,6 +1278,7 @@ function endBackground(core, taskId, status, summary) {
   if (task === undefined) return null;
   clearTimeout(task.timer);
   core.background.delete(taskId);
+  if (status === 'completed') core.shellOutputs.set(taskId, task.output);
   return taskNotification(sessionView(core), {
     taskId,
     toolUseId: task.toolUseId,
@@ -1199,7 +1388,7 @@ function reloadListsOf(core) {
  */
 function applyPluginReload(core) {
   for (const plugin of core.pendingPlugins) {
-    core.mcp.set(pluginServerOf(plugin), { status: 'connected', enabled: true });
+    core.mcp.set(pluginServerOf(plugin), serverEntry({ transport: 'stdio' }));
     core.appliedPlugins.add(plugin);
   }
   core.pendingPlugins.clear();
@@ -1220,6 +1409,7 @@ export function beginTurn(core, options, userMessageUuids) {
     signal: AbortSignal.any([core.sessionAbort.signal, controller.signal]),
     canUseTool: options.canUseTool,
     onElicitation: options.onElicitation,
+    onUserDialog: options.onUserDialog,
     denials: [],
     startedAt: Date.now(),
     userMessageUuid: userMessageUuids[userMessageUuids.length - 1],
@@ -1446,7 +1636,7 @@ export async function* runTurn(core, options, prompts, streamPartials) {
   const observer = new TurnObserver();
   const text = prompts.map((prompt) => promptText(prompt)).join('\n\n');
   const scenario = selectScenario(text);
-  const ctx = turnContextOf({ core, turn, userText: text, streamPartials });
+  const ctx = turnContextOf({ core, turn, userText: text, streamPartials, observer });
   /** @param {SDKMessage} message */
   const seen = (message) => {
     observer.see(message);
@@ -1630,7 +1820,7 @@ export function initMessage(core) {
     claude_code_version: CLAUDE_CODE_VERSION,
     cwd: core.cwd,
     tools: [...TOOL_NAMES],
-    mcp_servers: [...core.mcp].map(([name, server]) => ({ name, status: server.status })),
+    mcp_servers: [...core.mcp].map(([name, server]) => ({ name, status: serverStatusOf(server).status })),
     model: core.model,
     permissionMode: core.permissionMode,
     slash_commands: COMMANDS.map((command) => command.name),
@@ -1751,18 +1941,8 @@ export async function* sessionLoop(core, queue, options) {
   }
 }
 
-/** The mock MCP servers: github connects, filesystem always fails, as a misconfigured server would. */
-const MCP_CONNECTABLE = new Map([['github', true], ['filesystem', false]]);
+/** The HTML a mock MCP resource answers with. */
 const MCP_UI_HTML = '<!doctype html><title>Mock resource</title><p>A static resource from the mock MCP server.</p>';
-
-/**
- * The status a server reaches when it is enabled and connected or reconnected.
- * @param {string} name
- * @returns {{status: 'connected'|'failed', error?: string}}
- */
-function connectedStatus(name) {
-  return MCP_CONNECTABLE.get(name) === true ? { status: 'connected' } : { status: 'failed', error: 'spawn npx ENOENT' };
-}
 
 /**
  * One context category row of the /context breakdown.
@@ -1788,37 +1968,58 @@ export function serverOf(core, serverName) {
 }
 
 /**
- * SDK-shaped status of every configured server.
+ * SDK-shaped status of every configured server. A server lists its tools only while it is connected.
  * @param {SessionCore} core
  * @returns {McpServerStatus[]}
  */
 export function mcpStatusOf(core) {
-  return [...core.mcp].map(([name, server]) => ({
-    name,
-    status: server.status,
-    ...(server.error === undefined ? {} : { error: server.error }),
-    scope: 'user',
-    source: 'user',
-    tools: name === 'github' && server.status === 'connected'
-      ? [{ name: 'search_issues', description: 'Search issues in the connected repository',
-        annotations: { readOnly: true } }]
-      : [],
-  }));
+  return [...core.mcp].map(([name, server]) => {
+    const { status, error } = serverStatusOf(server);
+    return {
+      name,
+      status,
+      ...(error === undefined ? {} : { error }),
+      scope: 'user',
+      source: 'user',
+      tools: status === 'connected'
+        ? server.tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          annotations: { readOnly: tool.readOnly },
+        }))
+        : [],
+    };
+  });
 }
 
 /**
- * Initialization result: the lists a client shows before the first turn.
+ * Initialization result: the lists a client shows before the first turn, the account, the permission mode the runtime
+ * started in and the other fields the runtime reports with it.
  * @param {SessionCore} core
- * @returns {SDKControlInitializeResponse}
+ * @param {AccountInfo} account
+ * @returns {SDKControlInitializeResponse & Record<string, unknown>}
  */
-export function initializationOf(core) {
+export function initializationOf(core, account) {
   return {
-    commands: COMMANDS.map((command) => ({ ...command })),
+    account,
     agents: AGENTS.map((agent) => ({ ...agent })),
-    output_style: core.outputStyle,
+    analytics_disabled: false,
     available_output_styles: [...OUTPUT_STYLES],
+    capabilities: ['ui_surface_v1'],
+    commands: COMMANDS.map((command) => ({ ...command })),
+    current_permission_mode: core.permissionMode,
+    ...fastModeFieldsOf(core),
+    feedback_mode: 'off',
+    ide_rc_auto_enable_gate: false,
     models: MODELS.map((model) => ({ ...model })),
-    account: { email: 'demo@example.com', subscriptionType: 'pro', apiProvider: 'firstParty' },
+    output_style: core.outputStyle,
+    pid: process.pid,
+    remote_control_auto_connect_default: false,
+    remote_control_auto_enable: false,
+    remote_control_auto_on_by_default: false,
+    remote_control_available: false,
+    session_state: 'idle',
+    user_output_styles_dir: '/mock/output-styles',
   };
 }
 
@@ -1832,7 +2033,7 @@ export function contextUsageOf(core) {
   const summary = describeSessionOf(core);
   const percentage = Math.round((summary.contextTokens / summary.contextMax) * 1000) / 10;
   const usedSquares = Math.round(percentage);
-  const githubConnected = core.mcp.get('github')?.status === 'connected';
+  const githubConnected = statusNamed(core, 'github') === 'connected';
   const categories = [
     ...summary.contextRows
       .filter((row) => row.name !== 'Free space')
@@ -1884,14 +2085,16 @@ export function contextUsageOf(core) {
 }
 
 /**
- * The /usage data in the SDK's response shape. Rate limits follow the five-hour utilization of the session. The
- * behaviors scan reads real transcripts, so the mock always answers it with null.
+ * The /usage data in the SDK's response shape. Only an account with a plan has rate limits, which follow the five-hour
+ * utilization of the session. The behaviors scan reads real transcripts, so the mock always answers it with null.
  * @param {SessionCore} core
+ * @param {AccountInfo} account
  * @returns {UsageResponse}
  */
-export function usageResponseOf(core) {
+export function usageResponseOf(core, account) {
   const summary = describeSessionOf(core);
   const resetsAt = (/** @type {number} */ hours) => new Date(Date.now() + hours * 3600_000).toISOString();
+  const limited = hasPlanLimitsOf(account);
   return {
     session: {
       total_cost_usd: summary.costUsd,
@@ -1901,12 +2104,14 @@ export function usageResponseOf(core) {
       total_lines_removed: 0,
       model_usage: Object.fromEntries(Object.entries(core.modelUsage).map(([model, value]) => [model, { ...value }])),
     },
-    subscription_type: 'pro',
-    rate_limits_available: true,
-    rate_limits: {
-      five_hour: { utilization: core.fiveHourUtilization, resets_at: resetsAt(1) },
-      seven_day: { utilization: 31, resets_at: resetsAt(72) },
-    },
+    subscription_type: limited ? account.subscriptionType ?? null : null,
+    rate_limits_available: limited,
+    rate_limits: limited
+      ? {
+        five_hour: { utilization: core.fiveHourUtilization, resets_at: resetsAt(1) },
+        seven_day: { utilization: 31, resets_at: resetsAt(72) },
+      }
+      : null,
     behaviors: null,
   };
 }
@@ -1917,13 +2122,42 @@ export function usageResponseOf(core) {
  */
 
 /**
+ * The controls the mock adds to the SDK's Query. Most of them the SDK ships without public typings: the gateway reaches
+ * them by feature detection, and their answers follow the runtime's shapes.
+ * @typedef {Object} RuntimeControls
+ * @property {() => Promise<{sections: Array<{title: string, rows: Array<{label: string, value: string}>}>}>} getStatus
+ * @property {() => Promise<{state: Record<string, unknown>}>} listPermissionRules
+ * @property {() => Promise<Record<string, unknown>>} getHooksListing
+ * @property {() => Promise<Record<string, unknown>>} getSettings
+ * @property {() => Promise<Record<string, unknown>>} getSkillsDialog
+ * @property {() => Promise<Record<string, unknown>>} getSandboxDialog
+ * @property {() => Promise<{exists: boolean}>} getPlan
+ * @property {() => Promise<Record<string, unknown>>} getChromeDialog
+ * @property {() => Promise<Record<string, unknown>>} getMemoryDialog
+ * @property {() => Promise<{text: string, default_filename: string}>} exportConversation
+ * @property {(taskId: string) => Promise<{output: string, total_bytes: number, truncated: boolean}>} getTaskOutput
+ * @property {(uuid: string) => Promise<boolean>} cancelAsyncMessage
+ * @property {(question: string, options?: {history?: unknown[], signal?: AbortSignal}) =>
+ *   Promise<Record<string, unknown>|null>} askSideQuestion
+ * @property {(target: string, options?: {trustAccepted?: boolean, trustedDirectory?: string}) =>
+ *   Promise<Record<string, unknown>>} setCwd
+ * @property {(payload: {subtype: string, query?: string}) => Promise<Record<string, unknown>>} request
+ * @property {(loginWithClaudeAi: boolean) => Promise<{manualUrl: string, automaticUrl: string}>} claudeAuthenticate
+ * @property {(authorizationCode: string, state: string) => Promise<{account: AccountInfo}>} claudeOAuthCallback
+ * @property {() => Promise<{account: AccountInfo}>} claudeOAuthWaitForCompletion
+ * @property {(serverName: string, redirectUri?: string) => Promise<Record<string, unknown>>} mcpAuthenticate
+ * @property {(serverName: string, callbackUrl: string) => Promise<Record<string, unknown>>} mcpSubmitOAuthCallbackUrl
+ * @property {(serverName: string) => Promise<{message: string}>} mcpClearAuth
+ */
+
+/**
  * Builds the control methods of one query. Each call first checks that the query is open, so a closed query rejects
  * every control call. Methods that change the session queue a status message for the consumer.
  * @param {{open: () => SessionCore, isClosed: () => boolean, close: () => void, queue: InputQueue,
- *   store: MockStore}} deps
- * @returns {ControlMethods}
+ *   store: RecordStore, runtime: RuntimeState, owner: object}} deps owner is the query that runs the sign-ins
+ * @returns {ControlMethods & RuntimeControls}
  */
-export function createControls({ open, isClosed, close, queue, store }) {
+export function createControls({ open, isClosed, close, queue, store, runtime, owner }) {
   /** @returns {SessionCore} */
   const live = () => {
     if (isClosed()) throw new Error('The query is closed.');
@@ -1939,10 +2173,13 @@ export function createControls({ open, isClosed, close, queue, store }) {
     current.notify();
   };
   return {
-    interrupt: async () => {
+    interrupt: async (options) => {
       const current = live();
       current.turnAbort?.abort(new TurnStop('aborted_streaming', 'Interrupted by user'));
-      return { still_queued: [] };
+      if (!(isObject(options) && options.cancelQueued === true)) return { still_queued: queue.waiting() };
+      const cancelled = queue.cancelAll();
+      for (const uuid of cancelled) announceCancelled(current, uuid);
+      return { still_queued: [], cancelled };
     },
     setPermissionMode: async (mode) => {
       const current = live();
@@ -1957,8 +2194,8 @@ export function createControls({ open, isClosed, close, queue, store }) {
       if (mode !== 'default' && mode !== 'auto' && mode !== null) {
         throw new TypeError('mode must be default, auto or null.');
       }
-      if (!current.mcp.has(serverName) && !current.dynamicServers.has(serverName)) {
-        return { warning: `No MCP server named ${serverName} is known yet.` };
+      if (statusNamed(current, serverName) !== 'connected') {
+        return { warning: `No MCP server named "${serverName}" is connected.` };
       }
       return {};
     },
@@ -1994,6 +2231,12 @@ export function createControls({ open, isClosed, close, queue, store }) {
         }
         current.flagSettings.fastMode = settings.fastMode;
       }
+      if (settings.agent !== undefined) {
+        if (settings.agent !== null && (typeof settings.agent !== 'string' || settings.agent.trim() === '')) {
+          throw new TypeError('agent must be a non-empty string or null.');
+        }
+        current.agent = settings.agent;
+      }
       announce(current, current.permissionMode);
     },
     updateSettings: async (source, settings) => {
@@ -2013,8 +2256,8 @@ export function createControls({ open, isClosed, close, queue, store }) {
         current.outputStyle = settings.outputStyle;
       }
     },
-    initializationResult: async () => initializationOf(live()),
-    reinitialize: async () => initializationOf(live()),
+    initializationResult: async () => initializationOf(live(), runtime.account()),
+    reinitialize: async () => initializationOf(live(), runtime.account()),
     supportedCommands: async () => {
       live();
       return COMMANDS.map((command) => ({ ...command }));
@@ -2029,14 +2272,18 @@ export function createControls({ open, isClosed, close, queue, store }) {
     },
     mcpServerStatus: async () => mcpStatusOf(live()),
     getContextUsage: async () => contextUsageOf(live()),
-    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => usageResponseOf(live()),
-    accountInfo: async () => initializationOf(live()).account,
+    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => usageResponseOf(live(), runtime.account()),
+    accountInfo: async () => {
+      live();
+      return runtime.account();
+    },
     readFile: async (path, options) => {
       const current = live();
       if (typeof path !== 'string' || path === '') throw new TypeError('path must be a non-empty string.');
       const absPath = resolve(current.cwd, path);
       const rel = relative(current.cwd, absPath);
       if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+      if (readDeniedBy(effectiveSettingsOf(current), current.cwd, absPath)) return null;
       if (!existsSync(absPath) || !statSync(absPath).isFile()) return null;
       const maxBytes = options?.maxBytes ?? 1024 * 1024;
       if (!Number.isInteger(maxBytes) || maxBytes <= 0) throw new TypeError('maxBytes must be a positive integer.');
@@ -2093,31 +2340,29 @@ export function createControls({ open, isClosed, close, queue, store }) {
       const current = live();
       const server = serverOf(current, serverName);
       if (!server.enabled) throw new Error(`MCP server ${serverName} is disabled.`);
-      const next = connectedStatus(serverName);
-      current.mcp.set(serverName, { status: next.status, error: next.error, enabled: true });
+      // A reconnect re-reads the server's reachability, which the entry already holds: the status follows from it.
     },
     toggleMcpServer: async (serverName, enabled) => {
       const current = live();
-      serverOf(current, serverName);
+      const server = serverOf(current, serverName);
       if (typeof enabled !== 'boolean') throw new TypeError('enabled must be a boolean.');
-      current.mcp.set(serverName, enabled
-        ? { ...connectedStatus(serverName), enabled: true }
-        : { status: 'disabled', enabled: false });
+      server.enabled = enabled;
     },
     readMcpResource: async (serverName, uri) => {
       const current = live();
       const server = serverOf(current, serverName);
-      if (server.status !== 'connected') throw new Error(`MCP server ${serverName} is not connected.`);
+      if (serverStatusOf(server).status !== 'connected') throw new Error(`MCP server ${serverName} is not connected.`);
       if (typeof uri !== 'string' || !uri.startsWith('ui://')) throw new TypeError('uri must use the ui:// scheme.');
       return { contents: [{ uri, mimeType: 'text/html', text: MCP_UI_HTML }] };
     },
     setMcpServers: async (servers) => {
       const current = live();
       if (!isObject(servers)) throw new TypeError('servers must be an object.');
-      const names = Object.keys(servers);
-      const added = names.filter((name) => !current.dynamicServers.has(name));
-      const removed = [...current.dynamicServers].filter((name) => !Object.hasOwn(servers, name));
-      current.dynamicServers = new Set(names);
+      const previous = [...current.mcp].filter(([, server]) => server.dynamic).map(([name]) => name);
+      const added = Object.keys(servers).filter((name) => !previous.includes(name));
+      const removed = previous.filter((name) => !Object.hasOwn(servers, name));
+      for (const name of removed) current.mcp.delete(name);
+      for (const [name, config] of Object.entries(servers)) current.mcp.set(name, dynamicServerOf(name, config));
       return { added, removed, errors: {} };
     },
     streamInput: async (stream) => {
@@ -2159,17 +2404,244 @@ export function createControls({ open, isClosed, close, queue, store }) {
       for (const entry of moving) {
         current.foreground.delete(entry.toolUseId);
         const taskId = nextId(current, 'task');
-        startBackground(current, { taskId, toolUseId: entry.toolUseId, description: entry.description });
+        startBackground(current, {
+          taskId,
+          toolUseId: entry.toolUseId,
+          description: entry.description,
+          output: entry.output,
+        });
         current.outbox.push(backgroundTasksChanged(sessionView(current), backgroundListOf(current)));
         entry.resolve({ taskId });
       }
       if (moving.length > 0) current.notify();
       return moving.length > 0;
     },
+    getStatus: async () => {
+      const current = live();
+      return statusOf({
+        sessionId: current.sessionId,
+        cwd: current.cwd,
+        model: current.model,
+        login: loginMethodOf(runtime.account()),
+        agent: current.agent,
+        additionalDirectories: current.additionalDirectories,
+        settingSources: current.settingSources,
+        version: CLAUDE_CODE_VERSION,
+      });
+    },
+    listPermissionRules: async () => {
+      const current = live();
+      return {
+        state: permissionRulesOf({
+          fileSettings: effectiveSettingsOf(current),
+          trusted: runtime.isTrusted(current.cwd),
+          cwd: current.cwd,
+          additionalDirectories: current.additionalDirectories,
+        }),
+      };
+    },
+    getHooksListing: async () => hooksListingOf(effectiveSettingsOf(live())),
+    getSettings: async () => {
+      const current = live();
+      return settingsOf({
+        fileSettings: effectiveSettingsOf(current),
+        settingSources: current.settingSources,
+        model: current.model,
+        effort: current.effort,
+      });
+    },
+    getSkillsDialog: async () => {
+      live();
+      const skills = COMMANDS.filter((command) => SKILL_NAMES.includes(command.name));
+      return skillsDialogOf(skills.map((command) => ({ name: command.name, description: command.description })));
+    },
+    getSandboxDialog: async () => {
+      live();
+      return sandboxDialogOf();
+    },
+    getPlan: async () => {
+      live();
+      return { exists: false };
+    },
+    getChromeDialog: async () => chromeDialogOf(live().chrome),
+    getMemoryDialog: async () => {
+      const current = live();
+      return memoryDialogOf({ cwd: current.cwd, home: current.home });
+    },
+    exportConversation: async () => {
+      const current = live();
+      const record = store.read(current.sessionId);
+      return {
+        text: exportTextOf(record?.transcript ?? []),
+        default_filename: exportFilenameOf(new Date()),
+      };
+    },
+    getTaskOutput: async (taskId) => {
+      const current = live();
+      const text = typeof taskId === 'string' ? current.shellOutputs.get(taskId) : undefined;
+      if (text === undefined) {
+        throw new Error('get_task_output: no shell or Monitor task with that task_id in this session');
+      }
+      return taskOutputOf(text);
+    },
+    cancelAsyncMessage: async (uuid) => {
+      const current = live();
+      if (typeof uuid !== 'string' || uuid === '') throw new TypeError('uuid must be a message uuid.');
+      if (!queue.remove(uuid)) return false;
+      announceCancelled(current, uuid);
+      return true;
+    },
+    askSideQuestion: async (question, options) => {
+      live();
+      if (typeof question !== 'string' || question.trim() === '') {
+        throw new TypeError('question must be a non-empty string.');
+      }
+      if (options?.history !== undefined && !Array.isArray(options.history)) {
+        throw new TypeError('history must be a list of messages.');
+      }
+      if (options?.signal?.aborted === true) return null;
+      return sideAnswerOf(question);
+    },
+    setCwd: async (target, options) => {
+      const current = live();
+      if (typeof target !== 'string' || !isAbsolute(target)) throw new TypeError('cwd must be an absolute path.');
+      return changeCwd(current, runtime, resolve(target), options);
+    },
+    request: async (payload) => {
+      const current = live();
+      if (!isObject(payload) || typeof payload.subtype !== 'string') throw new TypeError('request needs a subtype.');
+      if (payload.subtype !== 'file_suggestions') throw new Error(`Unsupported control request: ${payload.subtype}`);
+      if (typeof payload.query !== 'string') throw new TypeError('query must be a string.');
+      return {
+        subtype: 'success',
+        request_id: randomUUID(),
+        response: { suggestions: suggestionsOf(current, payload.query), cwd: current.cwd },
+      };
+    },
+    claudeAuthenticate: async (loginWithClaudeAi) => {
+      live();
+      if (typeof loginWithClaudeAi !== 'boolean') throw new TypeError('loginWithClaudeAi must be a boolean.');
+      const flow = runtime.startLogin(loginWithClaudeAi ? 'claudeai' : 'console', owner);
+      return { manualUrl: flow.manualUrl, automaticUrl: flow.automaticUrl };
+    },
+    claudeOAuthCallback: async (authorizationCode, state) => {
+      live();
+      if (typeof authorizationCode !== 'string' || authorizationCode === ''
+        || typeof state !== 'string' || state === '') {
+        throw new Error('Invalid code. Please make sure the full code was copied');
+      }
+      return runtime.completeLogin(authorizationCode, state);
+    },
+    claudeOAuthWaitForCompletion: async () => {
+      live();
+      return runtime.waitForLogin();
+    },
+    mcpAuthenticate: async (serverName, redirectUri) => {
+      const current = live();
+      const server = current.mcp.get(serverName);
+      if (server === undefined) throw new Error(`Server not found: ${serverName}`);
+      if (redirectUri !== undefined && typeof redirectUri !== 'string') {
+        throw new TypeError('redirectUri must be a string.');
+      }
+      if (!server.oauth) {
+        if (server.transport === 'stdio') {
+          throw new Error(`Server type ${server.transport} does not support OAuth authentication`);
+        }
+        return { requiresUserAction: false, callbackExpected: false };
+      }
+      if (server.authorized) return { requiresUserAction: false, callbackExpected: false };
+      return mcpAuthorizationOf({ serverName, state: mcpFlowOf(current, serverName), redirectUri });
+    },
+    mcpSubmitOAuthCallbackUrl: async (serverName, callbackUrl) => {
+      const current = live();
+      const flow = current.mcpFlows.get(serverName);
+      if (flow === undefined) throw new Error(`No active OAuth flow for server: ${serverName}`);
+      if (typeof callbackUrl !== 'string') throw new TypeError('callbackUrl must be a string.');
+      const params = parseAddress(callbackUrl).searchParams;
+      if (params.get('state') !== flow.state) throw new Error('The OAuth state does not match this flow.');
+      if (!params.get('code')) throw new Error('The callback address carries no authorization code.');
+      current.mcpFlows.delete(serverName);
+      const server = current.mcp.get(serverName);
+      if (server !== undefined) server.authorized = true;
+      return {};
+    },
+    mcpClearAuth: async (serverName) => {
+      const current = live();
+      const server = current.mcp.get(serverName);
+      if (server === undefined) throw new Error(`Server not found: ${serverName}`);
+      current.mcpFlows.delete(serverName);
+      server.authorized = false;
+      return { message: 'Authentication cleared' };
+    },
     close: () => {
       close();
     },
   };
+}
+
+/**
+ * Announces that a queued prompt was cancelled before its turn started.
+ * @param {SessionCore} core
+ * @param {string} uuid
+ * @returns {void}
+ */
+function announceCancelled(core, uuid) {
+  core.outbox.push(commandLifecycle(sessionView(core), uuid, 'cancelled'));
+  core.notify();
+}
+
+/**
+ * The @ index answer. The index warms up after the query starts: until then it answers nothing, as the runtime's does.
+ * @param {SessionCore} core
+ * @param {string} query
+ * @returns {Array<{path: string}>}
+ */
+function suggestionsOf(core, query) {
+  if (Date.now() < core.fileIndexReadyAt) return [];
+  return fileSuggestionsOf(core.cwd, query);
+}
+
+/**
+ * The sign-in an MCP server's authorization runs under: the state of the open flow, or a new one.
+ * @param {SessionCore} core
+ * @param {string} serverName
+ * @returns {string}
+ */
+function mcpFlowOf(core, serverName) {
+  const open = core.mcpFlows.get(serverName);
+  if (open !== undefined) return open.state;
+  const state = randomUUID();
+  core.mcpFlows.set(serverName, { state });
+  return state;
+}
+
+/**
+ * The runtime's set_cwd: the session moves to another folder. A folder Claude Code does not trust answers `needs_trust`
+ * until the caller accepts it with the directory that answer named. Accepting records the trust, and the session's
+ * transcript moves to the new folder.
+ * @param {SessionCore} core
+ * @param {RuntimeState} runtime
+ * @param {string} dir absolute, resolved
+ * @param {{trustAccepted?: boolean, trustedDirectory?: string}} [options]
+ * @returns {Record<string, unknown>}
+ */
+export function changeCwd(core, runtime, dir, options = {}) {
+  if (options.trustAccepted === true && options.trustedDirectory === undefined) {
+    throw new Error('set_cwd: invalid request — trust_accepted requires trusted_directory '
+      + '(echo the directory from the needs_trust response)');
+  }
+  if (dir === core.cwd) return { status: 'ok', cwd: dir, changed: false, transcript_relocated: false };
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) throw new Error('set_cwd: the directory does not exist.');
+  if (!runtime.isTrusted(dir)) {
+    const accepted = options.trustAccepted === true && options.trustedDirectory === dir;
+    if (!accepted) return { status: 'needs_trust', directory: dir };
+    runtime.trust(dir);
+  }
+  core.cwd = dir;
+  persist(core, (record) => {
+    record.cwd = dir;
+  });
+  return { status: 'ok', cwd: dir, changed: true, transcript_relocated: true };
 }
 
 /** @returns {IteratorReturnResult<void>} */
@@ -2180,14 +2652,15 @@ function endOfSession() {
 /**
  * Creates the mock Query for one call of query(). Nothing is opened until the first pull or control call, so open
  * errors (a missing resume target, for example) surface through the iterator, as the SDK reports them.
- * @param {{prompt: string|AsyncIterable<SDKUserMessage>, options?: SdkOptions, store: MockStore, delayMs: number,
+ * @param {{prompt: string|AsyncIterable<SDKUserMessage>, options?: SdkOptions, store: RecordStore, delayMs: number,
  *   log?: Logger, fileSettings?: Record<string, unknown>, backgroundDisabled?: boolean,
- *   backgroundTiming?: BackgroundTiming}} args `fileSettings` are the settings the user's files define;
- *   `backgroundDisabled` mirrors CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
- * @returns {SdkQuery}
+ *   backgroundTiming?: BackgroundTiming, runtime?: RuntimeState}} args `fileSettings` are the settings the user's
+ *   files define; `backgroundDisabled` mirrors CLAUDE_CODE_DISABLE_BACKGROUND_TASKS; `runtime` is the trust record,
+ *   account and sign-in the queries of one adapter share (a query without one keeps its own, in memory)
+ * @returns {SdkQuery & RuntimeControls}
  */
 export function createMockQuery({ prompt, options = {}, store, delayMs, log, fileSettings = {},
-  backgroundDisabled = false, backgroundTiming = {} }) {
+  backgroundDisabled = false, backgroundTiming = {}, runtime = createRuntimeState() }) {
   validateOptions(options);
   if (typeof prompt !== 'string' && !(isObject(prompt) && typeof prompt[Symbol.asyncIterator] === 'function')) {
     throw new TypeError('prompt must be a string or an async iterable of user messages.');
@@ -2199,6 +2672,10 @@ export function createMockQuery({ prompt, options = {}, store, delayMs, log, fil
     }
   }
 
+  // A query that does not persist its session keeps its record in memory: nothing is written and nothing is listed.
+  const recordStore = options.persistSession === false ? createMemoryStore() : store;
+  /** The sign-ins this query starts belong to it: closing the query abandons them. */
+  const owner = {};
   const queue = new InputQueue();
   /** @type {SessionCore|null} */
   let core = null;
@@ -2214,9 +2691,9 @@ export function createMockQuery({ prompt, options = {}, store, delayMs, log, fil
   /** @returns {SessionCore} */
   const open = () => {
     if (core !== null) return core;
-    const record = openRecord({ store, options, cwd: options.cwd ?? process.cwd(), now: Date.now() });
-    const created = createCore({ record, options, store, delayMs, log, fileSettings, backgroundDisabled,
-      backgroundTiming });
+    const record = openRecord({ store: recordStore, options, cwd: options.cwd ?? process.cwd(), now: Date.now() });
+    const created = createCore({ record, options, store: recordStore, delayMs, log, fileSettings, backgroundDisabled,
+      backgroundTiming, runtime });
     core = created;
     const external = options.abortController?.signal;
     if (external !== undefined) {
@@ -2237,6 +2714,7 @@ export function createMockQuery({ prompt, options = {}, store, delayMs, log, fil
     core?.sessionAbort.abort(new SessionClosed());
     generator?.return(undefined).catch(() => {});
     resolveClosed();
+    runtime.abandonLogin(owner);
   };
 
   /** @returns {AsyncGenerator<SDKMessage, void, unknown>} */
@@ -2256,9 +2734,11 @@ export function createMockQuery({ prompt, options = {}, store, delayMs, log, fil
     isClosed: () => closed || core?.sessionAbort.signal.aborted === true,
     close,
     queue,
-    store,
+    store: recordStore,
+    runtime,
+    owner,
   });
-  /** @type {SdkQuery} */
+  /** @type {SdkQuery & RuntimeControls} */
   const query = {
     ...controls,
     next: () => {

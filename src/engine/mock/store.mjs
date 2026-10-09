@@ -231,6 +231,14 @@ function topLevelToolUseIds(transcript) {
 }
 
 /**
+ * Stamps a write: the modification time moves forward on every write, so two writes never share one value.
+ * @param {MockSessionRecord} record
+ */
+function stampRecord(record) {
+  record.lastModified = Math.max(Date.now(), record.lastModified + 1);
+}
+
+/**
  * Builds a new session record with empty transcript and counters.
  * @param {{sessionId: string, cwd: string, customTitle?: string|null, now?: number}} args
  * @returns {MockSessionRecord}
@@ -349,13 +357,6 @@ export function createMockStore(dir) {
   }
 
   /**
-   * @param {MockSessionRecord} record
-   */
-  function stamp(record) {
-    record.lastModified = Math.max(Date.now(), record.lastModified + 1);
-  }
-
-  /**
    * Creates a record file. Fails when the id is already stored.
    * @param {MockSessionRecord} record
    * @returns {MockSessionRecord}
@@ -363,7 +364,7 @@ export function createMockStore(dir) {
   function create(record) {
     if (keyOf(record.sessionId) !== record.sessionId) throw new TypeError('Session id must be a lowercase UUID');
     if (existsSync(pathOf(record.sessionId))) throw new Error('Session already exists');
-    stamp(record);
+    stampRecord(record);
     save(record);
     return record;
   }
@@ -388,7 +389,7 @@ export function createMockStore(dir) {
     const entry = load(sessionId);
     if (!entry || (dir !== undefined && entry.record.cwd !== dir)) throw new Error('Session not found');
     mutate(entry.record);
-    stamp(entry.record);
+    stampRecord(entry.record);
     save(entry.record);
     return entry.record;
   }
@@ -564,5 +565,75 @@ export function createMockStore(dir) {
     findLatest,
   };
 }
+
+/**
+ * In-memory store for a query that does not persist its session (`persistSession: false`). It keeps the contract of
+ * the file store that the query uses (read, create, update, findLatest), writes nothing and lists nothing. Records are
+ * copied on the way in and out, as the file store copies them through JSON.
+ * @returns {RecordStore}
+ */
+export function createMemoryStore() {
+  /** @type {Map<string, MockSessionRecord>} */
+  const records = new Map();
+
+  /**
+   * @param {string} sessionId
+   * @returns {MockSessionRecord|undefined}
+   */
+  function read(sessionId) {
+    const stored = records.get(sessionId);
+    return stored === undefined ? undefined : structuredClone(stored);
+  }
+
+  /**
+   * @param {MockSessionRecord} record
+   * @returns {MockSessionRecord}
+   */
+  function create(record) {
+    const id = record.sessionId;
+    if (typeof id !== 'string' || !isUuid(id) || id !== id.toLowerCase()) {
+      throw new TypeError('Session id must be a lowercase UUID');
+    }
+    if (records.has(id)) throw new Error('Session already exists');
+    stampRecord(record);
+    records.set(id, structuredClone(record));
+    return record;
+  }
+
+  /**
+   * @param {string} sessionId
+   * @param {(record: MockSessionRecord) => void} mutate
+   * @param {string} [dir]
+   * @returns {MockSessionRecord}
+   */
+  function update(sessionId, mutate, dir) {
+    const record = read(sessionId);
+    if (!record || (dir !== undefined && record.cwd !== dir)) throw new Error('Session not found');
+    mutate(record);
+    stampRecord(record);
+    records.set(sessionId, structuredClone(record));
+    return record;
+  }
+
+  /**
+   * The most recently modified record whose cwd equals `cwd`, with or without a summary.
+   * @param {string} cwd
+   * @returns {MockSessionRecord|undefined}
+   */
+  function findLatest(cwd) {
+    const latest = [...records.values()]
+      .filter((record) => record.cwd === cwd)
+      .map((record) => ({ record }))
+      .sort(newestFirst)[0];
+    return latest === undefined ? undefined : structuredClone(latest.record);
+  }
+
+  return { read, create, update, findLatest };
+}
+
+/**
+ * The part of a store that a query uses. The file store and the memory store both provide it.
+ * @typedef {Pick<MockStore, 'read'|'create'|'update'|'findLatest'>} RecordStore
+ */
 
 /** @typedef {ReturnType<typeof createMockStore>} MockStore */

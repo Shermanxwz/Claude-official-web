@@ -48,6 +48,10 @@ Engine adapter: src/engine/sdk-adapter.mjs (real)  |  src/engine/mock/ (determin
   them as generic cards, so new runtime features remain inspectable before the UI learns them.
 - Folder trust mirrors Claude Code's trust dialog: only trusted folders load project settings, hooks, skills, MCP
   servers and CLAUDE.md (`settingSources` includes `project` and `local`); untrusted folders run with user settings.
+  Trusting a folder also records it in Claude Code through the runtime's own `set_cwd` trust handshake, because the
+  runtime ignores project allow rules (and other trust-gated features) of folders it has no trust record for.
+- The permission mode is not forced: unless the user picks one, queries start without `permissionMode` and Claude Code
+  applies `permissions.defaultMode` from its settings, as `claude` does.
 - Thinking is shown as the terminal shows it: queries start with the runtime's `--thinking-display summarized` flag
   (`extraArgs`), because a non-interactive session ignores `showThinkingSummaries`; a setting that turns summaries
   off (`showThinkingSummaries: false`) is honored.
@@ -56,31 +60,48 @@ Engine adapter: src/engine/sdk-adapter.mjs (real)  |  src/engine/mock/ (determin
 
 ## Official interfaces
 
-Every Claude Code behavior goes through a public export of `@anthropic-ai/claude-agent-sdk`: `query()` and its
-control methods, its callbacks (`canUseTool`, `onElicitation`), the session functions (`listSessions`,
-`getSessionMessages`, `renameSession`, `forkSession`, …) and `resolveSettings()`. Settings are changed only through the
-runtime (`applyFlagSettings`, `updateSettings`, permission updates returned from `canUseTool`), never by editing files.
+Every Claude Code behavior goes through `@anthropic-ai/claude-agent-sdk`, in this order of preference:
+
+1. Public, typed exports: `query()` and its options, control methods and callbacks (`canUseTool`, `onElicitation`,
+   `onUserDialog`), the session functions (`listSessions`, `getSessionMessages`, `renameSession`, `forkSession`, …),
+   `resolveSettings()` and `setMcpServers()`. Settings change only through the runtime (`applyFlagSettings`,
+   `updateSettings`, permission updates returned from `canUseTool`), never by editing files.
+2. Runtime controls the SDK's query object carries without public typings — the calls behind the terminal's own
+   screens: `getStatus` (`/status`), `listPermissionRules` (`/permissions`), `getHooksListing` (`/hooks`),
+   `getMemoryDialog` (`/memory`), `getSettings` (`/config`), `getSkillsDialog`, `getSandboxDialog`, `getPlan`,
+   `getChromeDialog` (`/chrome`), `exportConversation` (`/export`), `getTaskOutput`, `cancelAsyncMessage`,
+   `askSideQuestion` (`/btw`), `setCwd` (the trust handshake), `claudeAuthenticate` / `claudeOAuthCallback`
+   (`/login`) and `mcpAuthenticate` / `mcpSubmitOAuthCallbackUrl` / `mcpClearAuth` (`/mcp` sign-in), plus the declared
+   `file_suggestions` control request through the query's generic control call. They are used only when present
+   (feature detection; a missing one answers `501 FEATURE_UNAVAILABLE` and the UI points to the terminal tab); their
+   answers are passed on as data and never trusted as HTML. The SDK version is pinned exactly, and the integration
+   tests and the real-runtime smoke cover them.
+3. The CLI's own flags through the public `extraArgs` option: `--thinking-display summarized` and, opt-in, `--chrome`.
+
 Typed slash commands are passed to the runtime unchanged, so its own handlers run.
 
-The gateway implements only what has no public interface:
+The gateway implements only what has no runtime interface:
 
 | Part | Why it is the gateway's |
 |---|---|
 | Login, cookies, Origin/Host checks, SSE, uploads, workspace roots | Hosting a web UI, not a Claude Code feature |
-| `@` file autocomplete (`GET /api/fs/search`) | The runtime answers a `file_suggestions` control request, but the SDK exposes no method for it |
-| Folder trust store | The SDK has no API for Claude Code's trust records; trust is applied through `settingSources` |
+| `@` file search fallback | Used when the runtime's own index cannot answer (no live session, still indexing) |
+| Folder trust record for `settingSources` | Claude Code's trust is recorded through its `set_cwd` handshake; the gateway keeps its own record to decide which settings a query loads |
+| Writing a memory file the runtime listed | The terminal's `/memory` opens an editor; the runtime has no write control |
+| Conversation search | `listSessions` and `getSessionMessages` are read through the SDK; matching is the gateway's |
 
-Public SDK interfaces that are deliberately not used:
+Interfaces that are deliberately not used:
 
 | Interface | Reason |
 |---|---|
-| `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET` | Marked unstable by the SDK; the runtime's `/usage` command works when typed |
-| `readMcpResource` (MCP Apps widgets) | Alpha, and it renders third-party HTML |
-| `onUserDialog` / `supportedDialogKinds` | Payload shapes are not documented; without them the runtime uses its plain refusal flow, which the UI renders |
+| `readMcpResource` (MCP Apps widgets) | Claude Code 2.1.295 does not advertise `mcp_read_resource_v1` to SDK hosts, so there is nothing to render yet |
 | `prewarm`, `startup` | Alpha process pre-warming; sessions start on demand |
-| `setMcpPermissionModeOverride` | Only tightens MCP servers under `bypassPermissions`/`auto`; not exposed yet |
 | `resumeDropsTurn` | Guards single-turn truncation in headless edit-and-retry; rewind here spans any number of turns |
-| `/bridge`, `/browser` subpath exports | They connect to Anthropic's hosted sessions (Remote Control), not to a self-hosted runtime |
+| `enableRemoteControl`, `/bridge` | Remote Control through Anthropic's hosted service needs a claude.ai sign-in and cannot be verified on a self-hosted test runtime |
+| `createSdkMcpServer`, `tool()` | Custom tools belong in Claude Code's own MCP configuration, which the GUI loads |
+| `generateSessionTitle`, `submitFeedback`, `messageRated`, `launchUltrareview` | The runtime titles sessions itself; feedback and cloud review are product features of Anthropic's apps |
+| `getChromeBrowsers`, `selectChromeBrowser` | Choosing among several connected Chromes cannot be verified here; `/chrome` in the terminal tab does it |
+| `filterEscalatingDefaultMode` | The gateway no longer computes a default mode; the runtime applies its own settings and filter |
 
 ## Process model
 

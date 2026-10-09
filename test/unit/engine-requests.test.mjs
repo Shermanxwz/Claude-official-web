@@ -1,6 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { RequestRegistry, toPermissionResult, toElicitationResult } from '../../src/engine/requests.mjs';
+import {
+  RequestRegistry, refusalDialogOf, toDialogResult, toPermissionResult, toElicitationResult,
+} from '../../src/engine/requests.mjs';
 import { AppError } from '../../src/contracts.mjs';
 
 const S1 = '11111111-1111-4111-8111-111111111111';
@@ -581,5 +583,112 @@ describe('toElicitationResult', () => {
   test('decline and cancel actions pass through', () => {
     assert.deepEqual(toElicitationResult({ body: { action: 'decline' } }), { action: 'decline' });
     assert.deepEqual(toElicitationResult({ body: { action: 'cancel' } }), { action: 'cancel' });
+  });
+});
+
+/** @param {Record<string, unknown>} [overrides] */
+function dialogRequest(overrides = {}) {
+  return {
+    id: 'd-1',
+    sessionId: S1,
+    kind: 'dialog',
+    createdAt: 1,
+    dialog: {
+      dialogKind: 'refusal_fallback_prompt',
+      originalModel: 'opus',
+      fallbackModel: 'sonnet',
+      apiRefusalCategory: null,
+      guidanceText: null,
+      retractedMessageUuids: [],
+    },
+    ...overrides,
+  };
+}
+
+describe('RequestRegistry dialog bodies', () => {
+  for (const result of ['retry_fallback', 'edit_prompt', 'cancelled']) {
+    test(`accepts the result ${result}`, async () => {
+      const { registry } = harness();
+      const pending = registry.create(dialogRequest());
+      registry.respond(S1, 'd-1', { result });
+      assert.deepEqual(await pending, { body: { result } });
+    });
+  }
+
+  test('refuses a result the dialog does not offer, and keeps the request pending', () => {
+    const { registry } = harness();
+    registry.create(dialogRequest());
+    assertAppError(() => registry.respond(S1, 'd-1', { result: 'approve' }), 422, 'INVALID_ARGUMENT');
+    assertAppError(() => registry.respond(S1, 'd-1', {}), 422, 'INVALID_ARGUMENT');
+    assertAppError(() => registry.respond(S1, 'd-1', { result: 'cancelled', extra: true }), 400, 'BAD_REQUEST');
+    assert.equal(registry.count(S1), 1);
+  });
+
+  test('a cancelled dialog settles without a body', async () => {
+    const { registry } = harness();
+    const controller = new AbortController();
+    const pending = registry.create(dialogRequest(), controller.signal);
+    controller.abort();
+    assert.deepEqual(await pending, { cancelled: true });
+  });
+});
+
+describe('refusalDialogOf', () => {
+  test('copies the models, the optional texts and the retracted message ids of a refusal fallback prompt', () => {
+    assert.deepEqual(refusalDialogOf({
+      dialogKind: 'refusal_fallback_prompt',
+      payload: {
+        originalModel: 'opus',
+        fallbackModel: 'sonnet',
+        apiRefusalCategory: 'cyber',
+        guidanceText: 'Rephrase the request',
+        retractedMessageUuids: ['u-1', 2, null, 'u-2'],
+        unexpected: 'dropped',
+      },
+    }), {
+      dialogKind: 'refusal_fallback_prompt',
+      originalModel: 'opus',
+      fallbackModel: 'sonnet',
+      apiRefusalCategory: 'cyber',
+      guidanceText: 'Rephrase the request',
+      retractedMessageUuids: ['u-1', 'u-2'],
+    });
+  });
+
+  test('a missing optional text or list is null or empty', () => {
+    assert.deepEqual(refusalDialogOf({
+      dialogKind: 'refusal_fallback_prompt',
+      payload: { originalModel: 'opus', fallbackModel: 'sonnet', apiRefusalCategory: 7, guidanceText: '' },
+    }), {
+      dialogKind: 'refusal_fallback_prompt',
+      originalModel: 'opus',
+      fallbackModel: 'sonnet',
+      apiRefusalCategory: null,
+      guidanceText: null,
+      retractedMessageUuids: [],
+    });
+  });
+
+  test('other dialog kinds, and prompts without both model names, are not rendered', () => {
+    assert.equal(refusalDialogOf({ dialogKind: 'something_new', payload: { originalModel: 'a', fallbackModel: 'b' } }),
+      null);
+    assert.equal(refusalDialogOf({ dialogKind: 'refusal_fallback_prompt', payload: { originalModel: 'opus' } }), null);
+    assert.equal(refusalDialogOf({
+      dialogKind: 'refusal_fallback_prompt', payload: { originalModel: '', fallbackModel: 'sonnet' },
+    }), null);
+    assert.equal(refusalDialogOf({
+      dialogKind: 'refusal_fallback_prompt', payload: { originalModel: 42, fallbackModel: 'sonnet' },
+    }), null);
+    assert.equal(refusalDialogOf({ dialogKind: 'refusal_fallback_prompt', payload: null }), null);
+    assert.equal(refusalDialogOf({ dialogKind: 'refusal_fallback_prompt' }), null);
+    assert.equal(refusalDialogOf(undefined), null);
+  });
+});
+
+describe('toDialogResult', () => {
+  test('an answered dialog completes with its result, and a cancelled one leaves the runtime default', () => {
+    const answered = toDialogResult({ body: { result: 'edit_prompt' } });
+    assert.deepEqual(answered, { behavior: 'completed', result: 'edit_prompt' });
+    assert.deepEqual(toDialogResult({ cancelled: true, reason: 'aborted' }), { behavior: 'cancelled' });
   });
 });

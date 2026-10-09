@@ -1,6 +1,8 @@
 /**
- * New-session dialog: browse workspace roots, pick a folder (or create one), set an optional title, model,
- * permission mode and effort, then start a live session and select it.
+ * New-session dialog: browse workspace roots, pick a folder (or create one), set an optional title, model, permission
+ * mode and effort, then start a live session and select it. The Advanced disclosure holds the agent, additional
+ * directories, a fallback model and the browser tools. A permission mode left at "Follow Claude Code settings" is not
+ * sent, so the runtime applies the settings exactly as the terminal does.
  */
 
 import { h, clear, icon } from '../dom.js';
@@ -11,6 +13,8 @@ const LAST_CWD_KEY = 'caw.lastCwd';
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto', 'dontAsk', 'bypassPermissions'];
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const FOLDER_NAME_RE = /^[A-Za-z0-9._ -]{1,100}$/;
+/** At most this many additional directories (docs/PROTOCOL.md, SessionSettings). */
+const ADDITIONAL_DIRECTORY_LIMIT = 20;
 
 /** @returns {string | null} */
 function readLastCwd() {
@@ -52,6 +56,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   const roots = Array.isArray(meta?.roots) ? meta.roots : [];
   const bypassAllowed = meta?.features?.bypass === true;
   const modes = PERMISSION_MODES.filter((mode) => mode !== 'bypassPermissions' || bypassAllowed);
+  const profile = meta?.profile ?? store.get().auth?.profile ?? null;
 
   /** @type {string | null} */
   let currentPath = null;
@@ -62,6 +67,15 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   let loadToken = 0;
   let creating = false;
   let browsing = false;
+  /** Additional directories chosen so far, in order. */
+  /** @type {string[]} */
+  const extraDirs = [];
+  /** The folder the additional-directory browser shows, and what it lists. */
+  let extraPath = /** @type {string | null} */ (null);
+  let extraParent = /** @type {string | null} */ (null);
+  /** @type {Array<{name: string, path: string, isProject: boolean}>} */
+  let extraEntries = [];
+  let extraToken = 0;
 
   const pathEl = h('span', { class: 'dir-path mono' });
   const listEl = h('ul', { class: 'dir-list', attrs: { 'aria-label': t('shell.newSession.folders') } });
@@ -128,14 +142,16 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   const datalist = h('datalist', { attrs: { id: 'new-session-models' } },
     modelOptions.map((value) => h('option', { attrs: { value } })));
 
+  // "Follow Claude Code settings" is the default: the empty value leaves permissionMode out of the request.
   const modeHint = h('p', { class: 'field-hint' });
   const modeSelect = h('select', {
     class: 'select',
+    attrs: { 'aria-describedby': 'new-session-mode-hint' },
     on: { change: () => syncModeHint() },
-  }, modes.map((mode) => h('option', {
-    attrs: { value: mode, selected: mode === (meta?.defaults?.permissionMode ?? 'default') },
-    text: t(`common.mode.${mode}`),
-  })));
+  },
+  h('option', { attrs: { value: '', selected: true }, text: t('composer.modeWord.settings') }),
+  modes.map((mode) => h('option', { attrs: { value: mode }, text: t(`common.mode.${mode}`) })));
+  modeHint.id = 'new-session-mode-hint';
 
   const effortSelect = h('select', { class: 'select' },
     h('option', { attrs: { value: '', selected: !meta?.defaults?.effort }, text: t('common.effort.default') }),
@@ -144,12 +160,53 @@ export function openNewSessionDialog({ api, store, t, actions }) {
       text: t(`common.effort.${level}`),
     })));
 
+  // Advanced: the agent (a select of the known agents, free text when none is known), extra directories, a fallback
+  // model (none by default) and the browser tools (full profile and a server that offers them).
+  const agentNames = collectAgentNames(store.get().capabilities);
+  const agentField = agentNames.length > 0
+    ? h('select', { class: 'select', attrs: { id: 'new-session-agent' } },
+      h('option', { attrs: { value: '', selected: true }, text: t('composer.advanced.noAgent') }),
+      agentNames.map((name) => h('option', { attrs: { value: name }, text: name })))
+    : h('input', {
+      class: 'input',
+      attrs: { id: 'new-session-agent', type: 'text', maxlength: 200, autocomplete: 'off', spellcheck: false,
+        placeholder: t('composer.advanced.agentPlaceholder') },
+    });
+  const fallbackSelect = h('select', { class: 'select', attrs: { id: 'new-session-fallback' } },
+    h('option', { attrs: { value: '', selected: true }, text: t('composer.advanced.noFallback') }),
+    modelOptions.map((value) => h('option', { attrs: { value }, text: value })));
+  const browserToolsBox = h('input', { attrs: { type: 'checkbox' } });
+  const browserToolsRow = meta?.features?.browserTools === true && profile === 'full'
+    ? h('label', { class: 'trust-check' }, browserToolsBox, h('span', { text: t('composer.advanced.browserTools') }))
+    : null;
+
+  const chipsEl = h('div', { class: 'dir-chips', attrs: { 'aria-label': t('composer.advanced.directories') } });
+  const extraPathEl = h('span', { class: 'dir-extra-path mono' });
+  const extraList = h('ul', { class: 'dir-list', attrs: { 'aria-label': t('composer.advanced.browse') } });
+  const extraUp = h('button', {
+    class: 'btn btn-ghost btn-sm',
+    attrs: { type: 'button', 'aria-label': t('shell.newSession.up') },
+    on: { click: () => loadExtra(extraParent) },
+  }, icon('chevron-right'), h('span', { text: t('shell.newSession.up') }));
+  const extraAdd = h('button', {
+    class: 'btn btn-secondary btn-sm',
+    attrs: { type: 'button' },
+    on: { click: () => addExtraDir(extraPath) },
+  }, t('composer.advanced.addThis'));
+  const extraBrowser = h('div', { class: 'dir-browser dir-browser-extra', attrs: { hidden: true } },
+    h('div', { class: 'dir-toolbar' }, extraUp, extraPathEl, extraAdd),
+    extraList);
+  const extraToggle = h('button', {
+    class: 'btn btn-ghost btn-sm',
+    attrs: { type: 'button', 'aria-expanded': 'false' },
+    on: { click: () => toggleExtraBrowser() },
+  }, icon('folder'), h('span', { text: t('composer.advanced.addFolder') }));
+
   const errorEl = h('p', { class: 'form-error', attrs: { role: 'alert' } });
   errorEl.hidden = true;
 
   // Folder trust (docs/PROTOCOL.md): an untrusted folder starts with user settings only. The notice offers trust for
   // the folder on screen and trust is applied before the session starts. Read-profile viewers cannot change trust.
-  const profile = meta?.profile ?? store.get().auth?.profile ?? null;
   const canTrust = profile !== 'read';
   /** @type {{path: string, trusted: boolean} | null} */
   let trustState = null;
@@ -165,7 +222,9 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   trustNotice.hidden = true;
 
   function syncModeHint() {
-    modeHint.textContent = t(`common.mode.${modeSelect.value}.hint`);
+    modeHint.textContent = modeSelect.value
+      ? t(`common.mode.${modeSelect.value}.hint`)
+      : t('composer.advanced.followHint');
   }
   syncModeHint();
 
@@ -269,6 +328,89 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     }
   }
 
+  /** Opens or closes the additional-directory browser; it starts at the folder the session starts in. */
+  function toggleExtraBrowser() {
+    const open = extraBrowser.hidden;
+    extraBrowser.hidden = !open;
+    extraToggle.setAttribute('aria-expanded', String(open));
+    if (open) loadExtra(extraPath ?? currentPath ?? null);
+  }
+
+  /** @param {string | null} path */
+  async function loadExtra(path) {
+    const token = ++extraToken;
+    try {
+      const query = path ? `?path=${encodeURIComponent(path)}` : '';
+      const data = await api.get(`/api/fs/dirs${query}`);
+      if (token !== extraToken) return;
+      extraPath = typeof data.path === 'string' ? data.path : null;
+      extraParent = typeof data.parent === 'string' ? data.parent : null;
+      extraEntries = Array.isArray(data.entries) ? data.entries : [];
+      extraPathEl.textContent = extraPath ?? t('shell.newSession.roots');
+      extraAdd.disabled = extraPath === null;
+      extraUp.disabled = extraPath === null;
+      clear(extraList);
+      for (const entry of extraEntries) {
+        extraList.appendChild(h('li', { class: 'dir-item' }, h('button', {
+          class: 'dir-row',
+          attrs: { type: 'button', title: entry.path },
+          on: { click: () => loadExtra(entry.path) },
+        }, icon('folder'), h('span', { class: 'dir-name', text: entry.name }), icon('chevron-right'))));
+      }
+    } catch (err) {
+      if (token !== extraToken) return;
+      showError(errorText(err, t));
+    }
+  }
+
+  /**
+   * Adds a folder to the additional directories: inside the roots, not the session folder itself, not listed yet, and
+   * within the limit the runtime accepts.
+   * @param {string | null} path
+   */
+  function addExtraDir(path) {
+    if (!path || !currentPath) return;
+    if (!isWithinRoots(path, roots) || path === currentPath) {
+      showError(t('composer.advanced.notAllowed'));
+      return;
+    }
+    if (extraDirs.includes(path)) return;
+    if (extraDirs.length >= ADDITIONAL_DIRECTORY_LIMIT) {
+      showError(t('composer.advanced.tooMany', { max: ADDITIONAL_DIRECTORY_LIMIT }));
+      return;
+    }
+    extraDirs.push(path);
+    showError('');
+    renderChips();
+  }
+
+  /** @param {string} path */
+  function removeExtraDir(path) {
+    const index = extraDirs.indexOf(path);
+    if (index >= 0) extraDirs.splice(index, 1);
+    renderChips();
+  }
+
+  function renderChips() {
+    clear(chipsEl);
+    if (extraDirs.length === 0) {
+      chipsEl.hidden = true;
+      return;
+    }
+    chipsEl.hidden = false;
+    for (const path of extraDirs) {
+      const name = path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+      chipsEl.appendChild(h('span', { class: 'dir-chip', attrs: { title: path } },
+        icon('folder'),
+        h('span', { class: 'dir-chip-name', text: name }),
+        h('button', {
+          class: 'dir-chip-remove',
+          attrs: { type: 'button', 'aria-label': t('composer.advanced.removeDir', { name }) },
+          on: { click: () => removeExtraDir(path) },
+        }, icon('x'))));
+    }
+  }
+
   async function createFolder() {
     const name = folderNameInput.value.trim();
     if (!currentPath || creating || browsing) return;
@@ -295,12 +437,20 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     creating = true;
     syncActions();
     showError('');
-    const body = { cwd: currentPath, permissionMode: modeSelect.value };
+    /** @type {Record<string, unknown>} */
+    const body = { cwd: currentPath };
+    if (modeSelect.value) body.permissionMode = modeSelect.value;
     const title = titleInput.value.trim();
     const model = modelInput.value.trim();
     if (title) body.title = title;
     if (model) body.model = model;
     if (effortSelect.value) body.effort = effortSelect.value;
+    const agent = agentField instanceof HTMLSelectElement || agentField instanceof HTMLInputElement
+      ? agentField.value.trim() : '';
+    if (agent) body.agent = agent;
+    if (extraDirs.length > 0) body.additionalDirectories = [...extraDirs];
+    if (fallbackSelect.value) body.fallbackModel = fallbackSelect.value;
+    if (browserToolsRow && browserToolsBox.checked) body.browserTools = true;
     try {
       // Trust is applied before the session starts, so the new session loads the folder's project settings.
       if (trustState?.path === currentPath && !trustState.trusted && trustCheckbox.checked) {
@@ -319,6 +469,22 @@ export function openNewSessionDialog({ api, store, t, actions }) {
       syncActions();
     }
   }
+
+  const advanced = h('details', { class: 'newsession-advanced' },
+    h('summary', { class: 'newsession-advanced-toggle', text: t('composer.advanced.title') }),
+    h('div', { class: 'newsession-grid' },
+      h('label', { class: 'field', attrs: { for: 'new-session-agent' } },
+        h('span', { class: 'field-label', text: t('composer.advanced.agent') }),
+        agentField),
+      h('label', { class: 'field', attrs: { for: 'new-session-fallback' } },
+        h('span', { class: 'field-label', text: t('composer.advanced.fallback') }),
+        fallbackSelect)),
+    h('div', { class: 'field' },
+      h('span', { class: 'field-label', text: t('composer.advanced.directories') }),
+      chipsEl,
+      h('div', { class: 'dir-browser-toggle' }, extraToggle),
+      extraBrowser),
+    browserToolsRow ? h('div', { class: 'field' }, browserToolsRow) : null);
 
   const body = h('div', { class: 'newsession' },
     h('div', { class: 'field' },
@@ -344,6 +510,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
       h('label', { class: 'field' },
         h('span', { class: 'field-label', text: t('shell.newSession.effort') }),
         effortSelect)),
+    advanced,
     errorEl);
 
   /** @type {{ close: () => void, element: HTMLElement } | null} */
@@ -359,6 +526,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     ],
   });
 
+  renderChips();
   const remembered = readLastCwd();
   const startPath = remembered && isWithinRoots(remembered, roots)
     ? remembered
@@ -387,4 +555,20 @@ function collectModelOptions(capabilities, fallback) {
   }
   if (fallback) values.add(fallback);
   return [...values];
+}
+
+/**
+ * Agent names from the cached capability sets (AgentInfo.name), in the order they were first seen. Empty when no set is
+ * known, in which case the dialog takes free text.
+ * @param {Record<string, { agents?: Array<{ name?: string }> }>} capabilities
+ * @returns {string[]}
+ */
+function collectAgentNames(capabilities) {
+  const names = new Set();
+  for (const entry of Object.values(capabilities ?? {})) {
+    for (const agent of entry?.agents ?? []) {
+      if (typeof agent?.name === 'string' && agent.name.trim()) names.add(agent.name.trim());
+    }
+  }
+  return [...names];
 }

@@ -124,6 +124,42 @@ function resolveRoots(name, raw, defaultRoot) {
   return [...new Set(roots)];
 }
 
+/** The browser MCP command runs as one executable with arguments (docs/PROTOCOL.md "Browser tools"). */
+const BROWSER_COMMAND_MAX_ITEMS = 32;
+const BROWSER_COMMAND_MAX_CHARS = 1024;
+const BARE_COMMAND_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * @param {string|undefined} raw
+ * @returns {string[]|null} the command and its arguments, or null when unset
+ */
+function browserMcpCommandOf(raw) {
+  const value = optionalText(raw);
+  if (value === null) return null;
+  const name = 'CAW_BROWSER_MCP_COMMAND';
+  /** @type {unknown} */
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new ConfigError(`${name} must be a JSON array of strings`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > BROWSER_COMMAND_MAX_ITEMS) {
+    throw new ConfigError(`${name} must be a JSON array of 1 to ${BROWSER_COMMAND_MAX_ITEMS} strings`);
+  }
+  for (const item of parsed) {
+    if (typeof item !== 'string' || item.length < 1 || item.length > BROWSER_COMMAND_MAX_CHARS) {
+      throw new ConfigError(`${name} entries must be strings of 1 to ${BROWSER_COMMAND_MAX_CHARS} characters`);
+    }
+    if (CONTROL_RE.test(item)) throw new ConfigError(`${name} entries must not contain control characters`);
+  }
+  const [command] = parsed;
+  if (!path.isAbsolute(command) && !BARE_COMMAND_RE.test(command)) {
+    throw new ConfigError(`${name} must start with an absolute path or a bare command name`);
+  }
+  return [...parsed];
+}
+
 /** @returns {string} */
 function readPackageVersion() {
   try {
@@ -238,7 +274,7 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
   const model = modelRaw === null ? null : plainText('CAW_DEFAULT_MODEL', modelRaw, 200);
   const allowBypass = flag('CAW_ALLOW_BYPASS', env.CAW_ALLOW_BYPASS, false);
   const permissionMode = /** @type {import('./contracts.mjs').Config['defaults']['permissionMode']} */ (
-    choice('CAW_DEFAULT_PERMISSION_MODE', env.CAW_DEFAULT_PERMISSION_MODE, PERMISSION_MODES, 'default'));
+    choice('CAW_DEFAULT_PERMISSION_MODE', env.CAW_DEFAULT_PERMISSION_MODE, PERMISSION_MODES, null));
   if (permissionMode === 'bypassPermissions') {
     if (!allowBypass) {
       throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ALLOW_BYPASS=1');
@@ -249,6 +285,8 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
   }
   const effort = /** @type {import('./contracts.mjs').Config['defaults']['effort']} */ (
     choice('CAW_DEFAULT_EFFORT', env.CAW_DEFAULT_EFFORT, EFFORT_LEVELS, null));
+  const fallbackModelRaw = optionalText(env.CAW_FALLBACK_MODEL);
+  const fallbackModel = fallbackModelRaw === null ? null : plainText('CAW_FALLBACK_MODEL', fallbackModelRaw, 200);
 
   const sessionTtlHours = integer('CAW_SESSION_TTL_HOURS', env.CAW_SESSION_TTL_HOURS, 168, 1, 8760);
 
@@ -266,9 +304,11 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
     stateDir,
     engine,
     claudeBin,
-    defaults: Object.freeze({ model, permissionMode, effort }),
+    defaults: Object.freeze({ model, permissionMode, effort, fallbackModel }),
     terminal: flag('CAW_TERMINAL', env.CAW_TERMINAL, false),
     allowBypass,
+    chrome: flag('CAW_CHROME', env.CAW_CHROME, false),
+    browserMcpCommand: browserMcpCommandOf(env.CAW_BROWSER_MCP_COMMAND),
     backgroundTasksDisabled: backgroundTasksDisabledIn(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS),
     idleTimeoutMs: integer('CAW_IDLE_TIMEOUT_MS', env.CAW_IDLE_TIMEOUT_MS, 1800000, 60000, 86400000),
     maxLiveSessions: integer('CAW_MAX_LIVE_SESSIONS', env.CAW_MAX_LIVE_SESSIONS, 4, 1, 32),

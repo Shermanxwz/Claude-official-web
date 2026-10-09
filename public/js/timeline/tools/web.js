@@ -15,6 +15,7 @@ import {
   section,
   statusOf,
   toolShell,
+  verbOf,
 } from './shell.js';
 import { domainOf, finiteNumber, isRecord, resultText, str, truncate } from './summaries.js';
 
@@ -52,12 +53,11 @@ function renderSearch(card, ctx) {
   const extras = [];
   if (card.result && links.length > 0) extras.push(chip(countText(t, 'results', links.length)));
   return toolShell({
-    iconName: 'globe',
-    title: 'WebSearch',
+    title: verbOf('WebSearch', t),
     subtitle: truncate(query, SUBTITLE_MAX),
     status: statusOf(card),
     body: () => searchBody(card, links, text, structured, ctx),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: query ? [copyButton({ text: query, t, label: t('tools.web.copyQuery') })] : [],
     extras,
     t,
@@ -125,12 +125,11 @@ function renderFetch(card, ctx) {
     actions.push(copyButton({ text: href, t, label: t('tools.web.copyUrl') }));
   }
   return toolShell({
-    iconName: 'globe',
-    title: 'WebFetch',
+    title: verbOf('WebFetch', t),
     subtitle: truncate(url, SUBTITLE_MAX),
     status: statusOf(card),
     body: () => fetchBody(card, input, structured, text, ctx),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions,
     extras: domain ? [chip(domain, { mono: true })] : [],
     t,

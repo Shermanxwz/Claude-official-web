@@ -27,6 +27,9 @@ import { t } from '../i18n.js';
  * @property {() => void} [onClose]
  * @property {boolean} [dismissible]   default true: Escape and backdrop close the dialog
  * @property {'sm'|'md'|'lg'} [size]
+ * @property {'center'|'top'} [placement]  default center; top aligns the dialog near the top of the viewport
+ * @property {string} [className]      extra class on the dialog element
+ * @property {boolean} [titleHidden]   keep the title for assistive technology only
  */
 
 /**
@@ -162,7 +165,10 @@ function actionButton(action, onPress) {
  * @param {OpenDialogOptions} options
  * @returns {{ close: () => void, element: HTMLElement }}
  */
-export function openDialog({ title, body, actions = [], onClose, dismissible = true, size = 'md' }) {
+export function openDialog({
+  title, body, actions = [], onClose, dismissible = true, size = 'md', placement = 'center', className = '',
+  titleHidden = false,
+}) {
   if (typeof document === 'undefined') throw new Error('openDialog requires a browser document');
   const previouslyFocused = /** @type {HTMLElement | null} */ (document.activeElement);
   const titleId = `dialog-title-${++idCounter}`;
@@ -225,7 +231,7 @@ export function openDialog({ title, body, actions = [], onClose, dismissible = t
   }, icon('x'));
 
   const header = h('div', { class: 'dialog-header' },
-    h('h2', { class: 'dialog-title', id: titleId, text: title }),
+    h('h2', { class: ['dialog-title', titleHidden ? 'sr-only' : ''], id: titleId, text: title }),
     closeButton);
 
   const bodyEl = h('div', { class: 'dialog-body' }, body ?? null);
@@ -237,11 +243,11 @@ export function openDialog({ title, body, actions = [], onClose, dismissible = t
   }
 
   const dialog = h('div', {
-    class: ['dialog', `dialog-${size}`],
+    class: ['dialog', `dialog-${size}`, className],
     attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId },
   }, header, bodyEl, footer);
 
-  backdrop = h('div', { class: 'dialog-backdrop' }, dialog);
+  backdrop = h('div', { class: ['dialog-backdrop', placement === 'top' ? 'is-top' : ''] }, dialog);
   backdrop.addEventListener('pointerdown', (event) => {
     pointerDownOnBackdrop = event.target === backdrop;
   });

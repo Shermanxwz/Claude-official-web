@@ -206,8 +206,10 @@ describe('controls: turns and slash commands', { timeout: 120000 }, () => {
 
   it('answers 200 for an interrupt that has nothing to stop, and 200 for a session that is not open', async () => {
     const live = await createLive(api, { cwd: server.proj });
-    assert.deepEqual((await api.post(`/api/sessions/${live.sessionId}/interrupt`)).json, { ok: true });
-    assert.deepEqual((await api.post(`/api/sessions/${randomUUID()}/interrupt`)).json, { ok: true });
+    assert.deepEqual((await api.post(`/api/sessions/${live.sessionId}/interrupt`)).json,
+      { ok: true, stillQueued: [], cancelled: [] });
+    assert.deepEqual((await api.post(`/api/sessions/${randomUUID()}/interrupt`)).json,
+      { ok: true, stillQueued: [], cancelled: [] });
   });
 
   it('reports the subagents of a session and their transcripts, and refuses malformed agent ids', async () => {
@@ -482,7 +484,8 @@ describe('controls: interrupt', { timeout: 120000 }, () => {
       await api.post(`/api/sessions/${sessionId}/messages`, { clientMessageId, text: 'Write something slow' });
       await events.next(sdkMessage(sessionId, 'stream_event'), 5000);
       const started = Date.now();
-      assert.deepEqual((await api.post(`/api/sessions/${sessionId}/interrupt`)).json, { ok: true });
+      assert.deepEqual((await api.post(`/api/sessions/${sessionId}/interrupt`)).json,
+        { ok: true, stillQueued: [], cancelled: [] });
       const finished = await events.next(turnResult(sessionId, clientMessageId), 5000);
       assert.equal(finished.data.msg.type, 'result');
       assert.ok(Date.now() - started < 3000, 'the turn stopped well before its paced end');

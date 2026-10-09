@@ -49,9 +49,10 @@ function liveInfo(sessionId, extra = {}) {
 }
 
 const HOST_METHODS = ['listSessions', 'getSession', 'getTranscript', 'createSession', 'openSession', 'closeSession',
-  'sendMessage', 'interrupt', 'updateSettings', 'respond', 'getContextUsage', 'getCapabilities', 'mcpAction',
-  'reload', 'rewind', 'fork', 'rename', 'tag', 'deleteSession', 'stopTask', 'listSubagents', 'getSubagentMessages',
-  'sessionCwd', 'backgroundTasks', 'setOutputStyle'];
+  'sendMessage', 'interrupt', 'cancelQueued', 'updateSettings', 'respond', 'getContextUsage', 'getCapabilities',
+  'mcpAction', 'mcpAuth', 'runtimeViews', 'runtimeView', 'getMemory', 'writeMemory', 'exportConversation', 'taskOutput',
+  'sideQuestion', 'fileSuggestions', 'recordRuntimeTrust', 'reload', 'rewind', 'fork', 'rename', 'tag', 'deleteSession',
+  'stopTask', 'listSubagents', 'getSubagentMessages', 'sessionCwd', 'backgroundTasks', 'setOutputStyle'];
 
 /**
  * Engine host double: records every call and answers with canned values. Tests override `replies` to force errors.
@@ -68,15 +69,26 @@ function makeEngineHost() {
     openSession: (/** @type {string} */ id) => liveInfo(id),
     closeSession: () => undefined,
     sendMessage: () => ({ accepted: true, duplicate: false }),
-    interrupt: () => undefined,
-    updateSettings: () => null,
+    interrupt: () => ({ stillQueued: [], cancelled: [] }),
+    cancelQueued: () => ({ cancelled: true }),
+    updateSettings: () => ({ live: null, restartRequired: false }),
     respond: () => undefined,
     getContextUsage: () => ({ totalTokens: 0 }),
     getCapabilities: () => ({
       stale: false, commands: [], models: [], agents: [], account: null, mcpServers: [], outputStyle: null,
       availableOutputStyles: [],
     }),
-    mcpAction: () => [],
+    mcpAction: () => ({ mcpServers: [] }),
+    mcpAuth: () => ({ ok: true }),
+    runtimeViews: () => ({ views: ['status', 'settings'] }),
+    runtimeView: (/** @type {string} */ _id, /** @type {string} */ view) => ({ view, data: {}, fetchedAt: 1 }),
+    getMemory: () => ({ files: [], folders: [], autoMemory: null, autoDream: null }),
+    writeMemory: () => ({ bytes: 5 }),
+    exportConversation: () => ({ text: 'hi', filename: 'conversation.txt' }),
+    taskOutput: () => ({ output: 'out', totalBytes: 3, truncated: false }),
+    sideQuestion: () => ({ response: 'Yes.', synthetic: false, refusalFallback: null }),
+    fileSuggestions: () => null,
+    recordRuntimeTrust: () => 'accepted',
     reload: () => ({ ok: true }),
     rewind: () => ({ conversation: { resumeAt: 'u-prev' } }),
     fork: () => ({ sessionId: NEW_SESSION }),
@@ -144,6 +156,37 @@ function makeWorkspaces() {
   };
 }
 
+/**
+ * Account double: the runtime's sign-in answers, recorded in `calls`.
+ */
+function makeAccount() {
+  /** @type {Array<{name: string, args: any[]}>} */
+  const calls = [];
+  return {
+    calls,
+    status: async () => {
+      calls.push({ name: 'status', args: [] });
+      return { account: null, signInPending: false };
+    },
+    startLogin: async (/** @type {string} */ method) => {
+      // Like the real account service, any method other than the two sign-in methods is a 400.
+      if (method !== 'claudeai' && method !== 'console') {
+        throw new AppError(400, 'BAD_REQUEST', 'The sign-in method is not valid.');
+      }
+      calls.push({ name: 'startLogin', args: [method] });
+      return { manualUrl: 'https://claude.ai/oauth/code', automaticUrl: null };
+    },
+    completeLogin: async (/** @type {string} */ code) => {
+      calls.push({ name: 'completeLogin', args: [code] });
+      return { account: { email: 'dev@example.com' } };
+    },
+    cancelLogin: async () => {
+      calls.push({ name: 'cancelLogin', args: [] });
+    },
+    close: async () => {},
+  };
+}
+
 function makeAttachments() {
   /** @type {Array<{name: string, args: any[]}>} */
   const calls = [];
@@ -193,10 +236,10 @@ function makeTerminal(enabled) {
 
 /**
  * @param {{profile?: 'read'|'standard'|'full', allowBypass?: boolean, terminal?: boolean, publicOrigin?: string,
- *   requireAuth?: boolean, backgroundTasksDisabled?: boolean}} [options]
+ *   requireAuth?: boolean, backgroundTasksDisabled?: boolean, extraEnv?: Record<string, string>}} [options]
  */
 async function startApp({ profile = 'full', allowBypass = false, terminal = false, publicOrigin = '',
-  requireAuth = true, backgroundTasksDisabled = false } = {}) {
+  requireAuth = true, backgroundTasksDisabled = false, extraEnv = {} } = {}) {
   /** @type {Record<string, string>} */
   const env = {
     HOME: root,
@@ -211,6 +254,7 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
   else env.CAW_REQUIRE_AUTH = '0';
   if (backgroundTasksDisabled) env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
   if (publicOrigin) env.CAW_PUBLIC_ORIGIN = publicOrigin;
+  Object.assign(env, extraEnv);
   const config = loadConfig(env, { packageVersion: '1.2.3' });
   /** @type {string[]} */
   const sink = [];
@@ -221,9 +265,10 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
   const workspaces = makeWorkspaces();
   const attachments = makeAttachments();
   const terminalApi = makeTerminal(terminal);
+  const account = makeAccount();
   const app = createApp({
     config, log, engine: { kind: 'mock', sdkVersion: '0.3.295' }, engineHost, events, auth, workspaces, attachments,
-    terminal: terminalApi, bootId: BOOT, publicDir,
+    terminal: terminalApi, account, bootId: BOOT, publicDir,
   });
   const server = http.createServer((req, res) => {
     void app.handleRequest(req, res);
@@ -241,6 +286,7 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
     workspaces,
     attachments,
     terminal: terminalApi,
+    account,
     cookie: '',
     /** @returns {Promise<void>} */
     close: () => new Promise((resolve) => {
@@ -664,8 +710,16 @@ describe('route mapping', () => {
       assert.equal(first.sdkVersion, '0.3.295');
       assert.equal(first.claudeCodeVersion, null);
       assert.deepEqual(first.roots, ctx.config.roots);
-      assert.deepEqual(first.defaults, { model: null, permissionMode: 'default', effort: null });
-      assert.deepEqual(first.features, { terminal: true, bypass: true, uploads: true, backgroundTasks: true });
+      assert.deepEqual(first.defaults, { model: null, permissionMode: null, effort: null, fallbackModel: null });
+      assert.deepEqual(first.features, {
+        terminal: true,
+        bypass: true,
+        uploads: true,
+        backgroundTasks: true,
+        accountLogin: true,
+        browserTools: false,
+        chrome: false,
+      });
       assert.deepEqual(first.limits, { uploadMaxBytes: 26214400, imageMaxBytes: 5242880, maxLiveSessions: 4 });
 
       ctx.engineHost.live = [liveInfo(SESSION, { claudeCodeVersion: '2.1.295' })];
@@ -732,14 +786,16 @@ describe('route mapping', () => {
       await request(ctx, 'POST', `/api/sessions/${SESSION}/open`);
       assert.deepEqual(ctx.engineHost.calls.map((call) => call.args), [[SESSION, { model: 'm1' }], [SESSION, {}]]);
       assert.deepEqual((await request(ctx, 'POST', `/api/sessions/${SESSION}/close`)).json, { ok: true });
-      assert.deepEqual((await request(ctx, 'POST', `/api/sessions/${SESSION}/interrupt`)).json, { ok: true });
+      assert.deepEqual((await request(ctx, 'POST', `/api/sessions/${SESSION}/interrupt`)).json, {
+        ok: true, stillQueued: [], cancelled: [],
+      });
       const settings = await request(ctx, 'POST', `/api/sessions/${SESSION}/settings`, {
         body: { effort: null, permissionMode: 'plan' },
       });
       assert.equal(settings.status, 200);
       assert.deepEqual(ctx.engineHost.calls.slice(-3), [
         { name: 'closeSession', args: [SESSION] },
-        { name: 'interrupt', args: [SESSION] },
+        { name: 'interrupt', args: [SESSION, {}] },
         { name: 'updateSettings', args: [SESSION, { effort: null, permissionMode: 'plan' }] },
       ]);
     });
@@ -819,13 +875,14 @@ describe('route mapping', () => {
       assert.deepEqual((await request(ctx, 'GET', '/api/fs/dirs', {})).json, { path: null, parent: null, entries: [] });
       await request(ctx, 'GET', `/api/fs/dirs?path=${encodeURIComponent(root)}`, {});
       assert.deepEqual((await request(ctx, 'GET', `/api/fs/search?cwd=${encodeURIComponent(root)}&q=app`, {})).json,
-        { results: [] });
+        { results: [], source: 'gateway' });
       assert.deepEqual((await request(ctx, 'POST', '/api/fs/mkdir', {
         body: { parent: root, name: 'new-project' },
       })).json, { path: path.join(root, 'new-project') });
       assert.deepEqual(ctx.workspaces.calls.map((call) => [call.name, ...call.args]), [
         ['listDirs', null],
         ['listDirs', root],
+        ['resolveDir', root],
         ['search', root, 'app', 50],
         ['mkdir', root, 'new-project'],
       ]);
@@ -1126,7 +1183,7 @@ describe('workspace trust routes', () => {
       const query = `/api/fs/trust?path=${encodeURIComponent(root)}`;
       assert.deepEqual((await request(ctx, 'GET', query, {})).json, { path: root, trusted: false });
       const trusted = await request(ctx, 'POST', '/api/fs/trust', { body: { path: root, trusted: true } });
-      assert.deepEqual(trusted.json, { path: root, trusted: true });
+      assert.deepEqual(trusted.json, { path: root, trusted: true, runtimeTrust: 'accepted' });
       assert.deepEqual((await request(ctx, 'GET', query, {})).json, { path: root, trusted: true });
       assert.deepEqual(ctx.workspaces.calls.filter((call) => call.name !== 'resolveDir').map((call) => call.name),
         ['isTrusted', 'setTrusted', 'isTrusted']);
@@ -1297,6 +1354,215 @@ describe('runtime feature routes', () => {
     await withApp({ backgroundTasksDisabled: true }, async (ctx) => {
       await login(ctx);
       assert.equal((await request(ctx, 'GET', '/api/meta', {})).json.features.backgroundTasks, false);
+    });
+  });
+});
+
+describe('session settings, queued messages and interrupts over HTTP', () => {
+  it('forwards the interrupt option, and cancels a queued message by its id', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}`;
+      assert.deepEqual((await request(ctx, 'POST', `${base}/interrupt`, { body: { cancelQueued: true } })).json, {
+        ok: true, stillQueued: [], cancelled: [],
+      });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'interrupt', args: [SESSION, { cancelQueued: true }] });
+      assert.equal((await request(ctx, 'POST', `${base}/interrupt`, { body: { cancelQueued: 'yes' } })).status, 400);
+      assert.deepEqual((await request(ctx, 'DELETE', `${base}/queued/${CLIENT_ID}`, {})).json, { cancelled: true });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'cancelQueued', args: [SESSION, CLIENT_ID] });
+    });
+  });
+
+  it('passes agent, folders, fallback model and browser tools on, and gates browser tools by profile', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const body = { agent: 'reviewer', additionalDirectories: [root], fallbackModel: null, browserTools: false };
+      assert.equal((await request(ctx, 'POST', `/api/sessions/${SESSION}/settings`, { body })).status, 200);
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'updateSettings', args: [SESSION, body] });
+      const bad = await request(ctx, 'POST', `/api/sessions/${SESSION}/settings`, { body: { agent: 3 } });
+      assert.equal(bad.status, 400);
+      assert.equal((await request(ctx, 'POST', `/api/sessions/${SESSION}/settings`, {
+        body: { additionalDirectories: 'x' },
+      })).status, 400);
+    });
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      const denied = await request(ctx, 'POST', `/api/sessions/${SESSION}/settings`, { body: { browserTools: true } });
+      assert.equal(denied.status, 403);
+      assert.equal(ctx.engineHost.calls.some((call) => call.name === 'updateSettings'), false);
+      assert.equal((await request(ctx, 'POST', `/api/sessions/${SESSION}/settings`, { body: { model: 'm' } })).status,
+        200);
+    });
+  });
+
+  it('reports the browser tools and Claude in Chrome features the operator configured', async () => {
+    const extraEnv = {
+      CAW_BROWSER_MCP_COMMAND: JSON.stringify(['npx', '-y', '@playwright/mcp@0.0.40']),
+      CAW_CHROME: '1',
+    };
+    await withApp({ extraEnv }, async (ctx) => {
+      await login(ctx);
+      const meta = (await request(ctx, 'GET', '/api/meta', {})).json;
+      assert.equal(meta.features.browserTools, true);
+      assert.equal(meta.features.chrome, true);
+      assert.equal(meta.features.accountLogin, true);
+    });
+  });
+
+  it('reads the context usage in the detail the client asked for', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}/context`;
+      assert.equal((await request(ctx, 'GET', base, {})).status, 200);
+      assert.equal(ctx.engineHost.calls.at(-1).args[1], undefined);
+      assert.equal((await request(ctx, 'GET', `${base}?detail=full`, {})).status, 200);
+      assert.equal(ctx.engineHost.calls.at(-1).args[1], 'full');
+      assert.equal((await request(ctx, 'GET', `${base}?detail=huge`, {})).status, 400);
+    });
+  });
+
+  it('searches conversations on /api/sessions/search, which is not taken for a session id', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const found = await request(ctx, 'GET', '/api/sessions/search?q=deploy&limit=5', {});
+      assert.equal(found.status, 200);
+      assert.deepEqual(found.json, { results: [], scanned: 0, truncated: false });
+      assert.equal((await request(ctx, 'GET', '/api/sessions/search?q=a', {})).status, 400);
+      assert.equal((await request(ctx, 'GET', '/api/sessions/search?q=deploy&limit=51', {})).status, 400);
+      assert.equal(ctx.engineHost.calls.some((call) => call.name === 'getSession'), false);
+    });
+  });
+
+  it('serves the runtime views to the profile that may read each one', async () => {
+    await withApp({ profile: 'read' }, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}/runtime`;
+      assert.deepEqual((await request(ctx, 'GET', base, {})).json, { views: ['status', 'settings'] });
+      assert.equal((await request(ctx, 'GET', `${base}/permissions`, {})).status, 200);
+      assert.equal((await request(ctx, 'GET', `${base}/status`, {})).status, 403);
+      assert.equal((await request(ctx, 'GET', `${base}/nope`, {})).status, 404);
+    });
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const answer = await request(ctx, 'GET', `/api/sessions/${SESSION}/runtime/settings`, {});
+      assert.deepEqual(answer.json, { view: 'settings', data: {}, fetchedAt: 1 });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'runtimeView', args: [SESSION, 'settings'] });
+    });
+  });
+
+  it('reads memory files and saves one with its path and content checked', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}/memory`;
+      assert.deepEqual((await request(ctx, 'GET', base, {})).json, {
+        files: [], folders: [], autoMemory: null, autoDream: null,
+      });
+      const target = path.join(root, 'CLAUDE.md');
+      assert.deepEqual((await request(ctx, 'PUT', base, { body: { path: target, content: '# Notes' } })).json, {
+        ok: true, bytes: 5,
+      });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'writeMemory', args: [SESSION, target, '# Notes'] });
+      assert.equal((await request(ctx, 'PUT', base, { body: { path: target, content: 7 } })).status, 400);
+      assert.equal((await request(ctx, 'PUT', base, { body: { path: '', content: 'x' } })).status, 400);
+    });
+  });
+
+  it('answers side questions, exports the conversation and reads task output', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}`;
+      assert.deepEqual((await request(ctx, 'POST', `${base}/side-question`, { body: { question: 'Why?' } })).json, {
+        response: 'Yes.', synthetic: false, refusalFallback: null,
+      });
+      assert.equal((await request(ctx, 'POST', `${base}/side-question`, { body: { question: 4 } })).status, 400);
+      const exportReply = await request(ctx, 'GET', `${base}/export`, {});
+      assert.deepEqual(exportReply.json, { text: 'hi', filename: 'conversation.txt' });
+      assert.deepEqual((await request(ctx, 'GET', `${base}/tasks/bash.1/output`, {})).json, {
+        output: 'out', totalBytes: 3, truncated: false,
+      });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'taskOutput', args: [SESSION, 'bash.1'] });
+    });
+  });
+
+  it('forwards MCP permission modes and the sign-in actions, and refuses unknown values', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const base = `/api/sessions/${SESSION}`;
+      const mode = await request(ctx, 'POST', `${base}/mcp`, {
+        body: { server: 'github', action: 'permission-mode', mode: 'auto' },
+      });
+      assert.deepEqual(mode.json, { mcpServers: [] });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), {
+        name: 'mcpAction', args: [SESSION, 'github', { action: 'permission-mode', mode: 'auto' }],
+      });
+      assert.equal((await request(ctx, 'POST', `${base}/mcp`, {
+        body: { server: 'github', action: 'permission-mode', mode: 'plan' },
+      })).status, 422);
+      assert.deepEqual((await request(ctx, 'POST', `${base}/mcp/auth`, {
+        body: { server: 'github', action: 'start' },
+      })).json, { ok: true });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), {
+        name: 'mcpAuth', args: [SESSION, 'github', { action: 'start' }],
+      });
+      assert.equal((await request(ctx, 'POST', `${base}/mcp/auth`, {
+        body: { server: 'github', action: 'open' },
+      })).status, 422);
+    });
+  });
+
+  it('serves the sign-in of Claude Code through the account service, at the full profile only', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      assert.deepEqual((await request(ctx, 'GET', '/api/account', {})).json, { account: null, signInPending: false });
+      assert.deepEqual((await request(ctx, 'POST', '/api/account/login', { body: { method: 'claudeai' } })).json, {
+        manualUrl: 'https://claude.ai/oauth/code', automaticUrl: null,
+      });
+      assert.equal((await request(ctx, 'POST', '/api/account/login', { body: { method: 'other' } })).status, 400);
+      assert.deepEqual((await request(ctx, 'POST', '/api/account/login/code', { body: { code: 'abc#def' } })).json, {
+        account: { email: 'dev@example.com' },
+      });
+      await request(ctx, 'POST', '/api/account/login/code', { body: { code: 42 } });
+      assert.deepEqual((await request(ctx, 'DELETE', '/api/account/login', {})).json, { ok: true });
+      assert.deepEqual(ctx.account.calls.map((call) => [call.name, ...call.args]), [
+        ['status'],
+        ['startLogin', 'claudeai'],
+        ['completeLogin', 'abc#def'],
+        ['completeLogin', ''],
+        ['cancelLogin'],
+      ]);
+    });
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      assert.equal((await request(ctx, 'GET', '/api/account', {})).status, 200);
+      assert.equal((await request(ctx, 'POST', '/api/account/login', { body: { method: 'claudeai' } })).status, 403);
+      assert.equal((await request(ctx, 'DELETE', '/api/account/login', {})).status, 403);
+    });
+  });
+
+  it('searches folders for the @ picker through the runtime when it answers, and the gateway otherwise', async () => {
+    await withApp({}, async (ctx) => {
+      await login(ctx);
+      const query = `/api/fs/search?cwd=${encodeURIComponent(root)}&q=host&session=${SESSION}`;
+      ctx.engineHost.replies.fileSuggestions = () => [{ path: 'src/host.mjs', type: 'file' }];
+      assert.deepEqual((await request(ctx, 'GET', query, {})).json, {
+        results: [{ path: 'src/host.mjs', type: 'file' }], source: 'runtime',
+      });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'fileSuggestions', args: [SESSION, root, 'host', 50] });
+      ctx.engineHost.replies.fileSuggestions = () => null;
+      assert.deepEqual((await request(ctx, 'GET', query, {})).json, { results: [], source: 'gateway' });
+      const badSession = `/api/fs/search?cwd=${encodeURIComponent(root)}&session=nope`;
+      assert.equal((await request(ctx, 'GET', badSession, {})).status, 400);
+    });
+  });
+
+  it('records the runtime trust of a folder only when it is trusted, and answers skipped otherwise', async () => {
+    await withApp({ profile: 'standard' }, async (ctx) => {
+      await login(ctx);
+      const untrust = await request(ctx, 'POST', '/api/fs/trust', { body: { path: root, trusted: false } });
+      assert.deepEqual(untrust.json, { path: root, trusted: false, runtimeTrust: 'skipped' });
+      assert.equal(ctx.engineHost.calls.some((call) => call.name === 'recordRuntimeTrust'), false);
+      await request(ctx, 'POST', '/api/fs/trust', { body: { path: root, trusted: true } });
+      assert.deepEqual(ctx.engineHost.calls.at(-1), { name: 'recordRuntimeTrust', args: [root] });
     });
   });
 });

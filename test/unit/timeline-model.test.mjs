@@ -1357,3 +1357,280 @@ test('thinking blocks keep their text, and an empty or redacted block has no tex
     ['thinking', 'weighing options', false],
   ]);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Reload while a plan is pending (rule 1): the snapshot replays the stream of a message the transcript already holds.
+
+/** The snapshot of a session whose plan request is pending, shaped like the recorded runtime messages. */
+function planSnapshot() {
+  const planInput = { plan: '# Plan\n\n1. Read the module\n2. Add the test' };
+  const stream = [
+    { type: 'message_start', message: { id: 'mock_1', role: 'assistant', content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Here is the plan.' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'plan-1', name: 'ExitPlanMode', input: {} } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"plan":"# Plan\\n\\n1. Read' } },
+    { type: 'content_block_stop', index: 1 },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 42 } },
+    { type: 'message_stop' },
+  ];
+  const liveEvents = [
+    live.system(10, 'init', { session_id: SESSION }),
+    live.system(11, 'session_state_changed', { state: 'running' }),
+    live.system(12, 'status', { status: 'requesting' }),
+    { type: 'stream_event', uuid: uuid(13), session_id: SESSION, parent_tool_use_id: null,
+      event: stream[0] },
+    ...stream.slice(1).map((event, index) => ({ type: 'stream_event', uuid: uuid(20 + index), session_id: SESSION,
+      parent_tool_use_id: null, event })),
+    live.assistant(2, 'mock_1', [{ type: 'text', text: 'Here is the plan.' }]),
+    live.assistant(3, 'mock_1', [{ type: 'tool_use', id: 'plan-1', name: 'ExitPlanMode', input: planInput }]),
+    live.system(30, 'session_state_changed', { state: 'requires_action' }),
+  ];
+  const transcript = [
+    tx('user', 1, { role: 'user', content: 'plan the change' }),
+    tx('assistant', 2, { id: 'mock_1', role: 'assistant', content: [{ type: 'text', text: 'Here is the plan.' }] }),
+    tx('assistant', 3, { id: 'mock_1', role: 'assistant', content: [{ type: 'tool_use', id: 'plan-1', name: 'ExitPlanMode', input: planInput }] }),
+  ];
+  return { transcript, liveEvents, planInput };
+}
+
+test('reload while a plan is pending: the replayed stream leaves no draft and the plan is a finished card', () => {
+  const { transcript, liveEvents, planInput } = planSnapshot();
+  const model = createModel();
+  model.loadTranscript(transcript);
+  for (const event of liveEvents) model.applyLiveEvent(event);
+  model.setSessionState('requires_action');
+  model.setPending([{ id: 'req-plan', sessionId: SESSION, kind: 'plan', createdAt: 1, toolName: 'ExitPlanMode',
+    toolUseId: 'plan-1', input: planInput }]);
+
+  const entries = model.getEntries();
+  assert.equal(entries.some((entry) => entry.streaming === true), false, 'no generating draft remains');
+  const blocks = entries.filter((entry) => entry.kind === 'assistant').flatMap((entry) => entry.blocks);
+  assert.equal(blocks.some((block) => block.kind === 'tool-draft'), false, 'no raw partial JSON remains');
+  assert.equal(blocks.filter((block) => block.kind === 'text').length, 1, 'the text answer shows once');
+
+  const [tool] = entries.filter((entry) => entry.kind === 'work').flatMap((entry) => entry.items)
+    .filter((item) => item.kind === 'tool' && item.name === 'ExitPlanMode');
+  assert.ok(tool, 'the ExitPlanMode card is listed');
+  assert.deepEqual(tool.input, planInput, 'the card carries the parsed plan, not partial JSON');
+  assert.equal(tool.pendingRequestId, 'req-plan', 'the card is linked to the pending plan request');
+  assert.ok(entries.some((entry) => entry.kind === 'request' && entry.request.id === 'req-plan'));
+});
+
+test('reload while a plan is pending: a replay of the same snapshot is stable', () => {
+  const { transcript, liveEvents } = planSnapshot();
+  const model = createModel();
+  model.loadTranscript(transcript);
+  for (const event of liveEvents) model.applyLiveEvent(event);
+  for (const event of liveEvents) model.applyLiveEvent(event);
+  assert.equal(model.getEntries().some((entry) => entry.streaming === true), false);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// message_cancelled, refusal dialog eviction, todos and activity (docs/FRONTEND.md)
+
+/** A clock that returns the values of the list in order, then the last one. */
+function clockOf(...values) {
+  let index = 0;
+  return () => values[Math.min(index++, values.length - 1)];
+}
+
+test('message_cancelled removes a queued message; a message the runtime started stays', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'long task'));
+  model.applyLiveEvent(live.stream(2, { type: 'message_start', message: { id: 'busy' } }));
+  model.addOptimistic({ clientMessageId: 'q-1', text: 'after that' });
+  assert.deepEqual(model.getPendingUserMessages().map((item) => item.status), ['queued']);
+  model.cancelQueued('q-1');
+  assert.equal(find(model, 'user').some((entry) => entry.text === 'after that'), false, 'the queued row is gone');
+  assert.equal(model.getPendingUserMessages().length, 0);
+
+  model.addOptimistic({ clientMessageId: 'q-2', text: 'second' });
+  model.applyLiveEvent(live.user(9, 'second', { uuid: 'q-2' }));
+  model.cancelQueued('q-2');
+  assert.equal(find(model, 'user').filter((entry) => entry.text === 'second').length, 1, 'a started message is not cancelled');
+});
+
+test('a cancelled queued message stays gone after a replay of the log', () => {
+  const model = createModel();
+  model.loadTranscript([tx('user', 1, { role: 'user', content: 'old' })]);
+  model.applyLiveEvent(live.user(2, 'busy'));
+  model.addOptimistic({ clientMessageId: 'q-3', text: 'dropped' });
+  model.cancelQueued('q-3');
+  model.prependTranscript([tx('user', 0, { role: 'user', content: 'older' })]);
+  assert.deepEqual(find(model, 'user').map((entry) => entry.text), ['older', 'old', 'busy']);
+});
+
+/** A running turn whose refused answer is still on screen while a refusal dialog waits. */
+function refusalDialogFixture() {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, 'write the exploit'));
+  model.applyLiveEvent(live.assistant(2, 'refused-1', [{ type: 'text', text: 'I cannot help with that.' }]));
+  const dialog = {
+    id: 'dlg-1', sessionId: SESSION, kind: 'dialog', createdAt: 1,
+    dialog: {
+      dialogKind: 'refusal_fallback_prompt', originalModel: 'claude-main', fallbackModel: 'claude-backup',
+      apiRefusalCategory: 'cyber', guidanceText: 'Retry on a different model?', retractedMessageUuids: [uuid(2)],
+    },
+  };
+  model.setPending([dialog]);
+  return { model, dialog };
+}
+
+test('a refusal dialog keeps the retracted answer until it is resolved, then evicts it without a marker', () => {
+  const { model, dialog } = refusalDialogFixture();
+  assert.equal(find(model, 'assistant').length, 1, 'the refused answer stays while the dialog waits');
+  const request = model.getEntries().find((entry) => entry.kind === 'request');
+  assert.equal(request.prompt, 'write the exploit', 'the dialog knows the prompt that started the turn');
+
+  model.setPending([]);
+  model.resolvePending(dialog.id);
+  assert.equal(find(model, 'assistant').length, 0, 'the refused answer leaves the timeline');
+  assert.equal(find(model, 'withdrawn').length + model.getEntries().filter((entry) => entry.kind === 'row').length, 0,
+    'no "Response withdrawn" marker is left');
+});
+
+test('resolving a request that is not a dialog evicts nothing', () => {
+  const { model, dialog } = refusalDialogFixture();
+  model.setPending([{ id: 'perm-1', sessionId: SESSION, kind: 'permission', createdAt: 2, toolName: 'Bash' }]);
+  model.resolvePending('perm-1');
+  assert.equal(find(model, 'assistant').length, 1);
+  model.setPending([]);
+  model.resolvePending(dialog.id);
+  assert.equal(find(model, 'assistant').length, 0);
+});
+
+test('a replay keeps the dialog eviction', () => {
+  const { model, dialog } = refusalDialogFixture();
+  model.setPending([]);
+  model.resolvePending(dialog.id);
+  model.prependTranscript([tx('user', 0, { role: 'user', content: 'earlier' })]);
+  assert.equal(find(model, 'assistant').length, 0);
+  assert.equal(find(model, 'user').length, 2);
+});
+
+test('todos are the latest TodoWrite of the main thread, normalized; subagent lists do not count', () => {
+  const model = createModel();
+  assert.equal(model.getTodos(), null, 'no list before any TodoWrite');
+  model.applyLiveEvent(live.user(1, 'plan it'));
+  model.applyLiveEvent(live.assistant(2, 'm1', [
+    { type: 'tool_use', id: 'TW1', name: 'TodoWrite', input: { todos: [
+      { content: 'Read the module', status: 'completed', activeForm: 'Reading the module' },
+      { content: 'Write the test', status: 'in_progress', activeForm: 'Writing the test' },
+    ] } },
+  ]));
+  model.applyLiveEvent(live.toolResult(3, 'TW1', 'Todos have been modified successfully.'));
+  model.applyLiveEvent(live.assistant(4, 'm2', [
+    { type: 'tool_use', id: 'AG1', name: 'Agent', input: { description: 'research', prompt: 'x' } },
+  ]));
+  model.applyLiveEvent(live.assistant(5, 'sub', [
+    { type: 'tool_use', id: 'TW-SUB', name: 'TodoWrite', input: { todos: [{ content: 'inner', status: 'pending' }] } },
+  ], { parent_tool_use_id: 'AG1' }));
+  model.applyLiveEvent(live.assistant(6, 'm3', [
+    { type: 'tool_use', id: 'TW2', name: 'TodoWrite', input: { todos: [
+      { content: 'Read the module', status: 'completed', activeForm: 'Reading the module' },
+      { content: 'Write the test', status: 'completed' },
+      { content: '  ', status: 'pending' },
+      { content: 'Ship it', status: 'bogus' },
+    ] } },
+  ]));
+  assert.deepEqual(model.getTodos(), [
+    { content: 'Read the module', activeForm: 'Reading the module', status: 'completed' },
+    { content: 'Write the test', activeForm: 'Write the test', status: 'completed' },
+    { content: 'Ship it', activeForm: 'Ship it', status: 'pending' },
+  ]);
+});
+
+test('activity is null while idle and describes the running turn: start, text, tokens and queued messages', () => {
+  const described = [];
+  const model = createModel({
+    now: clockOf(1000, 2000, 3000, 4000, 5000, 6000),
+    describeTool: (tool) => {
+      described.push(tool.name);
+      return `Reading ${tool.input.file_path}`;
+    },
+  });
+  assert.equal(model.getActivity(), null);
+  model.applyLiveEvent(live.user(1, 'read the app'));
+  model.applyLiveEvent(live.stream(2, { type: 'message_start', message: { id: 'a1' } }));
+  model.applyLiveEvent(live.stream(3, { type: 'message_delta', delta: {}, usage: { output_tokens: 120 } }));
+  model.applyLiveEvent(live.assistant(4, 'a1', [
+    { type: 'tool_use', id: 'R1', name: 'Read', input: { file_path: 'src/app.js' } },
+  ]));
+  const first = model.getActivity();
+  assert.equal(first.running, true);
+  assert.equal(first.startedAt, 1000, 'the start is the first event of the turn');
+  assert.equal(first.text, 'Reading src/app.js', 'the running tool is described');
+  assert.equal(first.outputTokens, 120);
+  assert.deepEqual(described, ['Read']);
+
+  model.addOptimistic({ clientMessageId: 'q-9', text: 'and then' });
+  model.applyLiveEvent(live.stream(5, { type: 'message_start', message: { id: 'a2' } }));
+  model.applyLiveEvent(live.stream(6, { type: 'message_delta', delta: {}, usage: { output_tokens: 80 } }));
+  model.applyLiveEvent(live.stream(7, { type: 'message_delta', delta: {}, usage: { output_tokens: 95 } }));
+  model.applyLiveEvent(live.stream(8, { type: 'message_delta', delta: {}, usage: { output_tokens: 95 } }));
+  const second = model.getActivity();
+  assert.equal(second.outputTokens, 120 + 95, 'the latest report of each message is summed');
+  assert.equal(second.queued, 1);
+  assert.equal(second.startedAt, 1000);
+
+  // The queued message starts the next turn when the result arrives, so the activity moves on to it.
+  model.applyLiveEvent(live.result(9));
+  const next = model.getActivity();
+  assert.equal(next.outputTokens, 0, 'the next turn counts its own tokens');
+  assert.equal(next.queued, 0);
+  assert.equal(find(model, 'user').some((entry) => entry.text === 'and then'), true);
+});
+
+test('a finished turn with nothing queued is idle', () => {
+  const model = createModel({ now: () => 10 });
+  model.applyLiveEvent(live.user(1, 'hello'));
+  model.applyLiveEvent(live.stream(2, { type: 'message_start', message: { id: 'h' } }));
+  assert.notEqual(model.getActivity(), null);
+  model.applyLiveEvent(live.result(3));
+  assert.equal(model.getActivity(), null);
+});
+
+test('activity is waiting while a request waits for the user, and running again once the request is resolved', () => {
+  const model = createModel({ now: () => 500 });
+  model.applyLiveEvent(live.user(1, 'edit the file'));
+  model.applyLiveEvent(live.stream(2, { type: 'message_start', message: { id: 'w1' } }));
+  model.applyLiveEvent(live.assistant(3, 'w1', [
+    { type: 'tool_use', id: 'PERM', name: 'Edit', input: { file_path: 'src/app.js' } },
+  ]));
+  assert.equal(model.getActivity().waiting, false);
+  model.setPending([
+    { id: 'req-2', sessionId: SESSION, kind: 'permission', createdAt: 1, toolName: 'Edit', toolUseId: 'PERM' },
+  ]);
+  assert.equal(model.getActivity().waiting, true, 'a pending request means the turn waits for the user');
+  model.resolvePending('req-2');
+  assert.equal(model.getActivity().waiting, false);
+});
+
+test('the runtime task summary is the activity text while the turn runs', () => {
+  const model = createModel({ now: () => 500, describeTool: () => 'Running a tool' });
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.stream(2, { type: 'message_start', message: { id: 'x' } }));
+  model.applyLiveEvent(live.assistant(3, 'x', [{ type: 'tool_use', id: 'B1', name: 'Bash', input: { command: 'npm test' } }]));
+  assert.equal(model.getActivity().text, 'Running a tool');
+  model.applyLiveEvent(live.system(4, 'task_summary', { detail: 'Checking the test output' }));
+  assert.equal(model.getActivity().text, 'Checking the test output');
+});
+
+test('a replayed snapshot keeps the start time of its events', () => {
+  const model = createModel({ now: clockOf(100, 9000) });
+  model.loadTranscript([tx('user', 1, { role: 'user', content: 'old' })]);
+  model.applyLiveEvent(live.user(2, 'live now'));
+  model.applyLiveEvent(live.stream(3, { type: 'message_start', message: { id: 'r' } }));
+  assert.equal(model.getActivity().startedAt, 100);
+  model.prependTranscript([tx('user', 0, { role: 'user', content: 'older' })]);
+  assert.equal(model.getActivity().startedAt, 100, 'the replay does not move the start');
+});
+
+test('the dialog request entry carries the prompt of its turn for "Edit prompt"', () => {
+  const { model } = refusalDialogFixture();
+  const entry = model.getEntries().find((item) => item.kind === 'request');
+  assert.equal(entry.request.dialog.fallbackModel, 'claude-backup');
+  assert.equal(entry.prompt, 'write the exploit');
+});

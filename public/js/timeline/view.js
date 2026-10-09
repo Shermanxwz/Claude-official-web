@@ -6,7 +6,7 @@ import { h, clear, icon } from '../dom.js';
 import { errorText } from '../api.js';
 import { createModel } from './model.js';
 import { renderTool } from './tools/index.js';
-import { summarizeTool } from './tools/summaries.js';
+import { describeActivity } from './tools/summaries.js';
 import { renderRequest } from './requests.js';
 import { renderMarkdown } from '../markdown.js';
 import { formatDuration, formatTokens, truncateMiddle, pluralKey } from './format.js';
@@ -19,19 +19,34 @@ const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'imag
 const BASE64_PATTERN = /^[A-Za-z0-9+/=\s]+$/;
 const NOTE_COLLAPSE_CHARS = 160;
 const GENERIC_JSON_LIMIT = 20000;
+/** Event types that wait in the queue while the session's history loads, then replay in order. */
+const QUEUED_WHILE_LOADING = new Set(['sdk', 'request', 'request_resolved', 'notice', 'message_cancelled']);
 
 /** @typedef {{ t: (key: string, vars?: Record<string, unknown>) => string, api: any, store: any, actions: any, container: HTMLElement }} Env */
 
 /**
- * Creates the timeline for the conversation area.
- * @param {{ container: HTMLElement, api: any, store: any, t: (key: string, vars?: Record<string, unknown>) => string, actions: any }} options
+ * Creates the timeline for the conversation area. `onTodos` and `onActivity` receive the composer's todo list and running
+ * line; each is called only when its value changed (and once on the first render).
+ * @param {{
+ *   container: HTMLElement,
+ *   api: any,
+ *   store: any,
+ *   t: (key: string, vars?: Record<string, unknown>) => string,
+ *   actions: any,
+ *   onTodos?: ((todos: Array<Record<string, any>>|null) => void)|null,
+ *   onActivity?: ((activity: Record<string, any>|null) => void)|null,
+ * }} options
  */
-export function createTimeline({ container, api, store, t, actions }) {
+export function createTimeline({ container, api, store, t, actions, onTodos = null, onActivity = null }) {
   const env = { container, api, store, t, actions };
   const refs = buildShell(container, t);
+  /** Names the running tool for the activity line, in the viewer's language and the session's folder. */
+  const describeTool = (/** @type {Record<string, any>} */ tool) => describeActivity(
+    tool.name, tool.input, t, currentCwd(env, state.sessionId));
+  const newModel = () => createModel({ describeTool });
   const state = {
     sessionId: /** @type {string|null} */ (null),
-    model: createModel(),
+    model: newModel(),
     liveState: /** @type {string|null} */ (null),
     pendingList: /** @type {Array<Record<string, any>>} */ ([]),
     loading: false,
@@ -48,6 +63,9 @@ export function createTimeline({ container, api, store, t, actions }) {
     destroyed: false,
     /** whether the last render showed the diagnostic rows of unknown message types */
     runtimeShown: false,
+    /** the last todos and activity sent to the composer, as JSON (undefined until the first render) */
+    publishedTodos: /** @type {string|undefined} */ (undefined),
+    publishedActivity: /** @type {string|undefined} */ (undefined),
   };
   const listStore = new Map();
   /** The open or closed state the user chose per details element (tool, work group, thinking), kept across renders. */
@@ -126,6 +144,7 @@ export function createTimeline({ container, api, store, t, actions }) {
     markLatestRequest(refs.list);
     syncDock();
     renderSlots(refs, state, ui, entries.length);
+    publishSummary();
     if (stick) {
       scrollToBottom(refs.scroller);
       showJump(refs, false);
@@ -134,6 +153,22 @@ export function createTimeline({ container, api, store, t, actions }) {
     }
     state.renderedVersion = state.model.getVersion();
     state.forceStick = false;
+  };
+
+  /** Sends the composer the latest todos and the running line, each only when it changed since the last send. */
+  const publishSummary = () => {
+    const todos = state.model.getTodos();
+    const todosKey = JSON.stringify(todos);
+    if (todosKey !== state.publishedTodos) {
+      state.publishedTodos = todosKey;
+      if (onTodos) onTodos(todos);
+    }
+    const activity = activityOf(state.model, t);
+    const activityKey = JSON.stringify(activity);
+    if (activityKey !== state.publishedActivity) {
+      state.publishedActivity = activityKey;
+      if (onActivity) onActivity(activity);
+    }
   };
 
   /**
@@ -149,7 +184,10 @@ export function createTimeline({ container, api, store, t, actions }) {
     state.controller = controller;
     const token = ++state.loadToken;
     state.sessionId = sessionId;
-    state.model = createModel();
+    state.model = newModel();
+    // The composer was reset for the new session, so the first render sends its todos and activity again.
+    state.publishedTodos = undefined;
+    state.publishedActivity = undefined;
     state.liveState = null;
     state.pendingList = [];
     state.loading = true;
@@ -203,7 +241,7 @@ export function createTimeline({ container, api, store, t, actions }) {
     if (state.destroyed || !data) return;
     const eventSession = typeof data.sessionId === 'string' ? data.sessionId
       : (data.live && typeof data.live.sessionId === 'string' ? data.live.sessionId : null);
-    if (state.loading && (type === 'sdk' || type === 'request' || type === 'request_resolved' || type === 'notice')) {
+    if (state.loading && QUEUED_WHILE_LOADING.has(type)) {
       state.queue.push([type, data]);
       return;
     }
@@ -222,9 +260,15 @@ export function createTimeline({ container, api, store, t, actions }) {
       }
       case 'request_resolved': {
         if (data.sessionId !== state.sessionId) return;
+        // The model evicts what a resolved dialog retracted before the pending list drops the request.
+        state.model.resolvePending(data.requestId);
         state.pendingList = state.pendingList.filter((item) => item.id !== data.requestId);
         state.model.setPending(state.pendingList);
-        state.model.resolvePending(data.requestId);
+        break;
+      }
+      case 'message_cancelled': {
+        if (eventSession !== null && eventSession !== state.sessionId) return;
+        state.model.cancelQueued(String(data.clientMessageId ?? ''));
         break;
       }
       case 'message_accepted': {
@@ -342,6 +386,11 @@ export function createTimeline({ container, api, store, t, actions }) {
     state.model.discardOptimistic(clientMessageId);
     scheduleRender();
   };
+  /** A queued message the runtime dropped leaves the timeline at once, as the message_cancelled event would remove it. */
+  ui.dropQueued = (clientMessageId) => {
+    state.model.cancelQueued(clientMessageId);
+    scheduleRender();
+  };
   const onReload = (/** @type {any} */ event) => {
     const sessionId = event?.detail?.sessionId;
     if (typeof sessionId === 'string' && sessionId === state.sessionId) load(sessionId);
@@ -450,16 +499,20 @@ function renderSlots(refs, state, ui, entryCount) {
   }
   if (!state.loading && entryCount === 0 && state.sessionId) {
     refs.tail.append(emptyState(t));
-    return;
   }
-  const run = state.model.getRunState();
-  if (run.running && !state.loading) {
-    const label = run.status === 'compacting' ? t('cards.running.compacting') : t('cards.running.working');
-    refs.tail.append(h('div', { class: 'tl-running', attrs: { role: 'status' } },
-      h('span', { class: 'tl-running-dot', attrs: { 'aria-hidden': 'true' } }),
-      h('span', { class: 'shimmer', text: label }),
-      run.activity ? h('span', { class: 'tl-running-activity', attrs: { title: run.activity }, text: run.activity }) : null));
-  }
+  // A running turn shows its line above the composer (the composer's activity bar), not in the timeline.
+}
+
+/**
+ * The running turn as the composer's activity line shows it. A compaction says so instead of naming the last tool.
+ * @param {ReturnType<typeof createModel>} model
+ * @param {(key: string) => string} t
+ * @returns {Record<string, any>|null}
+ */
+function activityOf(model, t) {
+  const activity = model.getActivity();
+  if (!activity) return null;
+  return model.getRunState().status === 'compacting' ? { ...activity, text: t('cards.running.compacting') } : activity;
 }
 
 /**
@@ -650,9 +703,18 @@ function userEl(ui, entry) {
   }
   article.append(bubble);
 
-  if (status === 'sending' || status === 'queued') {
-    article.append(h('div', { class: 'msg-status', attrs: { role: 'status' } },
-      h('span', { text: status === 'queued' ? t('cards.user.queued') : t('cards.user.sending') })));
+  if (status === 'sending') {
+    article.append(h('div', { class: 'msg-status', attrs: { role: 'status' } }, h('span', { text: t('cards.user.sending') })));
+  }
+  if (status === 'queued') {
+    article.append(h('div', { class: 'msg-status is-queued', attrs: { role: 'status' } },
+      h('span', { class: 'msg-status-label', text: t('cards.user.queued') }),
+      h('button', {
+        class: 'btn-ghost msg-cancel',
+        attrs: { type: 'button' },
+        text: t('cards.user.cancel'),
+        on: { click: () => cancelQueuedMessage(ui, entry) },
+      })));
   }
   if (status === 'failed') {
     article.append(h('div', { class: 'msg-failed', attrs: { role: 'alert' } },
@@ -721,6 +783,23 @@ async function copyText(ui, text) {
     actions.toast(t('cards.copied'), 'info');
   } catch {
     actions.toast(t('cards.copyFailed'), 'error');
+  }
+}
+
+/**
+ * Asks the runtime to drop a message that waits behind a running turn. The bubble leaves when the runtime dropped it;
+ * a message that already started stays, and the user is told so.
+ * @param {any} ui
+ * @param {Record<string, any>} entry
+ */
+async function cancelQueuedMessage(ui, entry) {
+  const { t, actions } = ui.env;
+  try {
+    const dropped = await actions.cancelQueued(entry.clientMessageId);
+    if (dropped === true) ui.dropQueued(entry.clientMessageId);
+    else actions.toast(t('cards.user.cancelTooLate'), 'info');
+  } catch (error) {
+    actions.toast(errorText(error, t), 'error');
   }
 }
 
@@ -830,9 +909,7 @@ function workEl(ui, entry, previous) {
     icon('layers'),
     h('span', { class: 'work-label', text: label }),
     entry.label && tools.length > 0 ? h('span', { class: 'work-count', text: String(tools.length) }) : null,
-    entry.running ? h('span', { class: 'work-running', attrs: { role: 'status' } },
-      h('span', { class: 'tl-running-dot', attrs: { 'aria-hidden': 'true' } }),
-      h('span', { class: 'shimmer', text: runningToolText(ui, runningTool) })) : null);
+    entry.running ? runningHeader(ui, runningTool) : null);
   let body = details.querySelector(':scope > .work-body');
   const first = details.firstElementChild;
   if (first && first.tagName === 'SUMMARY') first.replaceWith(summary);
@@ -846,13 +923,35 @@ function workEl(ui, entry, previous) {
   return details;
 }
 
-/** @param {any} ui @param {Record<string, any>|undefined} tool */
+/**
+ * The running state of a group header: the arc and what the running tool does, or the waiting dot while that tool waits
+ * for the user (the request card above the composer carries the decision).
+ * @param {any} ui
+ * @param {Record<string, any>|undefined} tool
+ */
+function runningHeader(ui, tool) {
+  const { t } = ui.env;
+  const waiting = Boolean(tool && tool.pendingRequestId);
+  const glyph = waiting
+    ? h('span', { class: 'tool-glyph is-waiting', attrs: { 'aria-hidden': 'true' } })
+    : h('span', { class: 'tool-glyph is-running', attrs: { 'aria-hidden': 'true' } }, h('span', { class: 'tool-arc' }));
+  const text = waiting ? t('tools.status.waiting') : runningToolText(ui, tool);
+  return h('span', { class: 'work-running', attrs: { role: 'status' } },
+    glyph,
+    h('span', { class: 'work-running-text', text }));
+}
+
+/**
+ * What the running tool of a group does, in the present tense ("Editing src/app.js"), and its elapsed time.
+ * @param {any} ui
+ * @param {Record<string, any>|undefined} tool
+ */
 function runningToolText(ui, tool) {
   const { t } = ui.env;
   if (!tool) return t('cards.work.running', { summary: '' });
   let summary = '';
   try {
-    summary = summarizeTool(tool.name, tool.input, tool.result, t, currentCwd(ui.env, ui.sessionId()));
+    summary = describeActivity(tool.name, tool.input, t, currentCwd(ui.env, ui.sessionId()));
   } catch {
     summary = tool.name;
   }
@@ -871,7 +970,8 @@ function itemEl(ui, item) {
     sessionId: ui.sessionId(),
     cwd: ui.cwd(),
     renderChildren: ui.renderChildren,
-    open: Boolean(item.running || item.pendingRequestId),
+    // A row that waits for a decision stays closed: the request card docked above the composer shows its preview.
+    open: Boolean(item.running && !item.pendingRequestId),
     background: backgroundAvailable(ui.env, ui.sessionId()) ? ui.background : undefined,
   };
   try {
@@ -1022,24 +1122,36 @@ function commandEl(ui, entry) {
 function resultEl(ui, entry) {
   const { t } = ui.env;
   const variant = entry.interrupted ? 'interrupted' : entry.isError ? 'error' : 'done';
-  let headline;
-  if (variant === 'interrupted') headline = t('cards.result.interrupted');
-  else if (variant === 'error') headline = t('cards.result.error', { reason: subtypeLabel(ui, entry.subtype) });
-  else headline = t('cards.result.done');
-  const facts = [headline];
-  if (Number.isFinite(entry.durationMs)) facts.push(formatDuration(entry.durationMs));
-  if (Number.isFinite(entry.numTurns) && entry.numTurns > 0) facts.push(turnCount(t, entry.numTurns));
+  let sentence;
+  if (variant === 'interrupted') sentence = t('cards.result.interrupted');
+  else if (variant === 'error') sentence = t('cards.result.error', { reason: subtypeLabel(ui, entry.subtype) });
+  else sentence = doneSentence(t, entry);
   const denials = Array.isArray(entry.permissionDenials) ? entry.permissionDenials : [];
   const errors = Array.isArray(entry.errors) ? entry.errors : [];
   return h('div', { class: ['turn-result', `is-${variant}`], dataset: { kind: 'result' } },
     h('div', { class: 'turn-result-line' },
       icon(variant === 'error' ? 'alert' : variant === 'interrupted' ? 'x' : 'check'),
-      h('span', { text: facts.join(' · ') })),
+      h('span', { text: sentence })),
     errors.length > 0 ? h('ul', { class: 'turn-errors' }, errors.map((message) => h('li', { text: String(message) }))) : null,
     denials.length > 0 ? h('div', { class: 'turn-denials', text: t('cards.result.denied', {
       count: denials.length,
       tools: denials.map((denial) => denial.toolName).filter(Boolean).join(', '),
     }) }) : null);
+}
+
+/**
+ * The turn footer of a successful turn as one sentence: "Done in 0.9 s, 3 turns" (no separators between facts).
+ * @param {(key: string, vars?: Record<string, unknown>) => string} t
+ * @param {Record<string, any>} entry
+ * @returns {string}
+ */
+function doneSentence(t, entry) {
+  const turns = Number.isFinite(entry.numTurns) && entry.numTurns > 0 ? turnCount(t, entry.numTurns) : '';
+  const duration = Number.isFinite(entry.durationMs) ? formatDuration(entry.durationMs) : '';
+  if (duration && turns) return t('cards.result.doneWithTurns', { duration, turns });
+  if (duration) return t('cards.result.doneIn', { duration });
+  if (turns) return t('cards.result.doneTurns', { turns });
+  return t('cards.result.done');
 }
 
 /** @param {any} ui @param {string|null|undefined} subtype */
@@ -1066,6 +1178,9 @@ function requestEl(ui, entry) {
     profile: ui.env.store.get()?.auth?.profile ?? null,
     toast: (message, level) => ui.env.actions.toast(message, level),
     cwd: ui.cwd(),
+    // A refused prompt comes back into the composer when the user chooses to edit it (dialog cards only).
+    prompt: typeof entry.prompt === 'string' ? entry.prompt : '',
+    insertPrompt: (text) => ui.env.actions.insertIntoComposer(text),
   }));
   return slot;
 }

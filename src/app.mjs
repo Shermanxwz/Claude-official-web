@@ -4,8 +4,9 @@
  * onto the engine, workspace, attachment and terminal modules. Response shapes follow docs/PROTOCOL.md.
  */
 
-import { AppError, EFFORT_LEVELS, PERMISSION_MODES, isUuid } from './contracts.mjs';
+import { AppError, EFFORT_LEVELS, PERMISSION_MODES, RUNTIME_VIEWS, isUuid } from './contracts.mjs';
 import { createRouter, parseUrl, readJson, sendError, sendJson, serveStatic, withBodyIdleLimit } from './http.mjs';
+import { createSessionSearch } from './search.mjs';
 import { isAllowedHost, secureHeaders } from './security.mjs';
 
 /** @typedef {import('node:http').IncomingMessage} IncomingMessage */
@@ -18,6 +19,7 @@ import { isAllowedHost, secureHeaders } from './security.mjs';
 /** @typedef {import('./contracts.mjs').WorkspacesApi} WorkspacesApi */
 /** @typedef {import('./contracts.mjs').AttachmentsApi} AttachmentsApi */
 /** @typedef {import('./contracts.mjs').TerminalApi} TerminalApi */
+/** @typedef {import('./contracts.mjs').AccountApi} AccountApi */
 /** @typedef {import('./contracts.mjs').SessionSettings} SessionSettings */
 /** @typedef {import('./contracts.mjs').PermissionMode} PermissionMode */
 /** @typedef {import('./contracts.mjs').EffortLevel} EffortLevel */
@@ -257,17 +259,73 @@ function nullableFastMode(value) {
 }
 
 /**
- * Reads the optional model / permissionMode / effort / fastMode fields shared by session creation, open and settings.
+ * @param {unknown} value
+ * @returns {PermissionMode|null} null: Claude Code's settings decide (the host refuses it for an open session)
+ */
+function nullablePermissionMode(value) {
+  return value === null ? null : permissionModeValue(value);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string|null} null clears the main-thread agent
+ */
+function nullableAgent(value) {
+  return value === null ? null : nonEmptyString(value, 'agent', 200);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function nullableFallbackModel(value) {
+  return value === null ? null : nonEmptyString(value, 'fallbackModel', 200);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string[]} folders as sent (the host resolves them)
+ */
+function directoryList(value) {
+  if (!Array.isArray(value)) throw badRequest('additionalDirectories must be a list of folders');
+  return value.map((item) => pathValue(item, 'additionalDirectories'));
+}
+
+/**
+ * @param {unknown} value
+ * @returns {'default'|'auto'|null}
+ */
+function mcpModeValue(value) {
+  return value === null ? null : /** @type {'default'|'auto'} */ (choiceValue(value, 'mode', ['default', 'auto']));
+}
+
+/**
+ * Reads the optional session settings shared by session creation, open and settings: the model, permission mode,
+ * effort, fast mode, main-thread agent, additional folders, fallback model and browser tools.
  * @param {Record<string, unknown>} body
  * @returns {SessionSettings}
  */
 function settingsFrom(body) {
   return definedOnly({
     model: optional(body, 'model', nullableModel),
-    permissionMode: optional(body, 'permissionMode', permissionModeValue),
+    permissionMode: optional(body, 'permissionMode', nullablePermissionMode),
     effort: optional(body, 'effort', nullableEffort),
     fastMode: optional(body, 'fastMode', nullableFastMode),
+    agent: optional(body, 'agent', nullableAgent),
+    additionalDirectories: optional(body, 'additionalDirectories', directoryList),
+    fallbackModel: optional(body, 'fallbackModel', nullableFallbackModel),
+    browserTools: optional(body, 'browserTools', (value) => booleanValue(value, 'browserTools')),
   });
+}
+
+/**
+ * The runtime view a path names.
+ * @param {string} name
+ * @returns {string}
+ */
+function runtimeViewName(name) {
+  if (!Object.hasOwn(RUNTIME_VIEWS, name)) throw new AppError(404, 'NOT_FOUND', 'No such runtime view');
+  return name;
 }
 
 /**
@@ -302,16 +360,20 @@ function sendText(res, status, text, headers) {
 
 /**
  * @param {{config: Config, log: Logger, engine: EngineAdapter, engineHost: EngineHostApi, events: EventHub,
- *   auth: AuthApi, workspaces: WorkspacesApi, attachments: AttachmentsApi, terminal: TerminalApi, bootId: string,
- *   publicDir: string}} deps
+ *   auth: AuthApi, workspaces: WorkspacesApi, attachments: AttachmentsApi, terminal: TerminalApi, account: AccountApi,
+ *   bootId: string, publicDir: string}} deps
  * @returns {{handleRequest: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
  *   handleUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => void}}
  */
-export function createApp({ config, log, engine, engineHost, events, auth, workspaces, attachments, terminal, bootId,
-  publicDir }) {
+export function createApp({ config, log, engine, engineHost, events, auth, workspaces, attachments, terminal, account,
+  bootId, publicDir }) {
   const https = config.publicOrigin.startsWith('https://');
   const securityHeaders = () => secureHeaders({}, { https });
   const router = createRouter();
+  const search = createSessionSearch({
+    listSessions: (options) => engineHost.listSessions(options),
+    getSessionMessages: (sessionId) => engine.getSessionMessages(sessionId),
+  });
   /** Last Claude Code version seen on a live session; remembered once known. */
   let claudeCodeVersion = /** @type {string|null} */ (null);
 
@@ -321,6 +383,15 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
       throw new AppError(501, 'FEATURE_DISABLED', 'The bypassPermissions mode is disabled (set CAW_ALLOW_BYPASS=1)');
     }
     auth.requireProfile(config.profile, 'full');
+  }
+
+  /**
+   * Settings that need more than the route's profile: bypass permissions and the browser tools need the full profile.
+   * @param {SessionSettings} settings
+   */
+  function assertSettingsAllowed(settings) {
+    if (settings.permissionMode === 'bypassPermissions') assertBypassAllowed();
+    if (settings.browserTools !== undefined) auth.requireProfile(config.profile, 'full');
   }
 
   function metaBody() {
@@ -344,6 +415,9 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
         bypass: config.allowBypass && config.profile === 'full',
         uploads: true,
         backgroundTasks: !config.backgroundTasksDisabled,
+        accountLogin: true,
+        browserTools: Array.isArray(config.browserMcpCommand),
+        chrome: config.chrome === true,
       },
       limits: {
         uploadMaxBytes: config.uploadMaxBytes,
@@ -382,11 +456,18 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   }, { profile: 'read' });
   router.add('GET', '/api/fs/dirs', ({ url }) => workspaces.listDirs(optionalPathQuery(url.searchParams.get('path'))),
     { profile: 'read' });
-  router.add('GET', '/api/fs/search', ({ url }) => {
-    const cwd = pathValue(url.searchParams.get('cwd'), 'cwd');
+  router.add('GET', '/api/fs/search', async ({ url }) => {
+    const cwd = await workspaces.resolveDir(pathValue(url.searchParams.get('cwd'), 'cwd'));
     const q = url.searchParams.get('q') ?? '';
     if (q.length > 200) throw badRequest('q must be at most 200 characters');
-    return workspaces.search(cwd, q, queryInteger(url.searchParams, 'limit', 1, 200) ?? 50);
+    const limit = queryInteger(url.searchParams, 'limit', 1, 200) ?? 50;
+    const session = url.searchParams.get('session');
+    if (session !== null) {
+      const runtime = await engineHost.fileSuggestions(sessionIdValue(session), cwd, q, limit);
+      if (runtime !== null) return { results: runtime, source: 'runtime' };
+    }
+    const found = await workspaces.search(cwd, q, limit);
+    return { results: found.results, source: 'gateway' };
   }, { profile: 'read' });
   router.add('GET', '/api/fs/trust', async ({ url }) => {
     const folder = pathValue(url.searchParams.get('path'), 'path');
@@ -399,6 +480,11 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
       offset: queryInteger(url.searchParams, 'offset', 0, 1000000) ?? 0,
     });
     return { sessions: await engineHost.listSessions(options) };
+  }, { profile: 'read' });
+  // Registered before /api/sessions/:id, which would otherwise match the word "search".
+  router.add('GET', '/api/sessions/search', ({ url }) => {
+    const limit = queryInteger(url.searchParams, 'limit', 1, 50) ?? 20;
+    return search.search(url.searchParams.get('q') ?? '', limit);
   }, { profile: 'read' });
   router.add('GET', '/api/sessions/:id', ({ params }) => engineHost.getSession(sessionIdValue(params.id)),
     { profile: 'read' });
@@ -414,8 +500,13 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
       : { tail: tail ?? DEFAULT_TAIL };
     return engineHost.getTranscript(id, options);
   }, { profile: 'read' });
-  router.add('GET', '/api/sessions/:id/context', ({ params }) => engineHost.getContextUsage(sessionIdValue(params.id)),
-    { profile: 'read' });
+  router.add('GET', '/api/sessions/:id/context', ({ params, url }) => {
+    const detail = url.searchParams.get('detail');
+    if (detail !== null && detail !== 'summary' && detail !== 'full') {
+      throw badRequest('detail must be summary or full');
+    }
+    return engineHost.getContextUsage(sessionIdValue(params.id), detail ?? undefined);
+  }, { profile: 'read' });
   router.add('GET', '/api/sessions/:id/capabilities', ({ params }) =>
     engineHost.getCapabilities(sessionIdValue(params.id)), { profile: 'read' });
   router.add('GET', '/api/sessions/:id/subagents', async ({ params }) => ({
@@ -424,6 +515,21 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   router.add('GET', '/api/sessions/:id/subagents/:agentId/messages', async ({ params }) => ({
     messages: await engineHost.getSubagentMessages(sessionIdValue(params.id), tokenValue(params.agentId, 'agentId')),
   }), { profile: 'read' });
+  router.add('GET', '/api/sessions/:id/tasks/:taskId/output', ({ params }) =>
+    engineHost.taskOutput(sessionIdValue(params.id), tokenValue(params.taskId, 'taskId')), { profile: 'read' });
+  router.add('GET', '/api/sessions/:id/runtime', ({ params }) => engineHost.runtimeViews(sessionIdValue(params.id)),
+    { profile: 'read' });
+  router.add('GET', '/api/sessions/:id/runtime/:view', ({ params }) => {
+    const id = sessionIdValue(params.id);
+    const view = runtimeViewName(params.view);
+    auth.requireProfile(config.profile, RUNTIME_VIEWS[view].profile);
+    return engineHost.runtimeView(id, view);
+  }, { profile: 'read' });
+  router.add('GET', '/api/sessions/:id/memory', ({ params }) => engineHost.getMemory(sessionIdValue(params.id)),
+    { profile: 'read' });
+  router.add('GET', '/api/sessions/:id/export', ({ params }) =>
+    engineHost.exportConversation(sessionIdValue(params.id)), { profile: 'read' });
+  router.add('GET', '/api/account', () => account.status(), { profile: 'read' });
 
   // standard
   router.add('POST', '/api/fs/mkdir', async ({ req }) => {
@@ -439,12 +545,14 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
     const body = await readJson(req);
     const folder = pathValue(body.path, 'path');
     const trusted = booleanValue(body.trusted, 'trusted');
-    return workspaces.setTrusted(folder, trusted);
+    const result = await workspaces.setTrusted(folder, trusted);
+    const runtimeTrust = trusted ? await engineHost.recordRuntimeTrust(result.path) : 'skipped';
+    return { ...result, runtimeTrust };
   }, { profile: 'standard' });
   router.add('POST', '/api/sessions', async ({ req }) => {
     const body = await readJson(req);
     const settings = settingsFrom(body);
-    if (settings.permissionMode === 'bypassPermissions') assertBypassAllowed();
+    assertSettingsAllowed(settings);
     const title = optional(body, 'title', (value) => nonEmptyString(value, 'title', 200));
     const cwd = await workspaces.resolveDir(pathValue(body.cwd, 'cwd'));
     return { live: await engineHost.createSession(definedOnly({ cwd, title, ...settings })) };
@@ -452,7 +560,7 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   router.add('POST', '/api/sessions/:id/open', async ({ req, params }) => {
     const id = sessionIdValue(params.id);
     const settings = settingsFrom(await readJson(req));
-    if (settings.permissionMode === 'bypassPermissions') assertBypassAllowed();
+    assertSettingsAllowed(settings);
     return { live: await engineHost.openSession(id, settings) };
   }, { profile: 'standard' });
   router.add('POST', '/api/sessions/:id/close', async ({ params }) => {
@@ -479,23 +587,51 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
     }
     return engineHost.sendMessage(id, { clientMessageId, text, images });
   }, { profile: 'standard' });
-  router.add('POST', '/api/sessions/:id/interrupt', async ({ params }) => {
-    await engineHost.interrupt(sessionIdValue(params.id));
-    return { ok: true };
+  router.add('POST', '/api/sessions/:id/interrupt', async ({ req, params }) => {
+    const id = sessionIdValue(params.id);
+    const body = await readJson(req);
+    const cancelQueued = optional(body, 'cancelQueued', (value) => booleanValue(value, 'cancelQueued'));
+    return { ok: true, ...(await engineHost.interrupt(id, definedOnly({ cancelQueued }))) };
   }, { profile: 'standard' });
+  router.add('DELETE', '/api/sessions/:id/queued/:clientMessageId', ({ params }) =>
+    engineHost.cancelQueued(sessionIdValue(params.id), tokenValue(params.clientMessageId, 'clientMessageId')),
+  { profile: 'standard' });
   router.add('POST', '/api/sessions/:id/settings', async ({ req, params }) => {
     const id = sessionIdValue(params.id);
     const settings = settingsFrom(await readJson(req));
-    if (settings.permissionMode === 'bypassPermissions') assertBypassAllowed();
-    return { live: await engineHost.updateSettings(id, settings) };
+    assertSettingsAllowed(settings);
+    return engineHost.updateSettings(id, settings);
   }, { profile: 'standard' });
   router.add('POST', '/api/sessions/:id/mcp', async ({ req, params }) => {
     const id = sessionIdValue(params.id);
     const body = await readJson(req);
     const server = nonEmptyString(body.server, 'server', 200);
-    const action = /** @type {'toggle'|'reconnect'} */ (choiceValue(body.action, 'action', ['toggle', 'reconnect']));
+    const action = /** @type {'toggle'|'reconnect'|'permission-mode'} */ (
+      choiceValue(body.action, 'action', ['toggle', 'reconnect', 'permission-mode']));
     const enabled = optional(body, 'enabled', (value) => booleanValue(value, 'enabled'));
-    return { mcpServers: await engineHost.mcpAction(id, server, definedOnly({ action, enabled })) };
+    const mode = optional(body, 'mode', mcpModeValue);
+    return engineHost.mcpAction(id, server, definedOnly({ action, enabled, mode }));
+  }, { profile: 'standard' });
+  router.add('POST', '/api/sessions/:id/mcp/auth', async ({ req, params }) => {
+    const id = sessionIdValue(params.id);
+    const body = await readJson(req);
+    const server = nonEmptyString(body.server, 'server', 200);
+    const action = /** @type {'start'|'callback'|'clear'} */ (choiceValue(body.action, 'action',
+      ['start', 'callback', 'clear']));
+    const callbackUrl = optional(body, 'callbackUrl', (value) => requiredString(value, 'callbackUrl', 4096));
+    return engineHost.mcpAuth(id, server, definedOnly({ action, callbackUrl }));
+  }, { profile: 'standard' });
+  router.add('PUT', '/api/sessions/:id/memory', async ({ req, params }) => {
+    const id = sessionIdValue(params.id);
+    const body = await readJson(req);
+    const content = requiredString(body.content, 'content', 1048576);
+    const { bytes } = await engineHost.writeMemory(id, pathValue(body.path, 'path'), content);
+    return { ok: true, bytes };
+  }, { profile: 'standard' });
+  router.add('POST', '/api/sessions/:id/side-question', async ({ req, params }) => {
+    const id = sessionIdValue(params.id);
+    const body = await readJson(req);
+    return engineHost.sideQuestion(id, requiredString(body.question, 'question', MAX_TEXT));
   }, { profile: 'standard' });
   router.add('POST', '/api/sessions/:id/reload', async ({ req, params }) => {
     const id = sessionIdValue(params.id);
@@ -556,6 +692,21 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
     const mediaType = uploadMediaType(req.headers['content-type']);
     return withBodyIdleLimit(req, () => attachments.save(req, { cwd, fileName, mediaType }));
   }, { profile: 'standard' });
+
+  // Claude Code's own sign-in (the gateway never reads the credentials).
+  router.add('POST', '/api/account/login', async ({ req }) => {
+    const body = await readJson(req);
+    // The account checks the method itself and answers 400 for any other value.
+    return account.startLogin(/** @type {'claudeai'|'console'} */ (body.method));
+  }, { profile: 'full' });
+  router.add('POST', '/api/account/login/code', async ({ req }) => {
+    const body = await readJson(req);
+    return account.completeLogin(typeof body.code === 'string' ? body.code : '');
+  }, { profile: 'full' });
+  router.add('DELETE', '/api/account/login', async () => {
+    await account.cancelLogin();
+    return { ok: true };
+  }, { profile: 'full' });
 
   // full
   router.add('DELETE', '/api/sessions/:id', async ({ params }) => {

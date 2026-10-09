@@ -6,10 +6,22 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { AppError, EFFORT_LEVELS, PERMISSION_MODES, isUuid } from '../contracts.mjs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  AppError, BROWSER_MCP_SERVER, DIALOG_KINDS, EFFORT_LEVELS, PERMISSION_MODES, RUNTIME_VIEWS, isUuid,
+} from '../contracts.mjs';
 import { AsyncQueue } from './queue.mjs';
-import { RequestRegistry, toElicitationResult, toPermissionResult } from './requests.mjs';
+import {
+  RequestRegistry, refusalDialogOf, toDialogResult, toElicitationResult, toPermissionResult,
+} from './requests.mjs';
 import { engineEnv } from './env.mjs';
+import { createRuntimeTrust } from './trust.mjs';
+import {
+  ControlTimeout, MEMORY_MAX_BYTES, TIMEOUT_MESSAGE, availableViews, exportFilename, fileSuggestionsOf, firstLine,
+  interruptReceipt, isEditableMemoryFile, isPlainObject, isWebUrl, listedMemoryFiles, redactSettings, runtimeMethod,
+  sameDirectory, viewArguments, withTimeout, writeMemoryFile,
+} from './runtime-views.mjs';
 
 /** @typedef {import('../contracts.mjs').EngineHostApi} EngineHostApi */
 /** @typedef {import('../contracts.mjs').EngineAdapter} EngineAdapter */
@@ -41,6 +53,12 @@ import { engineEnv } from './env.mjs';
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SlashCommand} SlashCommand */
 /** @typedef {import('node:crypto').UUID} UUID */
 /** @typedef {SessionMessage & {index: number}} IndexedMessage */
+/** @typedef {import('../contracts.mjs').RuntimeTrust} RuntimeTrust */
+/** @typedef {import('../contracts.mjs').MemoryFile} MemoryFile */
+/** @typedef {import('../contracts.mjs').ContextUsage} ContextUsage */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').McpServerConfig} McpServerConfig */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').OnUserDialog} OnUserDialog */
+/** @typedef {ReturnType<typeof sideAnswerOf>} SideAnswer */
 
 const IDLE_SWEEP_MS = 60_000;
 const EVENT_RING_MAX_ITEMS = 2000;
@@ -65,7 +83,6 @@ const REWIND_MODES = ['code', 'conversation', 'both'];
 const MODEL_RE = /^[\x21-\x7e]{1,200}$/;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const ENGINE_UNAVAILABLE_RE = /spawn|ENOENT|not found|Native CLI binary|log ?in|authenticat|api key|credential/i;
-const CONTROL_TIMEOUT_MS = 10_000;
 /** The settings lookup that decides the thinking-summary overlay gives up after this long and adds the overlay. */
 const SETTINGS_LOOKUP_MS = 2000;
 const RELOAD_TARGETS = ['plugins', 'skills', 'output-styles'];
@@ -75,11 +92,26 @@ const CACHE_IMPACT_MAX = 50;
 const CACHE_IMPACT_NAME_MAX = 200;
 const OUTPUT_STYLE_MAX = 100;
 const BACKGROUND_DISABLED_MESSAGE = 'Background tasks are disabled for this runtime.';
-const TIMEOUT_MESSAGE = 'The Claude Code runtime did not respond in time.';
 const CREDENTIALS_MESSAGE = 'Claude Code credentials were rejected. Log in again on the server: run `claude` and use '
   + '/login.';
 /** Errors of the authentication class: the runtime's credentials were rejected. Billing and rate limits are not. */
 const AUTH_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required'];
+const AGENT_MAX = 200;
+const WEB_PROTOCOLS = ['http:', 'https:'];
+const ADDITIONAL_DIRECTORIES_MAX = 20;
+const SIDE_QUESTION_MAX = 4000;
+const SIDE_QUESTION_MS = 120_000;
+const FILE_SUGGESTIONS_MS = 1500;
+const CONTEXT_FULL_MS = 30_000;
+const PATH_MAX = 4096;
+const URL_MAX = 4096;
+const AUTH_URL_MAX = 8192;
+const UNKNOWN_TASK = 'no shell or Monitor task';
+const BROWSER_DISABLED_MESSAGE = 'Browser tools are not configured on this gateway (CAW_BROWSER_MCP_COMMAND).';
+const BYPASS_REFUSED_MESSAGE = 'Bypass permissions is disabled on this gateway, so the session runs in default mode.';
+const BYPASS_FAILED_MESSAGE = 'Bypass permissions could not be turned off, so the session was closed.';
+const TRUST_NOTICE_MESSAGE = 'Claude Code did not record this folder as trusted, so its project settings may not '
+  + 'apply. Trust the folder in the terminal tab.';
 
 /**
  * Per-session state of one live query.
@@ -91,7 +123,7 @@ const AUTH_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_
  * @property {AbortController} abort
  * @property {LiveState} state
  * @property {string|null} model
- * @property {PermissionMode} permissionMode
+ * @property {PermissionMode|null} permissionMode   null until system/init reports the mode
  * @property {EffortLevel|null} effort
  * @property {string|null} title
  * @property {number} lastActivity
@@ -110,14 +142,11 @@ const AUTH_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_
  * @property {import('../contracts.mjs').FastModeState|null} fastModeState   last state the runtime reported
  * @property {string|null} fastModeDisabledReason   reason from the same report, null when nothing blocks it
  * @property {number} backgroundTasks   live non-ambient background tasks of this query
+ * @property {string|null} agent            main-thread agent the query runs as (option `agent`)
+ * @property {string[]} additionalDirectories   extra working directories, without the cwd
+ * @property {string|null} fallbackModel    fallback model the query started with
+ * @property {boolean} browserTools         the operator's browser MCP server is attached
  */
-
-/** @param {unknown} value @returns {value is Record<string, unknown>} */
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
 
 /** @param {string} message */
 function badRequest(message) {
@@ -137,17 +166,6 @@ function engineError(message) {
 /** @param {string} message */
 function cannotRewind(message) {
   return new AppError(422, 'CANNOT_REWIND', message);
-}
-
-/**
- * The first line of a text, at most 300 characters, or the fallback when there is none.
- * @param {unknown} text
- * @param {string} fallback
- * @returns {string}
- */
-function firstLine(text, fallback) {
-  const line = (typeof text === 'string' ? text : '').split('\n')[0].trim().slice(0, 300);
-  return line || fallback;
 }
 
 function sessionLocked() {
@@ -239,16 +257,63 @@ function parseOutputStyle(value) {
 
 /**
  * @param {unknown} action
- * @returns {{kind: 'toggle'|'reconnect', enabled: boolean}}
+ * @returns {{kind: 'toggle'|'reconnect'|'permission-mode', enabled: boolean, mode: 'default'|'auto'|null}}
  */
 function parseMcpAction(action) {
   if (!isPlainObject(action)) throw badRequest('The MCP action must be an object.');
   const kind = action.action;
-  if (kind !== 'toggle' && kind !== 'reconnect') throw invalid('The MCP action must be toggle or reconnect.');
+  if (kind !== 'toggle' && kind !== 'reconnect' && kind !== 'permission-mode') {
+    throw invalid('The MCP action must be toggle, reconnect or permission-mode.');
+  }
   if (action.enabled !== undefined && typeof action.enabled !== 'boolean') {
     throw badRequest('enabled must be a boolean.');
   }
-  return { kind, enabled: action.enabled === undefined ? true : /** @type {boolean} */ (action.enabled) };
+  const enabled = action.enabled === undefined ? true : /** @type {boolean} */ (action.enabled);
+  if (kind !== 'permission-mode') return { kind, enabled, mode: null };
+  if (action.mode !== 'default' && action.mode !== 'auto' && action.mode !== null) {
+    throw invalid('The MCP permission mode must be default, auto or null.');
+  }
+  return { kind, enabled, mode: /** @type {'default'|'auto'|null} */ (action.mode) };
+}
+
+/**
+ * @param {unknown} action
+ * @returns {{kind: 'start'|'callback'|'clear', callbackUrl: string|null}}
+ */
+function parseMcpAuth(action) {
+  if (!isPlainObject(action)) throw badRequest('The MCP authentication action must be an object.');
+  const kind = action.action;
+  if (kind !== 'start' && kind !== 'callback' && kind !== 'clear') {
+    throw invalid('The MCP authentication action must be start, callback or clear.');
+  }
+  if (kind !== 'callback') return { kind, callbackUrl: null };
+  if (!isWebUrl(action.callbackUrl, URL_MAX, WEB_PROTOCOLS)) {
+    throw badRequest('The callback address must be an http or https address of at most 4096 characters.');
+  }
+  return { kind, callbackUrl: /** @type {string} */ (action.callbackUrl) };
+}
+
+/**
+ * @param {unknown} value
+ * @returns {'summary'|'full'}
+ */
+function parseDetail(value) {
+  if (value === undefined || value === 'summary') return 'summary';
+  if (value === 'full') return 'full';
+  throw badRequest('detail must be summary or full.');
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string} the trimmed question
+ */
+function parseQuestion(value) {
+  if (typeof value !== 'string') throw badRequest('The question must be a string.');
+  const text = value.trim();
+  if (text === '' || text.length > SIDE_QUESTION_MAX) {
+    throw badRequest(`The question must be 1 to ${SIDE_QUESTION_MAX} characters.`);
+  }
+  return text;
 }
 
 /**
@@ -263,11 +328,62 @@ function parseModel(value) {
 
 /**
  * @param {unknown} value
- * @returns {PermissionMode}
+ * @returns {PermissionMode|null} null: Claude Code's settings decide
  */
 function parsePermissionMode(value) {
+  if (value === null) return null;
   if (!includes(PERMISSION_MODES, value)) throw invalid('The permission mode is not supported.');
   return /** @type {PermissionMode} */ (value);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string|null} null clears the main-thread agent
+ */
+function parseAgent(value) {
+  if (value === null) return null;
+  const text = parseText(value, 'The agent', AGENT_MAX);
+  if (text === '') throw invalid(`The agent must be 1 to ${AGENT_MAX} characters.`);
+  return text;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function parseFallbackModel(value) {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !MODEL_RE.test(value)) throw invalid('The fallback model is not valid.');
+  return value;
+}
+
+/**
+ * The additional folders as sent: a list of at most ADDITIONAL_DIRECTORIES_MAX paths. They are resolved by the caller.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function parseDirectories(value) {
+  if (!Array.isArray(value)) throw badRequest('additionalDirectories must be a list of folders.');
+  if (value.length > ADDITIONAL_DIRECTORIES_MAX) {
+    throw invalid(`additionalDirectories must list at most ${ADDITIONAL_DIRECTORIES_MAX} folders.`);
+  }
+  return value.map((item) => {
+    if (typeof item !== 'string' || item === '' || item.length > PATH_MAX) {
+      throw badRequest('Each additional directory must be a path.');
+    }
+    return item;
+  });
+}
+
+/**
+ * @param {unknown} value
+ * @param {boolean} available the operator configured the browser MCP server (CAW_BROWSER_MCP_COMMAND)
+ * @returns {boolean}
+ */
+function parseBrowserTools(value, available) {
+  if (typeof value !== 'boolean') throw badRequest('browserTools must be a boolean.');
+  if (!available) throw new AppError(501, 'FEATURE_DISABLED', BROWSER_DISABLED_MESSAGE);
+  return value;
 }
 
 /**
@@ -291,11 +407,13 @@ function parseFastMode(value) {
 }
 
 /**
- * Validates the settings a caller supplied. Only keys that are present in the input are returned.
+ * Validates the settings a caller supplied. Only keys that are present in the input are returned. Additional folders
+ * are returned as sent; the caller resolves them.
  * @param {unknown} input
+ * @param {boolean} browserAvailable the operator configured the browser MCP server
  * @returns {SessionSettings}
  */
-function parseSettings(input) {
+function parseSettings(input, browserAvailable) {
   if (input === undefined || input === null) return {};
   if (!isPlainObject(input)) throw badRequest('The settings must be an object.');
   /** @type {SessionSettings} */
@@ -304,7 +422,132 @@ function parseSettings(input) {
   if (input.permissionMode !== undefined) settings.permissionMode = parsePermissionMode(input.permissionMode);
   if (input.effort !== undefined) settings.effort = parseEffort(input.effort);
   if (input.fastMode !== undefined) settings.fastMode = parseFastMode(input.fastMode);
+  if (input.agent !== undefined) settings.agent = parseAgent(input.agent);
+  if (input.additionalDirectories !== undefined) {
+    settings.additionalDirectories = parseDirectories(input.additionalDirectories);
+  }
+  if (input.fallbackModel !== undefined) settings.fallbackModel = parseFallbackModel(input.fallbackModel);
+  if (input.browserTools !== undefined) {
+    settings.browserTools = parseBrowserTools(input.browserTools, browserAvailable);
+  }
   return settings;
+}
+
+/**
+ * The working folder is not one of a query's additional directories.
+ * @param {string[]} dirs
+ * @param {string} cwd
+ * @returns {string[]}
+ */
+function dirsForCwd(dirs, cwd) {
+  return dirs.filter((dir) => dir !== cwd);
+}
+
+/**
+ * @param {string[]} a
+ * @param {string[]} b
+ * @returns {boolean}
+ */
+function sameList(a, b) {
+  return a.length === b.length && a.every((item, index) => item === b[index]);
+}
+
+/**
+ * The CLI flags a query starts with: thinking summaries (see #wantsThinkingSummaries) and Claude in Chrome.
+ * @param {boolean} summaries
+ * @param {boolean} chrome
+ * @returns {Record<string, string|null>|undefined}
+ */
+function cliFlagsOf(summaries, chrome) {
+  /** @type {Record<string, string|null>} */
+  const flags = {};
+  if (summaries) flags['thinking-display'] = 'summarized';
+  if (chrome) flags.chrome = null;
+  return Object.keys(flags).length > 0 ? flags : undefined;
+}
+
+/**
+ * The runtime's interrupt. Its public typing takes no argument; the cancel_queued option is passed through it.
+ * @param {SdkQuery} query
+ * @param {boolean} cancelQueued
+ * @returns {Promise<unknown>} the receipt, undefined on runtimes without one
+ */
+function interruptRuntime(query, cancelQueued) {
+  const control = /** @type {{interrupt: (options?: {cancelQueued: true}) => Promise<unknown>}} */ (
+    /** @type {unknown} */ (query));
+  return cancelQueued ? control.interrupt({ cancelQueued: true }) : control.interrupt();
+}
+
+/**
+ * The flag-settings layer takes keys that the public typing does not declare (the main-thread agent).
+ * @param {SdkQuery} query
+ * @param {Record<string, unknown>} flags
+ * @returns {Promise<void>}
+ */
+function applyFlags(query, flags) {
+  return query.applyFlagSettings(/** @type {Parameters<SdkQuery['applyFlagSettings']>[0]} */ (
+    /** @type {unknown} */ (flags)));
+}
+
+/**
+ * @param {unknown} answer what askSideQuestion answered: null, or the response with its refusal fallback
+ * @returns {{response: string|null, synthetic: boolean,
+ *   refusalFallback: {originalModel: string, fallbackModel: string}|null}}
+ */
+function sideAnswerOf(answer) {
+  const source = isPlainObject(answer) ? answer : {};
+  /** @type {Record<string, unknown>} */
+  const fallback = isPlainObject(source.refusalFallback) ? source.refusalFallback : {};
+  const models = typeof fallback.originalModel === 'string' && typeof fallback.fallbackModel === 'string';
+  return {
+    response: typeof source.response === 'string' ? source.response : null,
+    synthetic: source.synthetic === true,
+    refusalFallback: models
+      ? {
+        originalModel: /** @type {string} */ (fallback.originalModel),
+        fallbackModel: /** @type {string} */ (fallback.fallbackModel),
+      }
+      : null,
+  };
+}
+
+/**
+ * A runtime method of a live query, bound to it. A method the installed runtime does not offer is refused as
+ * unavailable.
+ * @param {SdkQuery|null|undefined} query
+ * @param {string} name
+ * @param {string} message
+ * @returns {(...args: unknown[]) => Promise<unknown>}
+ */
+function methodOf(query, name, message) {
+  const call = runtimeMethod(query, name);
+  if (call === null) throw unavailable(message);
+  return call;
+}
+
+/**
+ * @param {string} message
+ * @returns {AppError}
+ */
+function unavailable(message) {
+  return new AppError(501, 'FEATURE_UNAVAILABLE', message);
+}
+
+/** @param {unknown} error @returns {string} */
+function messageOf(error) {
+  return error instanceof Error ? error.message : '';
+}
+
+/**
+ * A failed MCP authentication call. A timeout keeps its own message; anything else answers with the runtime's first
+ * line.
+ * @param {unknown} error
+ * @param {string} fallback
+ * @returns {AppError}
+ */
+function authFailure(error, fallback) {
+  if (error instanceof ControlTimeout) return engineError(TIMEOUT_MESSAGE);
+  return new AppError(502, 'ENGINE_ERROR', firstLine(messageOf(error), fallback));
 }
 
 /**
@@ -409,34 +652,6 @@ function settleWithin(promise, ms) {
   });
   return Promise.race([promise.then(() => undefined, () => undefined), timeout])
     .finally(() => clearTimeout(timer));
-}
-
-/** A control call of the runtime that did not settle within CONTROL_TIMEOUT_MS. */
-class ControlTimeout extends Error {
-  constructor() {
-    super(TIMEOUT_MESSAGE);
-    this.name = 'ControlTimeout';
-  }
-}
-
-/**
- * Runs one control call of the runtime and rejects with ControlTimeout when it does not settle in time.
- * @template T
- * @param {() => Promise<T>} call
- * @param {number} [ms]
- * @returns {Promise<T>}
- */
-async function withTimeout(call, ms = CONTROL_TIMEOUT_MS) {
-  /** @type {ReturnType<typeof setTimeout>|undefined} */
-  let timer;
-  const timeout = new Promise((_resolve, reject) => {
-    timer = setTimeout(() => reject(new ControlTimeout()), ms);
-  });
-  try {
-    return await Promise.race([call(), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
@@ -622,15 +837,30 @@ export class EngineHost {
   #stopped = false;
   /** @type {string|null} last Claude Code version reported by any init message */
   #lastClaudeCodeVersion = null;
+  /** @type {(p: string) => Promise<string>} resolves an additional folder inside the roots, or throws */
+  #resolveDir;
+  /** @type {string} the home folder whose `.claude` folder holds the user's memory */
+  #homeDir;
+  /** @type {ReturnType<typeof createRuntimeTrust>} */
+  #trust;
+  /** @type {Set<string>} folders whose failed trust handshake has been published */
+  #trustNoticed = new Set();
+  /** @type {Set<string>} sessions with a side question in flight */
+  #sideQuestions = new Set();
 
   /**
    * Folder trust decides which setting sources a query loads. Without `isTrustedCwd` every folder is untrusted.
+   * `resolveDir` resolves an additional folder to a real folder inside the workspace roots and throws when it cannot.
    * @param {{engine: EngineAdapter, config: Config, log: Logger, publish: Publish, getSeq: () => number,
    *   isAllowedCwd: (p: string) => Promise<boolean>, isTrustedCwd?: (p: string) => Promise<boolean>,
-   *   now?: () => number}} options
+   *   resolveDir?: (p: string) => Promise<string>, homeDir?: string, now?: () => number}} options
    */
   constructor({
-    engine, config, log, publish, getSeq, isAllowedCwd, isTrustedCwd = async () => false, now = Date.now,
+    engine, config, log, publish, getSeq, isAllowedCwd, isTrustedCwd = async () => false,
+    resolveDir = async () => {
+      throw outsideRoots();
+    },
+    homeDir = os.homedir(), now = Date.now,
   }) {
     this.#engine = engine;
     this.#config = config;
@@ -639,7 +869,10 @@ export class EngineHost {
     this.#getSeq = getSeq;
     this.#isAllowedCwd = isAllowedCwd;
     this.#isTrustedCwd = isTrustedCwd;
+    this.#resolveDir = resolveDir;
+    this.#homeDir = homeDir;
     this.#now = now;
+    this.#trust = createRuntimeTrust({ engine, config, log, env: () => this.#queryEnv() });
     this.#requests = new RequestRegistry({
       publish: (event) => {
         const seq = this.#publish(event);
@@ -883,6 +1116,10 @@ export class EngineHost {
       fastModeState: live.fastModeState,
       fastModeDisabledReason: live.fastModeDisabledReason,
       backgroundTasks: live.backgroundTasks,
+      agent: live.agent,
+      additionalDirectories: live.additionalDirectories,
+      fallbackModel: live.fallbackModel,
+      browserTools: live.browserTools,
     };
   }
 
@@ -1024,17 +1261,6 @@ export class EngineHost {
   }
 
   /**
-   * Resolves once every lifecycle operation queued for the session so far has finished.
-   * @param {string} sessionId
-   * @returns {Promise<void>}
-   */
-  async #settled(sessionId) {
-    for (let pending = this.#opening.get(sessionId); pending; pending = this.#opening.get(sessionId)) {
-      await pending;
-    }
-  }
-
-  /**
    * @param {unknown} cwd
    * @returns {Promise<boolean>} whether the folder lies inside an allowed workspace root
    */
@@ -1109,10 +1335,11 @@ export class EngineHost {
   async #startQuery({ mode, sessionId, cwd, trusted, title, settings, resumeSessionAt }) {
     const id = mode === 'new' ? randomUUID() : /** @type {string} */ (sessionId);
     this.#assertStartable(id);
-    const resolved = this.#resolveSettings(mode === 'new' ? null : id, settings);
+    const resolved = this.#resolveSettings(mode === 'new' ? null : id, settings, cwd);
     // The settings the query will load are read before the query exists. Nothing is registered until the answer is in,
     // and the start is checked again afterwards, because a shutdown or a start of the same id may have run meanwhile.
     const summaries = await this.#wantsThinkingSummaries(id, cwd, trusted === true);
+    if (trusted === true) await this.#syncRuntimeTrust(cwd, id);
     this.#assertStartable(id);
     this.#makeRoom();
     /** @type {LiveRecord} */
@@ -1124,6 +1351,8 @@ export class EngineHost {
       abort: new AbortController(),
       state: 'starting',
       model: resolved.model,
+      // An explicitly chosen mode is what the runtime starts in; without one, Claude Code's settings decide and
+      // system/init reports the result.
       permissionMode: resolved.permissionMode,
       effort: resolved.effort,
       title: title ?? null,
@@ -1143,8 +1372,12 @@ export class EngineHost {
       fastModeState: null,
       fastModeDisabledReason: null,
       backgroundTasks: 0,
+      agent: resolved.agent,
+      additionalDirectories: resolved.additionalDirectories,
+      fallbackModel: resolved.fallbackModel,
+      browserTools: resolved.browserTools,
     };
-    const options = this.#queryOptions(live, mode, resumeSessionAt, summaries);
+    const options = this.#queryOptions(live, { mode, resumeSessionAt, summaries, startMode: resolved.permissionMode });
     try {
       live.query = this.#engine.query({ prompt: live.input, options });
     } catch (error) {
@@ -1200,13 +1433,14 @@ export class EngineHost {
   /**
    * Options of one query. Keys that do not apply are omitted instead of being set to undefined.
    * @param {LiveRecord} live
-   * @param {'new'|'resume'} mode
-   * @param {string|undefined} resumeSessionAt
-   * @param {boolean} summaries the query asks for thinking summaries (see #wantsThinkingSummaries)
+   * @param {{mode: 'new'|'resume', resumeSessionAt: string|undefined, summaries: boolean,
+   *   startMode: PermissionMode|null}} start   summaries: the query asks for thinking summaries (see
+   *   #wantsThinkingSummaries); startMode: the mode the query starts in, null when Claude Code's settings decide
    * @returns {SdkOptions}
    */
-  #queryOptions(live, mode, resumeSessionAt, summaries) {
-    const { claudeBin, allowBypass, version } = this.#config;
+  #queryOptions(live, { mode, resumeSessionAt, summaries, startMode }) {
+    const { claudeBin, allowBypass, chrome } = this.#config;
+    const flags = cliFlagsOf(summaries, chrome === true);
     return {
       cwd: live.cwd,
       abortController: live.abort,
@@ -1214,8 +1448,12 @@ export class EngineHost {
       ...(mode === 'new' && live.title ? { title: live.title } : {}),
       ...(resumeSessionAt ? { resumeSessionAt } : {}),
       ...(live.model !== null ? { model: live.model } : {}),
-      permissionMode: live.permissionMode,
+      ...(startMode !== null ? { permissionMode: startMode } : {}),
       ...(live.effort !== null ? { effort: live.effort } : {}),
+      ...(live.agent !== null ? { agent: live.agent } : {}),
+      ...(live.additionalDirectories.length > 0 ? { additionalDirectories: live.additionalDirectories } : {}),
+      ...(live.fallbackModel !== null ? { fallbackModel: live.fallbackModel } : {}),
+      ...(live.browserTools ? { mcpServers: this.#browserServers() } : {}),
       allowDangerouslySkipPermissions: allowBypass,
       systemPrompt: { type: 'preset', preset: 'claude_code' },
       tools: { type: 'preset', preset: 'claude_code' },
@@ -1226,14 +1464,16 @@ export class EngineHost {
       agentProgressSummaries: true,
       enableFileCheckpointing: true,
       perTaskStopAffordance: true,
-      // The terminal's --thinking-display flag. The `thinking` option would also force the thinking type, which the
-      // runtime otherwise derives from the model and the user's settings.
-      ...(summaries ? { extraArgs: { 'thinking-display': 'summarized' } } : {}),
+      // --thinking-display and --chrome. The `thinking` option would also force the thinking type, which the runtime
+      // otherwise derives from the model and the user's settings.
+      ...(flags ? { extraArgs: flags } : {}),
       ...(typeof live.fastMode === 'boolean' ? { settings: { fastMode: live.fastMode } } : {}),
       toolConfig: { askUserQuestion: { previewFormat: 'markdown' } },
       canUseTool: this.#canUseTool(live),
       onElicitation: this.#onElicitation(live),
-      env: engineEnv(process.env, { clientApp: `claude-official-web/${version}` }),
+      onUserDialog: this.#onUserDialog(live),
+      supportedDialogKinds: [...DIALOG_KINDS],
+      env: this.#queryEnv(),
       ...(typeof claudeBin === 'string' ? { pathToClaudeCodeExecutable: claudeBin } : {}),
       stderr: (data) => this.#log.debug('engine stderr', { bytes: data.length }),
     };
@@ -1243,25 +1483,147 @@ export class EngineHost {
    * Explicit arguments win over the settings remembered for the session, which win over the configured defaults.
    * @param {string|null} sessionId
    * @param {SessionSettings} args
-   * @returns {{model: string|null, permissionMode: PermissionMode, effort: EffortLevel|null, fastMode: boolean|null}}
+   * @param {string} cwd the folder of the query, which is never one of its additional directories
+   * @returns {{model: string|null, permissionMode: PermissionMode|null, effort: EffortLevel|null,
+   *   fastMode: boolean|null, agent: string|null, additionalDirectories: string[], fallbackModel: string|null,
+   *   browserTools: boolean}}
    */
-  #resolveSettings(sessionId, args) {
+  #resolveSettings(sessionId, args, cwd) {
     const remembered = sessionId === null ? {} : this.#pending.get(sessionId) ?? {};
     const { defaults } = this.#config;
-    /** @param {'model'|'permissionMode'|'effort'|'fastMode'} key @param {unknown} fallback */
+    /** @param {keyof SessionSettings} key @param {unknown} fallback */
     const pick = (key, fallback) => {
       if (args[key] !== undefined) return args[key];
       if (remembered[key] !== undefined) return remembered[key];
       return fallback;
     };
     const resolved = {
-      model: /** @type {string|null} */ (pick('model', defaults.model)),
-      permissionMode: /** @type {PermissionMode} */ (pick('permissionMode', defaults.permissionMode)),
-      effort: /** @type {EffortLevel|null} */ (pick('effort', defaults.effort)),
+      model: /** @type {string|null} */ (pick('model', defaults.model ?? null)),
+      permissionMode: /** @type {PermissionMode|null} */ (pick('permissionMode', defaults.permissionMode ?? null)),
+      effort: /** @type {EffortLevel|null} */ (pick('effort', defaults.effort ?? null)),
       fastMode: /** @type {boolean|null} */ (pick('fastMode', null)),
+      agent: /** @type {string|null} */ (pick('agent', null)),
+      additionalDirectories: dirsForCwd(/** @type {string[]} */ (pick('additionalDirectories', [])), cwd),
+      fallbackModel: /** @type {string|null} */ (pick('fallbackModel', defaults.fallbackModel ?? null)),
+      browserTools: pick('browserTools', false) === true,
     };
     this.#assertBypassAllowed(resolved.permissionMode);
     return resolved;
+  }
+
+  /**
+   * The runtime's query environment: the gateway's own environment without its CAW_ variables, plus the client name.
+   * @returns {Record<string, string>}
+   */
+  #queryEnv() {
+    return engineEnv(process.env, { clientApp: `claude-official-web/${this.#config.version}` });
+  }
+
+  /** @returns {boolean} the operator configured the browser MCP server */
+  #browserAvailable() {
+    return Array.isArray(this.#config.browserMcpCommand);
+  }
+
+  /**
+   * The operator's browser MCP server as the runtime's stdio server config.
+   * @returns {Record<string, McpServerConfig>}
+   */
+  #browserServers() {
+    const [command, ...args] = this.#config.browserMcpCommand ?? [];
+    if (!command) return {};
+    return { [BROWSER_MCP_SERVER]: /** @type {McpServerConfig} */ ({ type: 'stdio', command, args }) };
+  }
+
+  /**
+   * Resolves the additional folders of a session to real folders inside the workspace roots, without duplicates.
+   * @param {string[]} list
+   * @returns {Promise<string[]>}
+   */
+  async #resolveDirectories(list) {
+    /** @type {string[]} */
+    const resolved = [];
+    for (const dir of list) {
+      if (!path.isAbsolute(dir)) throw outsideRoots();
+      const real = await this.#resolveDir(dir).catch(() => {
+        throw outsideRoots();
+      });
+      if (!resolved.includes(real)) resolved.push(real);
+    }
+    return resolved;
+  }
+
+  /**
+   * Records the folder's trust in Claude Code's own record before a query of a trusted folder starts (see trust.mjs).
+   * A failure is published once per folder as a warning; the session starts anyway.
+   * @param {string} cwd
+   * @param {string} sessionId
+   */
+  async #syncRuntimeTrust(cwd, sessionId) {
+    if ((await this.#trust.record(cwd)) !== 'failed' || this.#trustNoticed.has(cwd)) return;
+    this.#trustNoticed.add(cwd);
+    this.#publish({
+      type: 'notice',
+      sessionId,
+      data: { sessionId, level: 'warning', code: 'RUNTIME_TRUST', message: TRUST_NOTICE_MESSAGE },
+    });
+  }
+
+  /**
+   * Answers the runtime's dialogs. Only the refusal fallback prompt is declared, so a dialog of any other kind, or one
+   * without both model names, is cancelled at once.
+   * @param {LiveRecord} live
+   * @returns {OnUserDialog}
+   */
+  #onUserDialog(live) {
+    return async (request, options) => {
+      const dialog = refusalDialogOf(request);
+      if (dialog === null) return { behavior: 'cancelled' };
+      const pending = /** @type {PendingRequest} */ (omitUndefined({
+        id: this.#requestId(live.sessionId, options.requestId),
+        sessionId: live.sessionId,
+        kind: 'dialog',
+        createdAt: this.#now(),
+        toolUseId: request.toolUseID,
+        dialog,
+      }));
+      const outcome = await this.#awaitRequest(live, pending, options.signal);
+      return toDialogResult(outcome);
+    };
+  }
+
+  /**
+   * A query that reports bypass permissions while the gateway does not allow them is set back to default at once.
+   * @param {LiveRecord} live
+   */
+  #guardBypass(live) {
+    if (live.permissionMode === 'bypassPermissions' && !this.#config.allowBypass) void this.#refuseBypass(live);
+  }
+
+  /**
+   * Sets the query back to default mode and publishes a notice. When the runtime refuses that, the session is closed
+   * rather than left running in bypass mode.
+   * @param {LiveRecord} live
+   */
+  async #refuseBypass(live) {
+    if (live.closing || !live.query) return;
+    try {
+      await withTimeout(() => live.query.setPermissionMode('default'));
+      live.permissionMode = 'default';
+      this.#publish({
+        type: 'notice',
+        sessionId: live.sessionId,
+        data: { sessionId: live.sessionId, level: 'warning', code: 'BYPASS_REFUSED', message: BYPASS_REFUSED_MESSAGE },
+      });
+      this.#sync(live);
+    } catch (error) {
+      this.#log.warn('could not turn off bypass permissions', { sessionId: live.sessionId, reason: errorName(error) });
+      this.#publish({
+        type: 'notice',
+        sessionId: live.sessionId,
+        data: { sessionId: live.sessionId, level: 'error', code: 'BYPASS_REFUSED', message: BYPASS_FAILED_MESSAGE },
+      });
+      await this.#detach(live, { publish: true });
+    }
   }
 
   /** @param {PermissionMode} mode */
@@ -1485,12 +1847,13 @@ export class EngineHost {
       case 'init':
         live.init = msg;
         live.model = msg.model ?? live.model;
-        live.permissionMode = msg.permissionMode;
+        live.permissionMode = msg.permissionMode ?? null;
         live.effort = msg.effort ?? live.effort;
         live.claudeCodeVersion = msg.claude_code_version;
         if (msg.claude_code_version) this.#lastClaudeCodeVersion = msg.claude_code_version;
         if (live.state === 'starting') live.state = 'idle';
         this.#applyFastModeReport(live, msg);
+        this.#guardBypass(live);
         return;
       case 'background_tasks_changed':
         // The set replaces the previous one; ambient tasks (watchers, skip-transcript work) are not activity. A message
@@ -1505,7 +1868,10 @@ export class EngineHost {
         }
         return;
       case 'status':
-        if (msg.permissionMode) live.permissionMode = msg.permissionMode;
+        if (msg.permissionMode) {
+          live.permissionMode = msg.permissionMode;
+          this.#guardBypass(live);
+        }
         return;
       case 'commands_changed':
         live.commands = msg.commands;
@@ -1783,11 +2149,12 @@ export class EngineHost {
    * @param {string} sessionId
    * @param {() => Promise<T>} call
    * @param {string} message  the safe message for any other failure
+   * @param {number} [ms]     the time limit; the control timeout when omitted
    * @returns {Promise<T>}
    */
-  async #control(sessionId, call, message) {
+  async #control(sessionId, call, message, ms) {
     try {
-      return await withTimeout(call);
+      return await withTimeout(call, ms);
     } catch (error) {
       throw this.#failure(sessionId, error, message);
     }
@@ -1812,11 +2179,14 @@ export class EngineHost {
    * @param {{cwd: string, title?: string} & SessionSettings} options
    * @returns {Promise<LiveInfo>}
    */
-  async createSession({ cwd, title, model, permissionMode, effort, fastMode }) {
+  async createSession({ cwd, title, ...rest }) {
     if (typeof cwd !== 'string' || cwd === '') throw badRequest('The cwd must be a path.');
-    const settings = parseSettings({ model, permissionMode, effort, fastMode });
+    const settings = parseSettings(rest, this.#browserAvailable());
     const titleText = title === undefined ? '' : parseText(title, 'title', TITLE_MAX);
     if (!(await this.#withinRoots(cwd))) throw outsideRoots();
+    if (settings.additionalDirectories !== undefined) {
+      settings.additionalDirectories = await this.#resolveDirectories(settings.additionalDirectories);
+    }
     const trusted = await this.#trustOf(cwd);
     const live = await this.#startQuery({
       mode: 'new',
@@ -1838,15 +2208,17 @@ export class EngineHost {
    */
   async openSession(sessionId, settings) {
     requireSessionId(sessionId);
-    const parsed = parseSettings(settings);
+    const parsed = parseSettings(settings, this.#browserAvailable());
     if (parsed.permissionMode !== undefined) this.#assertBypassAllowed(parsed.permissionMode);
+    if (parsed.additionalDirectories !== undefined) {
+      parsed.additionalDirectories = await this.#resolveDirectories(parsed.additionalDirectories);
+    }
     this.#assertNotLocked(sessionId);
     // Registered at once, so a close or lock that is requested after this open waits for it.
     const live = await this.#exclusive(sessionId, async () => {
       const current = await this.#openLive(sessionId);
       if (!current) return this.#resumeLive(sessionId, parsed);
-      await this.#applySettings(current, parsed);
-      return current;
+      return (await this.#applySettings(current, parsed)).record;
     });
     return this.#info(live);
   }
@@ -1893,45 +2265,96 @@ export class EngineHost {
   }
 
   /**
-   * Interrupts the running turn. Not open means nothing is running, so it is a no-op.
+   * Interrupts the running turn. Not open means nothing is running, so it is a no-op. With `cancelQueued` the runtime
+   * also drops the messages queued behind the turn; each one it drops is published as message_cancelled.
    * @param {string} sessionId
+   * @param {{cancelQueued?: boolean}} [options]
+   * @returns {Promise<{stillQueued: string[], cancelled: string[]}>}
    */
-  async interrupt(sessionId) {
+  async interrupt(sessionId, { cancelQueued } = {}) {
     requireSessionId(sessionId);
+    if (cancelQueued !== undefined && typeof cancelQueued !== 'boolean') {
+      throw badRequest('cancelQueued must be a boolean.');
+    }
     const live = await this.#openLive(sessionId);
-    if (!live) return;
-    await this.#control(sessionId, () => live.query.interrupt(), 'The turn could not be interrupted.');
+    if (!live) return { stillQueued: [], cancelled: [] };
+    const receipt = await this.#control(sessionId, () => interruptRuntime(live.query, cancelQueued === true),
+      'The turn could not be interrupted.');
+    const outcome = interruptReceipt(receipt);
+    for (const clientMessageId of outcome.cancelled) {
+      this.#publish({ type: 'message_cancelled', data: { sessionId, clientMessageId } });
+    }
+    return outcome;
+  }
+
+  /**
+   * Removes one message that waits in the runtime's queue behind a running turn.
+   * @param {string} sessionId
+   * @param {string} clientMessageId
+   * @returns {Promise<{cancelled: boolean}>}
+   */
+  async cancelQueued(sessionId, clientMessageId) {
+    requireSessionId(sessionId);
+    if (!isUuid(clientMessageId)) throw badRequest('The clientMessageId must be a UUID.');
+    const live = await this.#requireLive(sessionId);
+    const cancel = methodOf(live.query, 'cancelAsyncMessage', 'This runtime cannot cancel a queued message.');
+    const cancelled = await this.#control(sessionId, () => cancel(clientMessageId),
+      'The queued message could not be cancelled.');
+    if (cancelled !== true) return { cancelled: false };
+    this.#publish({ type: 'message_cancelled', data: { sessionId, clientMessageId } });
+    return { cancelled: true };
   }
 
   /**
    * Applies the given settings to the live query and remembers them for the next start. Settings of a session that
-   * is not open are only remembered.
+   * is not open are only remembered. Runs in the session's lifecycle queue, so it waits for an open or a restart.
    * @param {string} sessionId
    * @param {SessionSettings} settings
-   * @returns {Promise<LiveInfo|null>}
+   * @returns {Promise<{live: LiveInfo|null, restartRequired: boolean}>}
    */
   async updateSettings(sessionId, settings) {
     requireSessionId(sessionId);
-    const parsed = parseSettings(settings);
+    const parsed = parseSettings(settings, this.#browserAvailable());
     if (parsed.permissionMode !== undefined) this.#assertBypassAllowed(parsed.permissionMode);
-    await this.#settled(sessionId);
+    if (parsed.additionalDirectories !== undefined) {
+      parsed.additionalDirectories = await this.#resolveDirectories(parsed.additionalDirectories);
+    }
+    return this.#exclusive(sessionId, () => this.#updateNow(sessionId, parsed));
+  }
+
+  /**
+   * @param {string} sessionId
+   * @param {SessionSettings} parsed
+   * @returns {Promise<{live: LiveInfo|null, restartRequired: boolean}>}
+   */
+  async #updateNow(sessionId, parsed) {
     const live = await this.#openLive(sessionId);
     if (!live) {
       await this.#scopeOf(sessionId, true);
       this.#remember(sessionId, parsed);
-      return null;
+      return { live: null, restartRequired: false };
     }
-    return this.#applySettings(live, parsed);
+    const applied = await this.#applySettings(live, parsed);
+    return { live: this.#info(applied.record), restartRequired: applied.restartRequired };
   }
 
   /**
-   * Applies settings to a live query and remembers them. Runs inside the session's lifecycle queue, or after it.
+   * Applies settings to a live query and remembers them. A change of the additional folders restarts the query, at the
+   * end and only between turns. A change of the fallback model is remembered and takes effect at the next start.
    * @param {LiveRecord} live
    * @param {SessionSettings} parsed
-   * @returns {Promise<LiveInfo>}
+   * @returns {Promise<{record: LiveRecord, restartRequired: boolean}>}
    */
   async #applySettings(live, parsed) {
     const { sessionId } = live;
+    if (parsed.permissionMode === null) {
+      throw badRequest('Null (settings decide) applies only to a session that is not open.');
+    }
+    const folders = parsed.additionalDirectories === undefined
+      ? null
+      : dirsForCwd(parsed.additionalDirectories, live.cwd);
+    const restart = folders !== null && !sameList(folders, live.additionalDirectories);
+    if (restart) this.#assertRestartable(live);
     if (parsed.model !== undefined) {
       const model = parsed.model;
       await this.#control(sessionId, () => live.query.setModel(model ?? undefined),
@@ -1964,7 +2387,57 @@ export class EngineHost {
       this.#remember(sessionId, { fastMode });
       this.#sync(live);
     }
-    return this.#info(live);
+    if (parsed.agent !== undefined) await this.#applyAgent(live, parsed.agent);
+    if (parsed.browserTools !== undefined) await this.#applyBrowserTools(live, parsed.browserTools);
+    const fallback = parsed.fallbackModel;
+    const restartRequired = fallback !== undefined && fallback !== live.fallbackModel;
+    if (fallback !== undefined) this.#remember(sessionId, { fallbackModel: fallback });
+    if (folders !== null) this.#remember(sessionId, { additionalDirectories: folders });
+    if (!restart) return { record: live, restartRequired };
+    const record = await this.#restartNow(sessionId, undefined, { additionalDirectories: folders });
+    return { record, restartRequired: false };
+  }
+
+  /**
+   * A query can restart only between turns, with no request waiting.
+   * @param {LiveRecord} live
+   */
+  #assertRestartable(live) {
+    if (live.state === 'running' || live.state === 'requires_action' || this.#requests.count(live.sessionId) > 0) {
+      throw new AppError(409, 'CONFLICT', 'Wait for the turn to finish before changing the folders of this session.');
+    }
+  }
+
+  /**
+   * Changes the main-thread agent of a live query. The runtime's answer to a name it refuses is shown.
+   * @param {LiveRecord} live
+   * @param {string|null} agent
+   */
+  async #applyAgent(live, agent) {
+    try {
+      await withTimeout(() => applyFlags(live.query, { agent }));
+    } catch (error) {
+      if (error instanceof ControlTimeout) throw engineError(TIMEOUT_MESSAGE);
+      throw invalid(firstLine(messageOf(error), 'The agent could not be changed.'));
+    }
+    live.agent = agent;
+    this.#remember(live.sessionId, { agent });
+    this.#sync(live);
+  }
+
+  /**
+   * Attaches or detaches the operator's browser MCP server of a live query.
+   * @param {LiveRecord} live
+   * @param {boolean} enabled
+   */
+  async #applyBrowserTools(live, enabled) {
+    const servers = enabled ? this.#browserServers() : {};
+    await this.#control(live.sessionId, () => live.query.setMcpServers(servers),
+      'The browser tools could not be changed.');
+    live.browserTools = enabled;
+    live.capsCache = null;
+    this.#remember(live.sessionId, { browserTools: enabled });
+    this.#sync(live);
   }
 
   /**
@@ -1982,34 +2455,371 @@ export class EngineHost {
   }
 
   /**
+   * The context usage of a live session. `full` counts each category with the token-count API and has its own limit.
    * @param {string} sessionId
-   * @returns {Promise<import('../contracts.mjs').ContextUsage>}
+   * @param {'summary'|'full'} [detail]
+   * @returns {Promise<ContextUsage>}
    */
-  async getContextUsage(sessionId) {
+  async getContextUsage(sessionId, detail) {
     requireSessionId(sessionId);
+    const mode = parseDetail(detail);
     const live = await this.#requireLive(sessionId);
-    return this.#control(sessionId, () => live.query.getContextUsage({ detail: 'summary' }),
-      'The context usage could not be read.');
+    return this.#control(sessionId, () => live.query.getContextUsage({ detail: mode }),
+      'The context usage could not be read.', mode === 'full' ? CONTEXT_FULL_MS : undefined);
   }
 
   /**
-   * Toggles or reconnects one MCP server of a live session and returns the status of all servers.
+   * Toggles, reconnects or sets the permission-mode override of one MCP server of a live session, and returns the
+   * status of all servers. `warning` is the runtime's note when no connected server has that name.
    * @param {string} sessionId
    * @param {string} server
-   * @param {{action: 'toggle'|'reconnect', enabled?: boolean}} action
-   * @returns {Promise<McpServerStatus[]>}
+   * @param {{action: 'toggle'|'reconnect'|'permission-mode', enabled?: boolean, mode?: 'default'|'auto'|null}} action
+   * @returns {Promise<{mcpServers: McpServerStatus[], warning?: string}>}
    */
   async mcpAction(sessionId, server, action) {
     requireSessionId(sessionId);
     const name = parseToken(server, 'The server name');
-    const { kind, enabled } = parseMcpAction(action);
+    const { kind, enabled, mode } = parseMcpAction(action);
     const live = await this.#requireLive(sessionId);
-    await this.#control(sessionId, () => (kind === 'toggle'
-      ? live.query.toggleMcpServer(name, enabled)
-      : live.query.reconnectMcpServer(name)), 'The MCP server could not be updated.');
+    /** @type {string|undefined} */
+    let warning;
+    if (kind === 'permission-mode') {
+      const answer = await this.#control(sessionId, () => live.query.setMcpPermissionModeOverride(name, mode),
+        'The MCP permission mode could not be changed.');
+      warning = typeof answer?.warning === 'string' ? answer.warning : undefined;
+    } else if (kind === 'toggle') {
+      await this.#control(sessionId, () => live.query.toggleMcpServer(name, enabled),
+        'The MCP server could not be updated.');
+    } else {
+      await this.#control(sessionId, () => live.query.reconnectMcpServer(name),
+        'The MCP server could not be updated.');
+    }
     live.capsCache = null;
-    return this.#control(sessionId, () => live.query.mcpServerStatus(),
+    const mcpServers = await this.#control(sessionId, () => live.query.mcpServerStatus(),
       'The MCP server status could not be read.');
+    return warning === undefined ? { mcpServers } : { mcpServers, warning };
+  }
+
+  /**
+   * The terminal's /mcp authentication of one server: start the sign-in, submit the address the browser landed on, or
+   * clear the stored credentials.
+   * @param {string} sessionId
+   * @param {string} server
+   * @param {{action: 'start'|'callback'|'clear', callbackUrl?: string}} action
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async mcpAuth(sessionId, server, action) {
+    requireSessionId(sessionId);
+    const name = parseToken(server, 'The server name');
+    const { kind, callbackUrl } = parseMcpAuth(action);
+    const live = await this.#requireLive(sessionId);
+    /** @type {Record<string, unknown>} */
+    let answer;
+    if (kind === 'start') answer = await this.#mcpStart(live, name);
+    else if (kind === 'callback') answer = await this.#mcpCallback(live, name, callbackUrl);
+    else answer = await this.#mcpClear(live, name);
+    live.capsCache = null;
+    return answer;
+  }
+
+  /**
+   * The runtime views the live query offers (see RUNTIME_VIEWS).
+   * @param {string} sessionId
+   * @returns {Promise<{views: string[]}>}
+   */
+  async runtimeViews(sessionId) {
+    requireSessionId(sessionId);
+    const live = await this.#requireLive(sessionId);
+    return { views: availableViews(live.query) };
+  }
+
+  /**
+   * One read-only runtime view. The caller has checked the access profile of the view.
+   * @param {string} sessionId
+   * @param {string} view
+   * @returns {Promise<{view: string, data: unknown, fetchedAt: number}>}
+   */
+  async runtimeView(sessionId, view) {
+    requireSessionId(sessionId);
+    if (!Object.hasOwn(RUNTIME_VIEWS, view)) throw new AppError(404, 'NOT_FOUND', 'The runtime view is not known.');
+    const spec = RUNTIME_VIEWS[view];
+    const live = await this.#requireLive(sessionId);
+    const call = methodOf(live.query, spec.method, 'This runtime does not offer this view.');
+    const answer = await this.#control(sessionId, () => call(...viewArguments(view)),
+      'The runtime view could not be read.', spec.timeoutMs);
+    return { view, data: view === 'settings' ? redactSettings(answer) : answer, fetchedAt: this.#now() };
+  }
+
+  /**
+   * The memory files the runtime lists for the live session, each with its content up to the size limit.
+   * @param {string} sessionId
+   * @returns {Promise<{files: MemoryFile[], folders: unknown[], autoMemory: unknown, autoDream: unknown}>}
+   */
+  async getMemory(sessionId) {
+    requireSessionId(sessionId);
+    const live = await this.#requireLive(sessionId);
+    const dialog = await this.#memoryDialog(live);
+    const files = await Promise.all(listedMemoryFiles(dialog).map((file) => this.#memoryFile(live, file)));
+    const source = isPlainObject(dialog) ? dialog : {};
+    return {
+      files,
+      folders: Array.isArray(source.folders) ? source.folders : [],
+      autoMemory: source.auto_memory ?? null,
+      autoDream: source.auto_dream ?? null,
+    };
+  }
+
+  /**
+   * Saves one memory file that the runtime lists for the live session as editable.
+   * @param {string} sessionId
+   * @param {string} file
+   * @param {string} content
+   * @returns {Promise<{bytes: number}>}
+   */
+  async writeMemory(sessionId, file, content) {
+    requireSessionId(sessionId);
+    if (typeof file !== 'string' || file === '' || file.length > PATH_MAX) {
+      throw badRequest('The memory file is not valid.');
+    }
+    if (typeof content !== 'string') throw badRequest('The content must be a string.');
+    const bytes = Buffer.byteLength(content, 'utf8');
+    if (bytes > MEMORY_MAX_BYTES) {
+      throw new AppError(413, 'PAYLOAD_TOO_LARGE', 'The memory file is larger than 256 KiB.');
+    }
+    const live = await this.#requireLive(sessionId);
+    const listed = listedMemoryFiles(await this.#memoryDialog(live)).some((entry) => entry.path === file);
+    if (!listed) throw new AppError(422, 'PATH_NOT_ALLOWED', 'This memory file cannot be saved.');
+    try {
+      await writeMemoryFile(file, content, this.#memoryLocations());
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      this.#log.warn('saving a memory file failed', { sessionId, reason: errorName(error) });
+      throw new AppError(500, 'INTERNAL', 'The memory file could not be saved.');
+    }
+    return { bytes };
+  }
+
+  /**
+   * The conversation as plain text, under the runtime's own file name.
+   * @param {string} sessionId
+   * @returns {Promise<{text: string, filename: string}>}
+   */
+  async exportConversation(sessionId) {
+    requireSessionId(sessionId);
+    const live = await this.#requireLive(sessionId);
+    const exportCall = methodOf(live.query, 'exportConversation', 'This runtime cannot export the conversation.');
+    const answer = await this.#control(sessionId, () => exportCall(), 'The conversation could not be exported.');
+    const source = isPlainObject(answer) ? answer : {};
+    return {
+      text: typeof source.text === 'string' ? source.text : '',
+      filename: exportFilename(source.default_filename),
+    };
+  }
+
+  /**
+   * The end of the output of a shell or Monitor task of the live session.
+   * @param {string} sessionId
+   * @param {string} taskId
+   * @returns {Promise<{output: string, totalBytes: number, truncated: boolean}>}
+   */
+  async taskOutput(sessionId, taskId) {
+    requireSessionId(sessionId);
+    const id = parseToken(taskId, 'The task id');
+    const live = await this.#requireLive(sessionId);
+    const read = methodOf(live.query, 'getTaskOutput', 'This runtime cannot read task output.');
+    let answer;
+    try {
+      answer = await withTimeout(() => read(id));
+    } catch (error) {
+      const reason = messageOf(error);
+      if (reason.includes(UNKNOWN_TASK)) throw new AppError(404, 'NOT_FOUND', firstLine(reason, 'Task not found.'));
+      throw this.#failure(sessionId, error, 'The task output could not be read.');
+    }
+    const source = isPlainObject(answer) ? answer : {};
+    return {
+      output: typeof source.output === 'string' ? source.output : '',
+      totalBytes: typeof source.total_bytes === 'number' ? source.total_bytes : 0,
+      truncated: source.truncated === true,
+    };
+  }
+
+  /**
+   * A side question, answered by the model without a turn in the transcript. One at a time per session.
+   * @param {string} sessionId
+   * @param {string} question
+   * @returns {Promise<SideAnswer>}
+   */
+  async sideQuestion(sessionId, question) {
+    requireSessionId(sessionId);
+    const text = parseQuestion(question);
+    this.#assertNotLocked(sessionId);
+    if (this.#sideQuestions.has(sessionId)) {
+      throw new AppError(409, 'CONFLICT', 'A side question is already being answered.');
+    }
+    this.#sideQuestions.add(sessionId);
+    try {
+      const live = await this.#ensureLive(sessionId);
+      const ask = methodOf(live.query, 'askSideQuestion', 'This runtime cannot answer side questions.');
+      let answer;
+      try {
+        answer = await withTimeout(() => ask(text), SIDE_QUESTION_MS);
+      } catch (error) {
+        throw this.#failure(sessionId, error, 'The side question could not be answered.');
+      }
+      return sideAnswerOf(answer);
+    } finally {
+      this.#sideQuestions.delete(sessionId);
+    }
+  }
+
+  /**
+   * The runtime's `@` index for a live session in its own folder, through its generic control call. Null when the
+   * runtime cannot answer: not live, another folder, the call is missing, fails or times out, or finds nothing.
+   * @param {string} sessionId
+   * @param {string} cwd
+   * @param {string} query
+   * @param {number} limit
+   * @returns {Promise<Array<{path: string, type: 'file'|'dir'}>|null>}
+   */
+  async fileSuggestions(sessionId, cwd, query, limit) {
+    const live = this.#live.get(sessionId);
+    if (!live || live.closing) return null;
+    if (!(await sameDirectory(live.cwd, cwd)) || !(await this.#withinRoots(live.cwd))) return null;
+    const request = runtimeMethod(live.query, 'request');
+    if (request === null) return null;
+    try {
+      const answer = await withTimeout(() => request({ subtype: 'file_suggestions', query }), FILE_SUGGESTIONS_MS);
+      const results = fileSuggestionsOf(answer, limit);
+      return results.length > 0 ? results : null;
+    } catch (error) {
+      this.#log.debug('file suggestions failed', { sessionId, reason: errorName(error) });
+      return null;
+    }
+  }
+
+  /**
+   * Records a folder's trust in Claude Code's own record (see trust.mjs). The caller has checked the folder.
+   * @param {string} dir
+   * @returns {Promise<RuntimeTrust>}
+   */
+  recordRuntimeTrust(dir) {
+    return this.#trust.record(dir);
+  }
+
+  /**
+   * The query of a live session that is not closing, for reads that need no particular session (the account).
+   * @returns {SdkQuery|null}
+   */
+  anyLiveQuery() {
+    for (const live of this.#live.values()) {
+      if (!live.closing && live.query) return live.query;
+    }
+    return null;
+  }
+
+  /** Drops every cached capability answer, after the signed-in account changed. */
+  forgetCapabilities() {
+    this.#capsGlobal = null;
+    this.#capsByCwd.clear();
+    for (const live of this.#live.values()) live.capsCache = null;
+  }
+
+  /**
+   * @param {LiveRecord} live
+   * @param {string} name
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async #mcpStart(live, name) {
+    const start = methodOf(live.query, 'mcpAuthenticate', 'This runtime cannot authenticate MCP servers.');
+    const answer = await this.#authCall(live, () => start(name));
+    const source = isPlainObject(answer) ? answer : {};
+    const hasAddress = source.authUrl !== undefined && source.authUrl !== null;
+    if (hasAddress && !isWebUrl(source.authUrl, AUTH_URL_MAX, WEB_PROTOCOLS)) {
+      throw engineError('The sign-in address of the server is not usable.');
+    }
+    return {
+      authUrl: hasAddress ? source.authUrl : null,
+      requiresUserAction: source.requiresUserAction === true,
+      callbackExpected: source.callbackExpected === true,
+      redirectScheme: source.redirectScheme === 'localhost' || source.redirectScheme === 'custom'
+        ? source.redirectScheme
+        : null,
+      callbackPort: typeof source.callbackPort === 'number' ? source.callbackPort : null,
+    };
+  }
+
+  /**
+   * @param {LiveRecord} live
+   * @param {string} name
+   * @param {string|null} callbackUrl
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async #mcpCallback(live, name, callbackUrl) {
+    const submit = methodOf(live.query, 'mcpSubmitOAuthCallbackUrl', 'This runtime cannot complete MCP sign-in.');
+    await this.#authCall(live, () => submit(name, callbackUrl));
+    return { ok: true };
+  }
+
+  /**
+   * @param {LiveRecord} live
+   * @param {string} name
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async #mcpClear(live, name) {
+    const clear = methodOf(live.query, 'mcpClearAuth', 'This runtime cannot clear MCP credentials.');
+    await this.#authCall(live, () => clear(name));
+    return { ok: true };
+  }
+
+  /**
+   * One MCP authentication call under the control timeout. A failure is logged without its content.
+   * @param {LiveRecord} live
+   * @param {() => Promise<unknown>} call
+   * @returns {Promise<unknown>}
+   */
+  async #authCall(live, call) {
+    try {
+      return await withTimeout(call);
+    } catch (error) {
+      this.#log.warn('MCP authentication call failed', { sessionId: live.sessionId, reason: errorName(error) });
+      throw authFailure(error, 'The server could not be authenticated.');
+    }
+  }
+
+  /**
+   * @param {LiveRecord} live
+   * @returns {Promise<unknown>} the runtime's memory dialog
+   */
+  async #memoryDialog(live) {
+    const dialog = methodOf(live.query, 'getMemoryDialog', 'This runtime does not list memory files.');
+    return this.#control(live.sessionId, () => dialog(), 'The memory files could not be read.');
+  }
+
+  /**
+   * One listed memory file with its content. A file the runtime refuses to read has no content.
+   * @param {LiveRecord} live
+   * @param {{kind: string, path: string, label: string, description: string, exists: boolean}} file
+   * @returns {Promise<MemoryFile>}
+   */
+  async #memoryFile(live, file) {
+    const read = methodOf(live.query, 'readFile', 'This runtime cannot read memory files.');
+    const answer = await withTimeout(() => read(file.path, { maxBytes: MEMORY_MAX_BYTES })).catch(() => null);
+    const source = isPlainObject(answer) ? answer : {};
+    return {
+      kind: file.kind,
+      path: file.path,
+      label: file.label,
+      description: file.description,
+      exists: file.exists,
+      content: typeof source.contents === 'string' ? source.contents : null,
+      truncated: source.truncated === true,
+      editable: await isEditableMemoryFile(file.path, this.#memoryLocations()),
+    };
+  }
+
+  /** @returns {{roots: string[], home: string}} where the gateway may save memory files */
+  #memoryLocations() {
+    return { roots: this.#config.roots, home: this.#homeDir };
   }
 
   /**
@@ -2169,25 +2979,36 @@ export class EngineHost {
   }
 
   /**
-   * Stops the live query of a session, if any, and starts it again at an earlier entry of the conversation. The
-   * stop is not reported as the end of the session, and the old query is fully stopped before the new one starts.
-   * Runs inside the session's lifecycle queue, so it never waits for the session again.
+   * Stops the live query of a session, if any, and starts it again with the settings it had, changed by `overrides`,
+   * and at an earlier entry of the conversation when `resumeAt` is given. The stop is not reported as the end of the
+   * session, and the old query is fully stopped before the new one starts. Runs inside the session's lifecycle queue,
+   * so it never waits for the session again.
    * @param {string} sessionId
-   * @param {string} resumeAt
+   * @param {string|undefined} resumeAt
+   * @param {SessionSettings} [overrides]
+   * @returns {Promise<LiveRecord>}
    */
-  async #restartNow(sessionId, resumeAt) {
+  async #restartNow(sessionId, resumeAt, overrides = {}) {
     const previous = await this.#openLive(sessionId);
     /** @type {string} */
     let cwd;
     /** @type {SessionSettings} */
-    let settings = {};
+    let settings = overrides;
     if (previous) {
       cwd = previous.cwd;
+      const remembered = this.#pending.get(sessionId) ?? {};
       settings = {
         model: previous.model,
-        permissionMode: previous.permissionMode,
+        // A null mode is not passed, so the settings the session remembers, or Claude Code's own, decide.
+        ...(previous.permissionMode !== null ? { permissionMode: previous.permissionMode } : {}),
         effort: previous.effort,
         fastMode: previous.fastMode,
+        agent: previous.agent,
+        additionalDirectories: previous.additionalDirectories,
+        // A fallback model changed while the query runs is only remembered; the restart is what applies it.
+        fallbackModel: remembered.fallbackModel !== undefined ? remembered.fallbackModel : previous.fallbackModel,
+        browserTools: previous.browserTools,
+        ...overrides,
       };
       await this.#detach(previous, { publish: false });
     } else {
@@ -2197,7 +3018,7 @@ export class EngineHost {
     this.#assertNotLocked(sessionId);
     const trusted = await this.#trustOf(cwd);
     this.#assertNotLocked(sessionId);
-    await this.#startQuery({ mode: 'resume', sessionId, cwd, trusted, settings, resumeSessionAt: resumeAt });
+    return this.#startQuery({ mode: 'resume', sessionId, cwd, trusted, settings, resumeSessionAt: resumeAt });
   }
 
   /**
@@ -2424,11 +3245,15 @@ export class EngineHost {
     return stale.length;
   }
 
-  /** Stops the sweep, closes every live query and cancels every pending request. Safe to call twice. */
+  /**
+   * Stops the sweep, closes every live query, stops the trust probes in flight and cancels every pending request.
+   * Safe to call twice.
+   */
   async shutdown() {
     clearInterval(this.#sweepTimer);
     this.#stopped = true;
     this.#requests.cancelAll();
     await Promise.all([...this.#live.values()].map((live) => this.#detach(live, { publish: true })));
+    await this.#trust.close();
   }
 }

@@ -4,7 +4,7 @@
  */
 
 import { h } from '../../dom.js';
-import { chip, errorBlock, keyValueList, mutedNote, prettyJson, statusOf, toolShell, cappedList } from './shell.js';
+import { chip, errorBlock, keyValueList, mutedNote, prettyJson, statusOf, toolShell, cappedList, verbOf } from './shell.js';
 import { firstLine, isRecord, resultText, str, truncate } from './summaries.js';
 
 const MARKS = { pending: '○', in_progress: '◐', completed: '✓' };
@@ -35,12 +35,11 @@ function renderTodos(card, ctx) {
   const todos = todoList(structured.newTodos) ?? todoList(input.todos) ?? [];
   const done = todos.filter((todo) => todo.status === 'completed').length;
   return toolShell({
-    iconName: 'list',
-    title: 'TodoWrite',
+    title: verbOf('TodoWrite', t),
     subtitle: todos.length > 0 ? `${done}/${todos.length}` : '',
     status: statusOf(card),
     body: () => todoBody(todos, done, t),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     t,
     family: 'todo',
   });
@@ -115,12 +114,11 @@ function renderTask(card, ctx) {
   const input = recordOf(card.input);
   const structured = recordOf(card.structured);
   return toolShell({
-    iconName: 'list',
-    title: card.name,
+    title: verbOf(card.name, t),
     subtitle: taskSubtitle(card.name, input, structured, t),
     status: statusOf(card),
     body: () => taskBody(card, input, structured, t),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     t,
     family: 'todo',
   });

@@ -1,26 +1,38 @@
 import { errorText } from '../api.js';
 import { clear, h, icon } from '../dom.js';
 import {
-  applyCompletion, detachChip, detectTrigger, draftKey, filterCommands, formatBytes, isSendShortcut, joinRestoredText,
-  mergeCommands,
+  applyCompletion, detachChip, detectTrigger, draftKey, escapeAction, filterCommands, formatBytes, HISTORY_IDLE,
+  isSendShortcut, joinRestoredText, keyDecision, mergeCommands, modeWordKey, parseSideQuestion, promptHistory,
+  runtimeHasCommand, stepHistory,
 } from './composer-logic.js';
+import { createRunningLine, createTodoBar } from './activity.js';
+import { createSideQuestion } from './side-question.js';
+import { hasOpenDialog } from './dialog.js';
+import { openMenu } from './menu.js';
 import { highlightText, openPalette } from './palette.js';
+import { renderMarkdown } from '../markdown.js';
 
 /**
  * Message composer: auto-growing input, send and stop, attachments (paste, drop, picker) uploaded as they are added,
- * per-session drafts, and the `/` command and `@` file palettes. Sending goes through `actions.sendMessage`.
+ * per-session drafts, the `/` command and `@` file palettes, the permission mode footer, prompt history (↑ ↓), the side
+ * question overlay, and the running line and todo bar above the field. Sending goes through `actions.sendMessage`.
  */
 
 const BUSY_STATES = ['running', 'requires_action'];
 const DRAFT_DEBOUNCE_MS = 400;
 const MENTION_DEBOUNCE_MS = 120;
 const MENTION_LIMIT = 50;
+const MODE_FLASH_MS = 2000;
+const SENT_HISTORY_LIMIT = 100;
 const MOBILE_QUERY = '(max-width: 767.98px)';
 const COARSE_QUERY = '(pointer: coarse)';
 /** Narrow or touch layouts, which get the short placeholder because the command and file hint does not fit there. */
 const COMPACT_QUERY = `${MOBILE_QUERY}, ${COARSE_QUERY}`;
 
-/** Commands the GUI implements itself. A Claude Code command with the same name runs the GUI action instead. */
+/**
+ * Commands the GUI implements, as the palette lists them (docs/FRONTEND.md). Picking one runs its panel or action; typed
+ * text is never a GUI command, except `/btw <question>` when the runtime has no `btw` command.
+ */
 const GUI_COMMANDS = [
   { id: 'model', name: 'model' },
   { id: 'permissions', name: 'permissions' },
@@ -30,13 +42,20 @@ const GUI_COMMANDS = [
   { id: 'fork', name: 'fork' },
   { id: 'rename', name: 'rename' },
   { id: 'mcp', name: 'mcp' },
-  { id: 'context', name: 'context' },
-  { id: 'tasks', name: 'tasks' },
   { id: 'terminal', name: 'terminal', needsTerminal: true },
-  { id: 'settings', name: 'settings' },
+  { id: 'status', name: 'status' },
+  { id: 'hooks', name: 'hooks' },
+  { id: 'memory', name: 'memory' },
+  { id: 'usage', name: 'usage' },
+  { id: 'export', name: 'export' },
+  { id: 'btw', name: 'btw' },
+  { id: 'login', name: 'login' },
+  { id: 'add-dir', name: 'add-dir' },
+  { id: 'devtools', name: 'devtools' },
 ];
-const GUI_BY_NAME = new Map(GUI_COMMANDS.map((command) => [command.name, command]));
-const HEADER_CONTROLS = { model: '.hdr-model', permissions: '.hdr-mode', effort: '.hdr-effort' };
+const HEADER_CONTROLS = { model: '.hdr-model', effort: '.hdr-effort' };
+/** Permission modes the footer menu offers; bypassPermissions only when the server allows it (meta.features.bypass). */
+const MODE_CHOICES = ['default', 'acceptEdits', 'plan', 'auto', 'dontAsk'];
 
 /**
  * @typedef {Object} Chip
@@ -56,10 +75,10 @@ const HEADER_CONTROLS = { model: '.hdr-model', permissions: '.hdr-mode', effort:
  */
 
 /**
- * Per-session composer state that outlives a mount: the attachments waiting to be sent, the suggestion and the last
- * sent text. A composer that is remounted, for example after a language change, finds what the previous one left. An
- * object URL is released only when its chip is removed or sent.
- * @type {Map<string, {chips: Chip[], suggestion: string|null, lastSent: string}>}
+ * Per-session composer state that outlives a mount: the attachments waiting to be sent, the suggestion and the prompts
+ * sent from this page (for ↑). A composer that is remounted, for example after a language change, finds what the
+ * previous one left. An object URL is released only when its chip is removed or sent.
+ * @type {Map<string, {chips: Chip[], suggestion: string|null, sent: string[]}>}
  */
 const records = new Map();
 
@@ -134,7 +153,8 @@ function chipStatusText(chip, t) {
 /**
  * @param {ComposerDeps} deps
  * @returns {{setSession: (id: string|null) => void, focus: () => void, insertText: (text: string) => void,
- *   setSuggestion: (text: string|null) => void, destroy: () => void}}
+ *   setText: (text: string) => void, setSuggestion: (text: string|null) => void,
+ *   setTodos: (todos: any[]|null) => void, setActivity: (activity: any) => void, destroy: () => void}}
  */
 export function createComposer({ container, api, store, t, actions }) {
   const view = { id: /** @type {string|null} */ (null), disposed: false, capsRef: undefined, dragDepth: 0 };
@@ -143,14 +163,18 @@ export function createComposer({ container, api, store, t, actions }) {
   let mentionTimer = /** @type {ReturnType<typeof setTimeout>|null} */ (null);
   let mentionAbort = /** @type {AbortController|null} */ (null);
   let draftTimer = /** @type {ReturnType<typeof setTimeout>|null} */ (null);
+  let historyState = HISTORY_IDLE;
+  /** The footer's flash line after Shift+Tab; null while the footer shows the mode's words. */
+  let flashText = /** @type {string|null} */ (null);
+  let flashTimer = /** @type {ReturnType<typeof setTimeout>|null} */ (null);
+  /** @type {any[]|null} */
+  let todos = null;
+  /** @type {{running: boolean, startedAt: number, text: string|null, outputTokens: number, queued: number}|null} */
+  let activity = null;
+  const coarse = matchesMedia(COARSE_QUERY);
 
-  const emptyText = h('p', { class: 'composer-empty-text', text: t('composer.emptyHint') });
-  const newSessionBtn = /** @type {HTMLButtonElement} */ (h('button', {
-    class: 'composer-cta',
-    attrs: { type: 'button' },
-    on: { click: () => actions.newSession() },
-  }, icon('plus'), t('composer.newSession')));
-  const emptyEl = h('div', { class: 'composer-empty' }, emptyText, newSessionBtn);
+  const emptyText = h('p', { class: 'composer-empty-text' });
+  const emptyEl = h('div', { class: 'composer-empty' }, emptyText);
 
   const suggestionText = h('span', { class: 'composer-suggestion-text' });
   const suggestionEl = h('div', { class: 'composer-suggestion', hidden: true },
@@ -165,6 +189,16 @@ export function createComposer({ container, api, store, t, actions }) {
       on: { click: dismissSuggestion },
     }, icon('x')));
 
+  const side = createSideQuestion({
+    t,
+    actions,
+    renderMarkdown,
+    onClose: (restoreFocus) => {
+      if (restoreFocus && !view.disposed) input.focus();
+    },
+  });
+  const runningLine = createRunningLine({ t, coarse });
+  const todoBar = createTodoBar({ t });
   const noticeEl = h('div', { class: 'composer-notice', attrs: { role: 'status' }, hidden: true });
   const usageEl = h('div', { class: 'composer-usage', hidden: true });
   const queuedEl = h('div', { class: 'composer-queued', hidden: true, text: t('composer.queued') });
@@ -192,19 +226,42 @@ export function createComposer({ container, api, store, t, actions }) {
     attrs: { type: 'button', 'aria-label': t('composer.attach') },
     on: { click: () => fileInput.click() },
   }, icon('paperclip')));
+  const modeText = h('span', { class: 'composer-mode-text' });
+  const modeBtn = /** @type {HTMLButtonElement} */ (h('button', {
+    class: 'composer-mode',
+    attrs: { type: 'button', 'aria-haspopup': 'menu', title: t('composer.mode.title') },
+    on: { click: () => openModeMenu() },
+  }, modeText));
   // On phones the label is hidden and the round button shows only its icon, so aria-label and title carry the name.
   const stopBtn = /** @type {HTMLButtonElement} */ (h('button', {
     class: 'composer-stop',
     attrs: { type: 'button', 'aria-label': t('composer.stop'), title: t('composer.stop'), hidden: true },
-    on: { click: () => actions.interrupt() },
+    on: {
+      click: () => actions.interrupt(),
+      contextmenu: (/** @type {MouseEvent} */ event) => {
+        event.preventDefault();
+        openStopMenu();
+      },
+    },
   }, icon('stop'), h('span', { class: 'btn-label', text: t('composer.stop') })));
+  const stopMoreBtn = /** @type {HTMLButtonElement} */ (h('button', {
+    class: 'composer-stop-more',
+    attrs: { type: 'button', 'aria-label': t('composer.stopMenu'), 'aria-haspopup': 'menu', hidden: true },
+    on: { click: () => openStopMenu() },
+  }, icon('chevron-down')));
   const sendBtn = /** @type {HTMLButtonElement} */ (h('button', {
     class: 'composer-send',
     attrs: { type: 'button', 'aria-label': t('composer.send'), title: t('composer.send') },
     on: { click: () => send() },
   }, icon('send'), h('span', { class: 'btn-label', text: t('composer.send') })));
-  const box = h('div', { class: 'composer-box' }, attachBtn, input,
-    h('div', { class: 'composer-actions' }, stopBtn, sendBtn));
+  // The group has its own border, so it is hidden with its buttons: an idle composer shows no empty pill.
+  const stopGroup = h('div', { class: 'composer-stop-group', attrs: { hidden: true } }, stopBtn, stopMoreBtn);
+  const footerEl = h('div', { class: 'composer-footer' },
+    attachBtn,
+    modeBtn,
+    h('span', { class: 'composer-spacer', attrs: { 'aria-hidden': 'true' } }),
+    h('div', { class: 'composer-actions' }, stopGroup, sendBtn));
+  const box = h('div', { class: 'composer-box' }, input, footerEl);
   const dropEl = h('div', { class: 'composer-drop', hidden: true, attrs: { 'aria-hidden': 'true' } },
     icon('paperclip'), h('span', { text: t('composer.drop') }));
   const fileInput = /** @type {HTMLInputElement} */ (h('input', {
@@ -212,7 +269,8 @@ export function createComposer({ container, api, store, t, actions }) {
     on: { change: onFilePicked },
   }));
   const shell = h('div', { class: 'composer-shell' },
-    suggestionEl, noticeEl, usageEl, queuedEl, chipsEl, box, dropEl, fileInput);
+    side.element, suggestionEl, todoBar.element, runningLine.element,
+    noticeEl, usageEl, queuedEl, chipsEl, box, dropEl, fileInput);
   const root = h('section', { class: 'composer', attrs: { 'aria-label': t('composer.region') } }, emptyEl, shell);
   container.appendChild(root);
 
@@ -233,7 +291,7 @@ export function createComposer({ container, api, store, t, actions }) {
   function recordFor(id) {
     let record = records.get(id);
     if (!record) {
-      record = { chips: [], suggestion: null, lastSent: '' };
+      record = { chips: [], suggestion: null, sent: [] };
       records.set(id, record);
     }
     return record;
@@ -259,6 +317,11 @@ export function createComposer({ container, api, store, t, actions }) {
     return BUSY_STATES.includes(state);
   }
 
+  /** Whether a menu, a dialog or the side question is open, so that Escape belongs to it. */
+  function overlayOpen() {
+    return Boolean(document.querySelector('.menu')) || hasOpenDialog() || side.isOpen();
+  }
+
   /** @returns {{chips: Chip[], uploading: boolean, failed: boolean, hasContent: boolean, canSend: boolean}} */
   function summary() {
     const chips = currentRecord()?.chips ?? [];
@@ -280,8 +343,6 @@ export function createComposer({ container, api, store, t, actions }) {
     const s = store.get();
     const meta = s.meta ?? {};
     const profileRead = (s.auth?.profile ?? meta.profile) === 'read';
-    emptyText.textContent = t(profileRead ? 'composer.disabled.read' : 'composer.emptyHint');
-    newSessionBtn.disabled = profileRead;
     const reason = disabledReason();
     const { chips, uploading, failed, hasContent, canSend } = summary();
     const busy = isBusy();
@@ -289,17 +350,25 @@ export function createComposer({ container, api, store, t, actions }) {
     const text = input.value;
     const readOnly = reason === 'composer.disabled.read';
 
-    root.classList.toggle('is-empty', !view.id);
-    emptyEl.hidden = Boolean(view.id);
+    // Without a session the welcome page offers the way in, so the composer stays out of its way. A read-only profile
+    // keeps the one sentence that explains why no session can be started here.
+    emptyText.textContent = t('composer.disabled.read');
+    emptyEl.hidden = Boolean(view.id) || !profileRead;
+    root.hidden = !view.id && !profileRead;
     shell.hidden = !view.id;
     if (!view.id) return;
 
     input.disabled = Boolean(reason);
     attachBtn.disabled = Boolean(reason) || meta.features?.uploads === false;
+    modeBtn.disabled = Boolean(reason);
     sendBtn.disabled = !canSend;
+    stopGroup.hidden = !busy || readOnly;
     stopBtn.hidden = !busy || readOnly;
     stopBtn.disabled = Boolean(reason);
+    stopMoreBtn.hidden = !busy || readOnly;
+    stopMoreBtn.disabled = Boolean(reason);
     queuedEl.hidden = !busy || !text.trim() || Boolean(reason);
+    paintMode();
 
     const noticeKey = reason ?? (failed || uploading ? (hasContent ? 'composer.attach.blocked' : null) : null);
     noticeEl.hidden = !noticeKey;
@@ -312,6 +381,14 @@ export function createComposer({ container, api, store, t, actions }) {
     chipsEl.hidden = chips.length === 0;
     sendBtn.title = failed || uploading ? t('composer.attach.blocked') : t('composer.send');
     updateUsage(s);
+  }
+
+  /** The footer's mode line: the mode in words, or the flash line for two seconds after Shift+Tab. */
+  function paintMode() {
+    const live = view.id ? store.get().live?.[view.id] : null;
+    const word = flashText ?? t(modeWordKey(live?.permissionMode ?? null));
+    if (modeText.textContent !== word) modeText.textContent = word;
+    footerEl.classList.toggle('is-flash', flashText !== null);
   }
 
   /** Shows the argument hint of a Claude Code command that has been typed without arguments yet. */
@@ -331,6 +408,78 @@ export function createComposer({ container, api, store, t, actions }) {
     view.capsRef = caps;
     if (capsChanged && palette?.isOpen() && paletteKind === 'slash') refreshPalette();
     sync();
+  }
+
+  // ---- running line, todo bar, permission mode
+
+  /** @param {any[]|null} next */
+  function applyTodos(next) {
+    todos = Array.isArray(next) ? next : null;
+    paintSummary();
+  }
+
+  /** @param {any} next */
+  function applyActivity(next) {
+    activity = next && typeof next === 'object' ? next : null;
+    paintSummary();
+    sync();
+  }
+
+  function paintSummary() {
+    const running = Boolean(activity?.running);
+    runningLine.update(activity);
+    todoBar.update(todos, running);
+  }
+
+  /** Shift+Tab: the shell moves to the next permission mode and says which one it is now. */
+  function cycleMode() {
+    if (!view.id || disabledReason()) return;
+    let next;
+    try {
+      next = Promise.resolve(actions.cyclePermissionMode?.());
+    } catch (err) {
+      next = Promise.reject(err);
+    }
+    next.then((mode) => {
+      if (typeof mode !== 'string' || view.disposed) return;
+      flashText = t('composer.mode.changed', { mode: t(modeWordKey(mode)) });
+      clearTimeout(flashTimer ?? undefined);
+      flashTimer = setTimeout(() => {
+        flashTimer = null;
+        flashText = null;
+        paintMode();
+      }, MODE_FLASH_MS);
+      paintMode();
+    }, (err) => actions.toast(errorText(err, t), 'error'));
+  }
+
+  function openModeMenu() {
+    if (!view.id || disabledReason()) return;
+    const meta = store.get().meta ?? {};
+    const live = store.get().live?.[view.id];
+    const current = live?.permissionMode ?? null;
+    const modes = meta.features?.bypass ? [...MODE_CHOICES, 'bypassPermissions'] : MODE_CHOICES;
+    openMenu(modeBtn, modes.map((mode) => ({
+      label: t(modeWordKey(mode)),
+      checked: mode === current,
+      onClick: () => actions.updateSettings({ permissionMode: mode }),
+    })), { label: t('composer.mode.title') });
+  }
+
+  /** The stop menu: "Stop", and "Stop and clear the queue" while a message waits behind the running turn. */
+  function openStopMenu() {
+    if (!view.id || !isBusy()) return;
+    /** @type {Array<{label: string, icon: string, danger?: boolean, onClick: () => void}>} */
+    const items = [{ label: t('composer.stop'), icon: 'stop', onClick: () => actions.interrupt() }];
+    if ((activity?.queued ?? 0) > 0) {
+      items.push({
+        label: t('composer.stopClear'),
+        icon: 'trash',
+        danger: true,
+        onClick: () => actions.interrupt({ cancelQueued: true }),
+      });
+    }
+    openMenu(stopBtn, items, { label: t('composer.stopMenu') });
   }
 
   // ---- text and drafts
@@ -390,6 +539,8 @@ export function createComposer({ container, api, store, t, actions }) {
   // ---- keyboard and input
 
   function onInput() {
+    // Typing is an edit: the field keeps what it shows and the history walk ends.
+    historyState = HISTORY_IDLE;
     refreshPalette();
     onTextChanged();
   }
@@ -433,25 +584,77 @@ export function createComposer({ container, api, store, t, actions }) {
         }
       }
     }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      input.blur();
-      return;
-    }
-    if (event.key === 'ArrowUp' && !input.value && !event.shiftKey && !event.altKey) {
-      const last = currentRecord()?.lastSent;
-      if (last) {
+    const action = keyDecision(event, {
+      paletteOpen: Boolean(palette?.isOpen()),
+      browsing: historyState.index >= 0,
+      running: isBusy(),
+      blocked: overlayOpen(),
+      text: input.value,
+      caret: input.selectionStart ?? 0,
+    });
+    switch (action) {
+      case 'mode-cycle':
         event.preventDefault();
-        input.value = last;
-        input.setSelectionRange(last.length, last.length);
-        onTextChanged();
-      }
-      return;
+        cycleMode();
+        return;
+      case 'escape':
+        onEscape(event);
+        return;
+      case 'history-prev':
+        event.preventDefault();
+        walkHistory('prev');
+        return;
+      case 'history-next':
+        event.preventDefault();
+        walkHistory('next');
+        return;
+      default:
+        break;
     }
     if (isSendShortcut(event, { coarse: matchesMedia(COARSE_QUERY) })) {
       event.preventDefault();
       send();
     }
+  }
+
+  /** @param {KeyboardEvent} event */
+  function onEscape(event) {
+    event.preventDefault();
+    const action = escapeAction({ browsing: historyState.index >= 0, running: isBusy(), blocked: overlayOpen() });
+    if (action === 'leave-history') {
+      input.value = historyState.draft;
+      historyState = HISTORY_IDLE;
+      onTextChanged();
+      return;
+    }
+    if (action === 'interrupt') {
+      actions.interrupt();
+      return;
+    }
+    input.blur();
+  }
+
+  /** @param {'prev'|'next'} action */
+  function walkHistory(action) {
+    const id = view.id;
+    if (!id) return;
+    const result = stepHistory(historyState, action, historyEntries(id), input.value);
+    if (!result) return;
+    historyState = result.state;
+    input.value = result.text;
+    input.setSelectionRange(result.text.length, result.text.length);
+    onTextChanged();
+  }
+
+  /**
+   * The prompts ↑ recalls for a session, newest first: the user messages of the loaded transcript (through
+   * actions.sessionPrompts, when the shell provides it) plus the prompts sent from this page.
+   * @param {string} id
+   * @returns {string[]}
+   */
+  function historyEntries(id) {
+    const transcript = typeof actions.sessionPrompts === 'function' ? actions.sessionPrompts(id) : [];
+    return promptHistory(Array.isArray(transcript) ? transcript : [], recordFor(id).sent);
   }
 
   /** @param {ClipboardEvent} event */
@@ -519,6 +722,11 @@ export function createComposer({ container, api, store, t, actions }) {
       input,
       query,
     });
+    if (kind === 'slash') {
+      // The open palette's own element: the shortcut hint stays with it until it closes.
+      const root = shell.querySelector(':scope > .palette');
+      if (root && !root.querySelector('.palette-hint')) root.append(h('p', { class: 'palette-hint', text: t('composer.palette.hint') }));
+    }
   }
 
   function closePalette() {
@@ -539,7 +747,9 @@ export function createComposer({ container, api, store, t, actions }) {
         h('span', { class: 'palette-path' }, highlightText(item.path, query)),
       ];
     }
-    const badge = item.source === 'gui' ? t('composer.palette.app') : item.builtin ? t('composer.palette.builtin') : '';
+    let badge = '';
+    if (item.source === 'gui') badge = item.shadowed ? t('composer.palette.panel') : t('composer.palette.app');
+    else if (item.builtin) badge = t('composer.palette.builtin');
     return [
       h('span', { class: 'palette-main' },
         h('span', { class: 'palette-name' }, '/', highlightText(item.name, query)),
@@ -555,23 +765,15 @@ export function createComposer({ container, api, store, t, actions }) {
       replaceTrigger(`@${item.path} `);
       return;
     }
-    const override = GUI_BY_NAME.get(item.name);
-    const guiId = item.source === 'gui' ? item.guiId : override && guiAvailable(override) ? override.id : null;
-    if (guiId) {
+    // A GUI row runs its panel or action; a runtime row types the command, which the runtime then runs.
+    if (item.source === 'gui') {
       input.value = '';
       closePalette();
       onTextChanged();
-      runGuiCommand(guiId);
+      runGuiCommand(item.guiId);
       return;
     }
     replaceTrigger(`/${item.name} `);
-  }
-
-  /** @param {{needsTerminal?: boolean}} command */
-  function guiAvailable(command) {
-    if (!command.needsTerminal) return true;
-    const meta = store.get().meta ?? {};
-    return meta.features?.terminal === true && (store.get().auth?.profile ?? meta.profile) === 'full';
   }
 
   /** @param {string} replacement */
@@ -591,9 +793,11 @@ export function createComposer({ container, api, store, t, actions }) {
   function runGuiCommand(guiId) {
     switch (guiId) {
       case 'model':
-      case 'permissions':
       case 'effort':
         focusHeaderSetting(guiId);
+        break;
+      case 'permissions':
+        actions.openPanel('runtime', { tab: 'permissions' });
         break;
       case 'fast':
         toggleFast();
@@ -608,23 +812,42 @@ export function createComposer({ container, api, store, t, actions }) {
         actions.renameSession();
         break;
       case 'mcp':
-        actions.openPanel('capabilities');
-        break;
-      case 'context':
-        actions.openPanel('context');
-        break;
-      case 'tasks':
-        actions.openPanel('tasks');
+        actions.openPanel('capabilities', { section: 'mcp' });
         break;
       case 'terminal':
         actions.openTerminal();
         break;
-      case 'settings':
-        actions.openPanel('settings');
+      case 'status':
+      case 'hooks':
+      case 'memory':
+      case 'usage':
+        actions.openPanel('runtime', { tab: guiId });
+        break;
+      case 'export':
+        runAsync(() => actions.exportConversation());
+        break;
+      case 'btw':
+        side.open(null);
+        break;
+      case 'login':
+        actions.openPanel('settings', { section: 'account' });
+        break;
+      case 'add-dir':
+        actions.openPanel('session', { section: 'directories' });
+        break;
+      case 'devtools':
+        actions.openPanel('developer');
         break;
       default:
         break;
     }
+  }
+
+  /** @param {() => unknown} work a shell action that may reject; the rejection is reported as a toast */
+  function runAsync(work) {
+    Promise.resolve()
+      .then(work)
+      .catch((err) => actions.toast(errorText(err, t), 'error'));
   }
 
   /**
@@ -683,7 +906,9 @@ export function createComposer({ container, api, store, t, actions }) {
       sync();
       return;
     }
-    const path = `/api/fs/search?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(query)}&limit=${MENTION_LIMIT}`;
+    // The session makes the runtime's own @ index answer first (docs/PROTOCOL.md, file search).
+    const path = `/api/fs/search?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(query)}&limit=${MENTION_LIMIT}`
+      + `&session=${encodeURIComponent(id ?? '')}`;
     try {
       const data = await api.get(path, { signal: controller.signal });
       if (controller.signal.aborted) return;
@@ -714,12 +939,24 @@ export function createComposer({ container, api, store, t, actions }) {
     if (!id || !canSend || !hasContent) return;
     const record = recordFor(id);
     const text = input.value.replace(/\s+$/u, '');
+    // `/btw <question>` is the side question when the runtime has no btw command of its own; it never enters the transcript.
+    const question = parseSideQuestion(text);
+    if (question !== null && !runtimeHasCommand(store.get().capabilities?.[id]?.commands, 'btw')) {
+      historyState = HISTORY_IDLE;
+      input.value = '';
+      closePalette();
+      saveDraft(id, '');
+      onTextChanged();
+      side.open(question);
+      return;
+    }
     const sent = record.chips;
     const attachments = sent
       .filter((chip) => chip.status === 'done')
       .map((chip) => ({ path: chip.path, name: chip.name, kind: chip.kind, mediaType: chip.mediaType }));
     record.chips = [];
-    if (text.trim()) record.lastSent = text;
+    if (text.trim()) record.sent = [...record.sent, text].slice(-SENT_HISTORY_LIMIT);
+    historyState = HISTORY_IDLE;
     input.value = '';
     closePalette();
     saveDraft(id, '');
@@ -1016,9 +1253,13 @@ export function createComposer({ container, api, store, t, actions }) {
       }
       flushDraft();
       closePalette();
+      side.close({ restoreFocus: false });
+      historyState = HISTORY_IDLE;
       view.id = next;
       view.capsRef = next ? store.get().capabilities?.[next] : undefined;
       input.value = next ? loadDraft(next) : '';
+      applyTodos(null);
+      applyActivity(null);
       autosize();
       renderChips();
       sync();
@@ -1035,10 +1276,27 @@ export function createComposer({ container, api, store, t, actions }) {
       refreshPalette();
       onTextChanged();
     },
+    /** Replaces the field's text (the refused prompt that an edit brings back, for example). */
+    setText(text) {
+      if (!view.id || disabledReason()) return;
+      input.value = typeof text === 'string' ? text : '';
+      historyState = HISTORY_IDLE;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      onTextChanged();
+    },
     setSuggestion(text) {
       if (!view.id) return;
       recordFor(view.id).suggestion = typeof text === 'string' && text.trim() ? text : null;
       sync();
+    },
+    /** @param {any[]|null} list the latest todos of the session, or null */
+    setTodos(list) {
+      applyTodos(list);
+    },
+    /** @param {any} next the running turn (docs/FRONTEND.md activity), or null while idle */
+    setActivity(next) {
+      applyActivity(next);
     },
     destroy() {
       if (view.disposed) return;
@@ -1048,7 +1306,10 @@ export function createComposer({ container, api, store, t, actions }) {
       stopPlaceholderWatch();
       mounts.delete(restoreText);
       if (mentionTimer) clearTimeout(mentionTimer);
+      if (flashTimer) clearTimeout(flashTimer);
       closePalette();
+      runningLine.destroy();
+      side.close({ restoreFocus: false });
       // The chips outlive this composer with their thumbnails, so object URLs stay until a chip is removed or sent.
       for (const record of records.values()) {
         for (const chip of record.chips) detachChip(chip)?.abort();

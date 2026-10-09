@@ -6,6 +6,7 @@
  */
 import { join } from 'node:path';
 import { createMockQuery } from './query.mjs';
+import { createRuntimeState } from './runtime.mjs';
 import { createMockStore } from './store.mjs';
 
 /** @typedef {import('../../contracts.mjs').EngineAdapter} EngineAdapter */
@@ -53,6 +54,9 @@ export function resolveDelay(explicit) {
 export function createMockAdapter({ config, log, delayMs, resolvedSettings = {}, backgroundTiming = {} }) {
   const pace = resolveDelay(delayMs);
   const store = createMockStore(join(config.stateDir, 'mock-sessions'));
+  // The trust record, the account and a sign-in in progress belong to the runtime, so every query of this adapter
+  // shares them and they survive a restart of the gateway.
+  const runtime = createRuntimeState({ dir: join(config.stateDir, 'mock-runtime') });
   log.info('engine adapter ready', { engine: 'mock', sdkVersion: 'mock', delayMs: pace });
   return {
     kind: 'mock',
@@ -66,6 +70,7 @@ export function createMockAdapter({ config, log, delayMs, resolvedSettings = {},
       fileSettings: { ...resolvedSettings },
       backgroundDisabled: config.backgroundTasksDisabled === true,
       backgroundTiming,
+      runtime,
     }),
     resolveSettings: async (options) => ({
       // An empty settingSources list disables the filesystem sources, so the files define nothing.

@@ -429,3 +429,87 @@ function fill(template, vars = {}) {
     Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : match,
   );
 }
+
+const ACTIVITY = {
+  read: 'Reading {path}',
+  write: 'Writing {path}',
+  edit: 'Editing {path}',
+  notebook: 'Editing notebook {path}',
+  bash: 'Running {command}',
+  bashOutput: 'Reading background output',
+  stopTask: 'Stopping a background task',
+  monitor: 'Monitoring {description}',
+  grep: 'Searching for “{pattern}”',
+  glob: 'Finding files matching “{pattern}”',
+  ls: 'Listing {path}',
+  fetch: 'Fetching {domain}',
+  webSearch: 'Searching the web for “{query}”',
+  agent: 'Running agent: {description}',
+  todos: 'Updating todos',
+  mcp: 'Calling {tool}',
+  tool: 'Running {tool}',
+};
+
+/**
+ * What a running tool does, as the composer's running line shows it: a present-progressive phrase such as
+ * "Reading src/app.js". Never throws; an unexpected input falls back to the tool name.
+ * @param {unknown} name
+ * @param {unknown} input
+ * @param {Translate | null | undefined} t
+ * @param {unknown} [cwd] session working directory, used to shorten paths
+ * @returns {string}
+ */
+export function describeActivity(name, input, t, cwd) {
+  const tool = str(name);
+  const args = isRecord(input) ? input : {};
+  const say = (/** @type {string} */ key, /** @type {Record<string, string>} */ vars = {}) => {
+    const localized = typeof t === 'function' ? t(`tools.activity.${key}`, vars) : '';
+    if (typeof localized === 'string' && localized !== '' && localized !== `tools.activity.${key}`) return localized;
+    return fill(ACTIVITY[key], vars);
+  };
+  const path = displayPath(args.file_path, cwd);
+  switch (tool) {
+    case 'Read':
+      return path ? say('read', { path }) : say('tool', { tool });
+    case 'Write':
+      return path ? say('write', { path }) : say('tool', { tool });
+    case 'Edit':
+    case 'MultiEdit':
+      return path ? say('edit', { path }) : say('tool', { tool });
+    case 'NotebookEdit': {
+      const notebook = displayPath(args.notebook_path, cwd);
+      return notebook ? say('notebook', { path: notebook }) : say('tool', { tool });
+    }
+    case 'Bash': {
+      const command = truncate(firstLine(args.command), 60);
+      return command ? say('bash', { command }) : say('tool', { tool });
+    }
+    case 'BashOutput':
+      return say('bashOutput');
+    case 'KillShell':
+    case 'KillBash':
+    case 'TaskStop':
+      return say('stopTask');
+    case 'Monitor':
+      return say('monitor', { description: truncate(firstLine(args.description), 60) || tool });
+    case 'Grep':
+      return say('grep', { pattern: truncate(firstLine(args.pattern), 60) || tool });
+    case 'Glob':
+      return say('glob', { pattern: truncate(firstLine(args.pattern), 60) || tool });
+    case 'LS':
+      return say('ls', { path: displayPath(args.path, cwd) || '.' });
+    case 'WebFetch':
+      return say('fetch', { domain: domainOf(args.url) });
+    case 'WebSearch':
+      return say('webSearch', { query: truncate(firstLine(args.query), 60) || tool });
+    case 'Agent':
+    case 'Task':
+      return say('agent', { description: truncate(firstLine(args.description), 60) || tool });
+    case 'TodoWrite':
+      return say('todos');
+    default: {
+      if (tool.startsWith('mcp__')) return say('mcp', { tool: parseMcpToolName(tool).tool || tool });
+      return say('tool', { tool: tool || 'tool' });
+    }
+  }
+}

@@ -65,7 +65,10 @@ describe('loadConfig defaults', () => {
     assert.equal(config.stateDir, path.join(root, 'state'));
     assert.equal(config.engine, 'sdk');
     assert.equal(config.claudeBin, null);
-    assert.deepEqual(config.defaults, { model: null, permissionMode: 'default', effort: null });
+    // Without CAW_DEFAULT_PERMISSION_MODE the runtime's settings decide the mode of a new session.
+    assert.deepEqual(config.defaults, { model: null, permissionMode: null, effort: null, fallbackModel: null });
+    assert.equal(config.chrome, false);
+    assert.equal(config.browserMcpCommand, null);
     assert.equal(config.terminal, false);
     assert.equal(config.allowBypass, false);
     assert.equal(config.idleTimeoutMs, 1800000);
@@ -312,5 +315,35 @@ describe('background tasks switch', () => {
       const config = loadConfig(env({ CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: raw }));
       assert.equal(config.backgroundTasksDisabled, true, `value ${JSON.stringify(raw)}`);
     }
+  });
+});
+
+describe('runtime options', () => {
+  it('reads the fallback model as a short text, and leaves it unset when blank', () => {
+    const loaded = loadConfig(env({ CAW_FALLBACK_MODEL: ' claude-haiku-5-5 ' }));
+    assert.equal(loaded.defaults.fallbackModel, 'claude-haiku-5-5');
+    assert.equal(loadConfig(env({ CAW_FALLBACK_MODEL: '   ' })).defaults.fallbackModel, null);
+    assertInvalid({ CAW_FALLBACK_MODEL: 'x'.repeat(201) }, 'CAW_FALLBACK_MODEL');
+  });
+
+  it('reads CAW_CHROME as a flag', () => {
+    assert.equal(loadConfig(env({ CAW_CHROME: '1' })).chrome, true);
+    assert.equal(loadConfig(env({ CAW_CHROME: '0' })).chrome, false);
+  });
+
+  it('reads the browser MCP command as a JSON array of one to 32 strings, and rejects anything else', () => {
+    const config = loadConfig(env({
+      CAW_BROWSER_MCP_COMMAND: JSON.stringify(['npx', '-y', '@playwright/mcp@0.0.40', '--headless']),
+    }));
+    assert.deepEqual(config.browserMcpCommand, ['npx', '-y', '@playwright/mcp@0.0.40', '--headless']);
+    const absolute = loadConfig(env({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['/opt/browser/bin/serve']) }));
+    assert.deepEqual(absolute.browserMcpCommand, ['/opt/browser/bin/serve']);
+    assertInvalid({ CAW_BROWSER_MCP_COMMAND: 'npx -y server' }, 'CAW_BROWSER_MCP_COMMAND');
+    assertInvalid({ CAW_BROWSER_MCP_COMMAND: '[]' }, 'CAW_BROWSER_MCP_COMMAND');
+    assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(Array(33).fill('npx')) }, 'CAW_BROWSER_MCP_COMMAND');
+    assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['npx', 3]) }, 'CAW_BROWSER_MCP_COMMAND');
+    assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['npx', 'a\nb']) }, 'CAW_BROWSER_MCP_COMMAND');
+    assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['./relative/server']) }, 'CAW_BROWSER_MCP_COMMAND');
+    assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['x'.repeat(1025)]) }, 'CAW_BROWSER_MCP_COMMAND');
   });
 });

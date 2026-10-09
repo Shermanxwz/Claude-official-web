@@ -21,6 +21,7 @@
  * @property {boolean} builtin
  * @property {'sdk'|'gui'} source
  * @property {string} [guiId]
+ * @property {boolean} [shadowed]  a GUI row whose name a Claude Code command also uses
  */
 
 /**
@@ -125,8 +126,9 @@ export function filterCommands(items, query) {
 }
 
 /**
- * Builds the slash palette rows: GUI commands first, then Claude Code commands. A GUI command is dropped when a Claude
- * Code command or alias already uses its name, so `/model` never appears twice.
+ * Builds the slash palette rows: the GUI commands first, then the Claude Code commands. A GUI command that a Claude Code
+ * command or alias also uses keeps its row and is marked `shadowed` (the palette badges it "Panel"); picking the Claude
+ * Code row types the command, picking the GUI row runs the panel or action.
  * @param {Array<{name?: string, description?: string, argumentHint?: string, aliases?: string[], builtin?: boolean}>}
  *   sdkCommands  capabilities.commands
  * @param {GuiCommandSpec[]} guiCommands
@@ -143,13 +145,13 @@ export function mergeCommands(sdkCommands, guiCommands) {
       builtin: cmd.builtin === true,
       source: /** @type {const} */ ('sdk'),
     }));
-  const taken = new Set();
+  const runtimeNames = new Set();
   for (const cmd of sdk) {
-    taken.add(cmd.name.toLowerCase());
-    for (const alias of cmd.aliases) taken.add(alias.toLowerCase());
+    runtimeNames.add(cmd.name.toLowerCase());
+    for (const alias of cmd.aliases) runtimeNames.add(alias.toLowerCase());
   }
   const gui = (Array.isArray(guiCommands) ? guiCommands : [])
-    .filter((cmd) => cmd && typeof cmd.name === 'string' && !taken.has(cmd.name.toLowerCase()))
+    .filter((cmd) => cmd && typeof cmd.name === 'string' && cmd.name !== '')
     .map((cmd) => ({
       name: cmd.name,
       description: cmd.description ?? '',
@@ -158,8 +160,163 @@ export function mergeCommands(sdkCommands, guiCommands) {
       builtin: false,
       source: /** @type {const} */ ('gui'),
       guiId: cmd.id,
+      shadowed: runtimeNames.has(cmd.name.toLowerCase()),
     }));
   return [...gui, ...sdk];
+}
+
+/**
+ * A slash command typed as `/btw <question>` (the side question). Only the question counts: a bare `/btw` or one with
+ * nothing after it is not a side question, so it is sent as typed.
+ * @param {string} text
+ * @returns {string|null} the trimmed question, or null when the text is not a side question
+ */
+export function parseSideQuestion(text) {
+  if (typeof text !== 'string') return null;
+  const match = /^\/btw\s+(\S[\s\S]*)$/u.exec(text);
+  return match ? match[1].trim() : null;
+}
+
+/**
+ * Whether the runtime's own command list has a command or alias with this name. When it does, the typed command goes to
+ * the runtime and the GUI side question is offered only from the palette.
+ * @param {Array<{name?: string, aliases?: string[]}> | null | undefined} commands
+ * @param {string} name lowercase command name without the slash
+ * @returns {boolean}
+ */
+export function runtimeHasCommand(commands, name) {
+  return (Array.isArray(commands) ? commands : []).some((cmd) => cmd && (cmd.name === name
+    || (Array.isArray(cmd.aliases) && cmd.aliases.includes(name))));
+}
+
+/**
+ * The composer footer's words for a permission mode (message keys under composer.modeWord).
+ * @param {string|null|undefined} mode
+ * @returns {string} message key
+ */
+export function modeWordKey(mode) {
+  switch (mode) {
+    case 'default': return 'composer.modeWord.default';
+    case 'acceptEdits': return 'composer.modeWord.acceptEdits';
+    case 'plan': return 'composer.modeWord.plan';
+    case 'auto': return 'composer.modeWord.auto';
+    case 'bypassPermissions': return 'composer.modeWord.bypassPermissions';
+    case 'dontAsk': return 'composer.modeWord.dontAsk';
+    default: return 'composer.modeWord.settings';
+  }
+}
+
+/**
+ * Keys the composer reacts to. Shift+Tab cycles the permission mode; the plain key combinations are left alone.
+ * @param {{key?: string, shiftKey?: boolean, altKey?: boolean, ctrlKey?: boolean, metaKey?: boolean}} event
+ * @returns {boolean}
+ */
+export function isModeCycleKey(event) {
+  return Boolean(event) && event.key === 'Tab' && event.shiftKey === true
+    && !event.altKey && !event.ctrlKey && !event.metaKey;
+}
+
+/**
+ * What Escape does in the composer when no palette or menu took it: leave the prompt history, interrupt the running
+ * turn (only when nothing else is open), or leave the field.
+ * @param {{browsing: boolean, running: boolean, blocked: boolean}} state  blocked: a menu, dialog or overlay is open
+ * @returns {'leave-history'|'interrupt'|'blur'}
+ */
+export function escapeAction({ browsing, running, blocked }) {
+  if (browsing) return 'leave-history';
+  if (running && !blocked) return 'interrupt';
+  return 'blur';
+}
+
+/**
+ * @typedef {Object} HistoryState
+ * @property {number} index  position in the newest-first list, or -1 when the field holds the user's own text
+ * @property {string} draft  the text the field held before the user started walking the history
+ */
+
+/** @type {HistoryState} */
+export const HISTORY_IDLE = Object.freeze({ index: -1, draft: '' });
+
+/**
+ * Which arrow walks the prompt history. Up goes back from the first line of an empty field, or from the first line of
+ * a recalled prompt; Down goes forward from the last line of a recalled prompt. Modifier keys never walk the history.
+ * @param {{key?: string, shiftKey?: boolean, altKey?: boolean, ctrlKey?: boolean, metaKey?: boolean}} event
+ * @param {{text: string, caret: number, browsing: boolean}} field
+ * @returns {'prev'|'next'|null}
+ */
+export function historyKeyAction(event, { text, caret, browsing }) {
+  if (!event || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return null;
+  const value = typeof text === 'string' ? text : '';
+  const position = Math.min(Math.max(0, Math.trunc(caret)), value.length);
+  if (event.key === 'ArrowUp') {
+    const firstLine = !value.slice(0, position).includes('\n');
+    return (browsing || value === '') && firstLine ? 'prev' : null;
+  }
+  if (event.key === 'ArrowDown') {
+    const lastLine = !value.slice(position).includes('\n');
+    return browsing && lastLine ? 'next' : null;
+  }
+  return null;
+}
+
+/**
+ * One step through the prompt history. `entries` are newest first. Going back past the oldest entry keeps the oldest;
+ * going forward past the newest returns the draft the user had typed. Returns null when the step does nothing.
+ * @param {HistoryState} state
+ * @param {'prev'|'next'} action
+ * @param {string[]} entries  newest first
+ * @param {string} current    the field's text now
+ * @returns {{state: HistoryState, text: string}|null}
+ */
+export function stepHistory(state, action, entries, current) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (action === 'prev') {
+    if (list.length === 0) return null;
+    const index = Math.min(state.index + 1, list.length - 1);
+    const draft = state.index < 0 ? current : state.draft;
+    return { state: { index, draft }, text: list[index] };
+  }
+  if (action === 'next') {
+    if (state.index < 0) return null;
+    if (state.index === 0) return { state: { index: -1, draft: '' }, text: state.draft };
+    const index = state.index - 1;
+    return { state: { index, draft: state.draft }, text: list[index] };
+  }
+  return null;
+}
+
+/**
+ * The prompts ↑ can recall, newest first and without a repeat of the entry before it. `transcript` holds the session's
+ * user messages (oldest first); `sent` the prompts sent from this page that the transcript may not show yet.
+ * @param {string[]} transcript
+ * @param {string[]} sent
+ * @returns {string[]}
+ */
+export function promptHistory(transcript, sent) {
+  const seen = Array.isArray(transcript) ? transcript.filter((text) => typeof text === 'string' && text.trim() !== '') : [];
+  const extra = (Array.isArray(sent) ? sent : []).filter((text) => typeof text === 'string' && !seen.includes(text));
+  const newestFirst = [...seen, ...extra].reverse();
+  return newestFirst.filter((text, index) => index === 0 || text !== newestFirst[index - 1]);
+}
+
+/**
+ * The composer's own key decision for one keydown, in the order the composer checks them. Returns the first action that
+ * applies, or null to leave the key to the field.
+ * @param {{key?: string, shiftKey?: boolean, altKey?: boolean, ctrlKey?: boolean, metaKey?: boolean}} event
+ * @param {{paletteOpen: boolean, browsing: boolean, running: boolean, blocked: boolean, text: string, caret: number,
+ *   bypass?: boolean}} state
+ * @returns {'mode-cycle'|'escape'|'history-prev'|'history-next'|null}
+ */
+export function keyDecision(event, state) {
+  if (!event) return null;
+  if (isModeCycleKey(event)) return 'mode-cycle';
+  // While the palette is open its own keys (arrows, Enter, Escape) come first, so the field decides nothing.
+  if (state.paletteOpen) return null;
+  if (event.key === 'Escape') return 'escape';
+  const walk = historyKeyAction(event, { text: state.text, caret: state.caret, browsing: state.browsing });
+  if (walk === 'prev') return 'history-prev';
+  if (walk === 'next') return 'history-next';
+  return null;
 }
 
 /**

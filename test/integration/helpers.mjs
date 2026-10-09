@@ -58,10 +58,12 @@ function writeTree(dir, files) {
  * @param {Record<string, string>} [overrides] environment variables that replace the defaults
  * @param {{wrapEngine?: (engine: import('../../src/contracts.mjs').EngineAdapter) =>
  *   import('../../src/contracts.mjs').EngineAdapter,
- *   backgroundTiming?: {waitMs?: number, runMs?: number}}} [options] backgroundTiming shortens how long a foreground
- *   command waits to be moved and how long a background command runs in the mock
+ *   backgroundTiming?: {waitMs?: number, runMs?: number},
+ *   resolvedSettings?: Record<string, unknown>}} [options] backgroundTiming shortens how long a foreground
+ *   command waits to be moved and how long a background command runs in the mock. resolvedSettings are the settings the
+ *   user's files define: every query of the mock loads them (a permissions.defaultMode, hooks, an env block, and so on)
  */
-export async function startTestServer(overrides = {}, { wrapEngine, backgroundTiming } = {}) {
+export async function startTestServer(overrides = {}, { wrapEngine, backgroundTiming, resolvedSettings } = {}) {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'caw-it-')));
   const root = path.join(base, 'workspace');
   const proj = path.join(root, 'proj');
@@ -88,7 +90,13 @@ export async function startTestServer(overrides = {}, { wrapEngine, backgroundTi
     };
     const config = loadConfig(env);
     const log = createLogger({ level: 'error' });
-    const mock = createMockAdapter({ config, log, delayMs: Number(env.CAW_MOCK_DELAY_MS), backgroundTiming });
+    const mock = createMockAdapter({
+      config,
+      log,
+      delayMs: Number(env.CAW_MOCK_DELAY_MS),
+      backgroundTiming,
+      resolvedSettings,
+    });
     const engine = wrapEngine ? wrapEngine(mock) : mock;
     running = await startServer({ env, engine, listenHost: '127.0.0.1', listenPort: 0 });
     const { url, events, engineHost } = running;
@@ -338,6 +346,7 @@ export function client(url) {
    *   get: (pathname: string, options?: object) => ReturnType<typeof send>,
    *   post: (pathname: string, body?: unknown, options?: object) => ReturnType<typeof send>,
    *   patch: (pathname: string, body?: unknown, options?: object) => ReturnType<typeof send>,
+   *   put: (pathname: string, body?: unknown, options?: object) => ReturnType<typeof send>,
    *   del: (pathname: string, body?: unknown, options?: object) => ReturnType<typeof send>,
    *   login: (token?: string, options?: object) => ReturnType<typeof send>,
    *   events: (options?: {watch?: string, after?: number, lastEventId?: string}) => Promise<EventStream>
@@ -357,6 +366,9 @@ export function client(url) {
     },
     patch(pathname, body, options) {
       return send('PATCH', pathname, { ...options, body });
+    },
+    put(pathname, body, options) {
+      return send('PUT', pathname, { ...options, body });
     },
     del(pathname, body, options) {
       return send('DELETE', pathname, { ...options, body });

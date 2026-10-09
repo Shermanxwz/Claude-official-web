@@ -4,7 +4,7 @@
  */
 
 import { h } from '../../dom.js';
-import { chip, copyButton, errorBlock, markdownBlock, mutedNote, statusOf, toolShell } from './shell.js';
+import { chip, copyButton, errorBlock, markdownBlock, mutedNote, statusOf, toolShell, verbOf } from './shell.js';
 import { displayPath, isRecord, resultText, str } from './summaries.js';
 
 /**
@@ -28,12 +28,11 @@ function renderExit(card, ctx) {
   const plan = str(structured.plan) || str(input.plan);
   const savedPath = displayPath(structured.filePath, ctx.cwd);
   return toolShell({
-    iconName: 'layers',
-    title: 'ExitPlanMode',
+    title: verbOf('ExitPlanMode', t),
     subtitle: savedPath,
     status: statusOf(card),
     body: () => exitBody(card, structured, plan, ctx),
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     actions: plan ? [copyButton({ text: plan, t, label: t('tools.plan.copy') })] : [],
     extras: [chip(t('tools.plan.badge'), { kind: 'accent' })],
     t,
@@ -81,11 +80,10 @@ function renderEnter(card, ctx) {
   const message = str(structured.message) || resultText(card.result);
   const body = () => (failed ? errorBlock(message, t) : mutedNote(message));
   return toolShell({
-    iconName: 'layers',
-    title: 'EnterPlanMode',
+    title: verbOf('EnterPlanMode', t),
     status: statusOf(card),
     body: message ? body : null,
-    open: Boolean(ctx.open || card.pendingRequestId),
+    open: Boolean(ctx.open),
     t,
     family: 'plan',
   });
