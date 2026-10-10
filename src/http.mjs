@@ -156,7 +156,8 @@ function collectBody(req, limit, idleMs) {
  * - No body → `{}`.
  * - Media type must be application/json or application/*+json (415 otherwise).
  * - Bodies over `limit` bytes → 413.
- * - No data for `idleTimeoutMs` (30 s by default) → 400 'Request body timed out'; the connection is closed.
+ * - No data for `idleTimeoutMs` (30 s by default) → the request is destroyed and the connection closed,
+ *   with no response.
  * - Invalid JSON, or JSON that is not an object → 400.
  * @param {IncomingMessage} req
  * @param {number} [limit]

@@ -230,7 +230,7 @@
   background: var(--accent-soft);
 }
 
-/* 16px keeps iOS Safari from zooming in when the field is focused. */
+/* iOS Safari zooms in on a focused field under 16px, so the field never goes below 16px; Large still grows it. */
 .terminal-ime {
   display: block;
   width: 100%;
@@ -241,7 +241,7 @@
   background: var(--bg);
   color: var(--fg);
   font-family: var(--font-sans);
-  font-size: 16px;
+  font-size: max(16px, calc(16px * var(--fs-scale)));
 }
 
 .terminal-ime::placeholder {

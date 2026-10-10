@@ -12,6 +12,7 @@ import { h, icon } from '../dom.js';
  * @property {string} [icon]        icon name (see docs/FRONTEND.md)
  * @property {boolean} [danger]
  * @property {boolean} [disabled]
+ * @property {string} [title]       tooltip, e.g. why the item is disabled
  * @property {boolean} [checked]    when given, the item is a checkable menu item
  * @property {() => void} [onClick]
  */
@@ -79,6 +80,7 @@ function renderEntry(entry, choose) {
       type: 'button',
       role: checkable ? 'menuitemcheckbox' : 'menuitem',
       disabled: entry.disabled,
+      title: entry.title ?? null,
       'aria-checked': checkable ? String(entry.checked === true) : null,
       tabindex: '-1',
     },
@@ -105,7 +107,9 @@ export function openMenu(anchor, items, { label } = {}) {
   /** @type {(entry: MenuItem) => void} */
   const choose = (entry) => {
     if (entry.disabled) return;
-    close(false);
+    // Focus returns to the anchor before the action runs. A sheet or dialog that the action opens then remembers the
+    // anchor, which is still on the page, rather than the menu item that was just removed.
+    close(true);
     entry.onClick?.();
   };
 

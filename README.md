@@ -3,8 +3,8 @@ English · [简体中文](README.zh-CN.md)
 # claude-official-web
 
 A self-hosted graphical Web host for the official Claude Agent SDK. It runs the same Claude Code runtime as the `claude`
-terminal, so your CLAUDE.md, settings, permission rules, hooks, skills, plugins, MCP servers, subagents and session files
-behave exactly as they do in the terminal.
+terminal, so your CLAUDE.md, settings, permission rules, hooks, skills, plugins, MCP servers, subagents and session
+files behave exactly as they do in the terminal.
 
 ## Screenshots
 
@@ -41,23 +41,40 @@ This is an overview. The complete map, with the SDK call or message behind each 
 
 - **Conversation:** streaming replies, collapsible thinking with its summary, Markdown and code, tool cards for every
   tool family (diffs for edits), subagents nested in their parent card, background tasks (including moving a running
-  command or subagent to the background, like Ctrl+B), interrupts that leave background tasks running, queued
-  messages, refusal-fallback notices, compaction and context usage.
+  command or subagent to the background, like Ctrl+B), interrupts that leave background tasks running, queued messages
+  that you can cancel, a Stop menu that can also clear the queue, refusal-fallback notices, compaction and context
+  usage. Side questions (`/btw`) get an answer that stays out of the transcript.
 - **Approvals:** permission cards (allow once, allow always, or deny with a reason), answers to AskUserQuestion, plan
   approval, MCP elicitation, permission modes, and model, effort and fast mode switching. Allow always saves the ticked
-  suggestions:
-  allow rules and session-only mode switches start ticked, directory grants and other changes only when you tick them.
-- **Sessions:** start, resume, rename, tag, fork, rewind code or conversation, delete, paged history, and a session list
-  grouped by project.
-- **Input:** slash commands from Claude Code (skills, custom commands and MCP prompts, plus the built-in commands that work
-  without a terminal), `@` file mentions, image and file attachments, and prompt suggestions.
+  suggestions: allow rules and session-only mode switches start ticked, directory grants and other changes only when you
+  tick them. When a model declines a request, a dialog offers to retry on the fallback model, edit the prompt or cancel.
+- **Sessions:** start, resume, rename, tag, fork, rewind code or conversation, delete, paged history, export to a text
+  file (`/export`), and a session list grouped by project. Search matches the titles and first prompts of every
+  conversation, and the message text of the 50 most recently changed ones (within 5 seconds). A quick switcher (Ctrl+K,
+  or ⌘K on a Mac) finds sessions by title and runs the same search.
+- **Session settings:** an agent, additional directories, a fallback model and browser tools for each session. A change
+  to the fallback model applies after a restart, and a change to the additional directories restarts a live session.
+- **Input:** slash commands from Claude Code (skills, custom commands and MCP prompts, plus the built-in commands that
+  work without a terminal), `@` file mentions, image and file attachments, and prompt suggestions.
 - **Workspaces and folder trust:** allowed roots with a directory browser. Every path is checked against those roots. A
   folder's project settings, hooks, skills, CLAUDE.md and MCP servers load only after you trust the folder.
-- **Extensions:** MCP server status, toggle and reconnect; reload of plugins (with the prompt-cache check of
-  `/reload-plugins`), skills and output styles; an output style picker; CLAUDE.md, settings, hooks and plugins loaded as
-  they are in the terminal, once the folder is trusted.
-- **Official interfaces only:** every Claude Code feature goes through a public SDK interface. The few parts the gateway
-  implements itself, and the reasons, are listed in [ARCHITECTURE.md](ARCHITECTURE.md#official-interfaces).
+- **Runtime panels:** `/status`, `/permissions`, `/hooks`, `/memory` (an editor for the CLAUDE.md files that Claude Code
+  loads), `/skills`, `/sandbox`, `/usage` and, for the `full` profile, the settings view (`/config`). The panels show
+  what the runtime reports. Only the memory editor changes anything.
+- **Extensions:** MCP servers with their status, toggle, reconnect and sign-in (OAuth); reload of plugins (with the
+  prompt-cache check of `/reload-plugins`), skills and output styles; an output style picker; CLAUDE.md, settings, hooks
+  and plugins loaded as they are in the terminal, once the folder is trusted.
+- **Account:** Claude Code's sign-in from the browser, in Settings → Account, through the same flow as `/login`. The
+  gateway never reads the credentials.
+- **Browser tools (optional):** Claude in Chrome on a desktop host, or a browser MCP server that you configure and
+  switch on per session. See [Browser](#browser).
+- **Interface:** light, dark and system themes, three text sizes, keyboard shortcuts (Shift+Tab cycles the permission
+  mode), touch targets of at least 44 px on touch screens, and a developer console (`/devtools`) that shows the raw
+  output of each runtime view and the events this page received.
+- **Official interfaces only:** every Claude Code feature goes through the Agent SDK. The public interfaces come first.
+  Where the SDK has none, the gateway calls the runtime's own screens, and only when the installed runtime offers them.
+  The few parts the gateway implements itself, and the reasons, are listed in
+  [ARCHITECTURE.md](ARCHITECTURE.md#official-interfaces).
 - **Operations:** a token login (stored as a hash by default), a health endpoint, structured logs, a systemd service
   installer, and a verification suite (`npm run seal`).
 - **Terminal fallback (optional):** a terminal tab for the commands that exist only in the terminal.
@@ -68,9 +85,10 @@ This is an overview. The complete map, with the SDK call or message behind each 
   with `npm start`.
 - Node.js 22.12 or newer.
 - A Claude subscription or an Anthropic API key. See [Usage and billing](#usage-and-billing).
-- Claude Code logged in once on the server, as the same user that runs the gateway. The SDK ships the Claude Code binary,
-  so the gateway does not need a separate installation. To log in, run `claude` (or `npx @anthropic-ai/claude-code`) once
-  as that user and complete `/login`.
+- Claude Code logged in once on the server, as the same user that runs the gateway. The SDK ships the Claude Code
+  binary, so the gateway does not need a separate installation. To log in, run `claude` (or `npx
+  @anthropic-ai/claude-code`) once as that user and complete `/login`. Or sign in from the browser after the first
+  start, in Settings → Account. That needs the `full` access profile.
 - Only for the terminal tab: `build-essential` and `python3`, which node-pty needs to compile.
 
 ## Quick demo
@@ -82,11 +100,13 @@ npm ci
 npm run demo
 ```
 
-Open <http://127.0.0.1:4180>. The demo has no login, so run it only on your own machine and never expose it to a network.
+Open <http://127.0.0.1:4180>. The demo has no login, so run it only on your own machine and never expose it to a
+network.
 
 ## Production install (Linux)
 
-1. Log in to Claude Code as the user who will run the service, and complete `/login` (see [Requirements](#requirements)).
+1. Log in to Claude Code as the user who will run the service, and complete `/login` (see
+   [Requirements](#requirements)).
 2. Clone or unpack the project into `~/claude-official-web`. Then run the installer from that directory. Set the origin
    first if you will open the gateway through a hostname:
 
@@ -95,15 +115,15 @@ Open <http://127.0.0.1:4180>. The demo has no login, so run it only on your own 
    CAW_PUBLIC_ORIGIN=https://claude.example.com scripts/install-linux.sh
    ```
 
-The installer checks Node.js, installs the production dependencies, creates the configuration file, installs and starts a
-systemd user service, and waits for its health check. Running it again is safe: it keeps your configuration and your login
-token, and it updates the dependencies and the unit. It also restarts a running service to apply the configuration. In the
-default hash mode, that signs every browser out.
+The installer checks Node.js, installs the production dependencies, creates the configuration file, installs and starts
+a systemd user service, and waits for its health check. Running it again is safe: it keeps your configuration and your
+login token, and it updates the dependencies and the unit. It also restarts a running service to apply the
+configuration. In the default hash mode, that signs every browser out.
 
 **The login token is printed once.** A new installation generates a token and stores only its SHA-256 hash, as
-`CAW_TOKEN_SHA256`, in the configuration file. Save the token in a password manager when the installer prints it. The file
-cannot show the token again. If you lose it, run `scripts/install-linux.sh --rotate-token`. Run the installer in your own
-terminal rather than through Claude Code, so that the printed token never reaches a session transcript.
+`CAW_TOKEN_SHA256`, in the configuration file. Save the token in a password manager when the installer prints it. The
+file cannot show the token again. If you lose it, run `scripts/install-linux.sh --rotate-token`. Run the installer in
+your own terminal rather than through Claude Code, so that the printed token never reaches a session transcript.
 
 The configuration lives in `~/.config/claude-official-web/env` (mode 600). After you change it, run
 `systemctl --user restart claude-official-web`.
@@ -120,17 +140,17 @@ scripts/install-linux.sh --uninstall --purge   # also remove the configuration a
 
 The installer also accepts these options:
 
-- `--plain-token` stores a newly issued token as plaintext (`CAW_TOKEN`) instead of a hash. Use it only when the file must
-  be able to show the token.
-- `--rotate-token` issues a new token, stores it in the same way (or as plaintext with `--plain-token`), and restarts the
-  service. Every browser session ends.
-- `--show-token` prints a token issued by this run, or the plaintext token that is already stored. A stored hash cannot be
-  shown.
+- `--plain-token` stores a newly issued token as plaintext (`CAW_TOKEN`) instead of a hash. Use it only when the file
+  must be able to show the token.
+- `--rotate-token` issues a new token, stores it in the same way (or as plaintext with `--plain-token`), and restarts
+  the service. Every browser session ends.
+- `--show-token` prints a token issued by this run, or the plaintext token that is already stored. A stored hash cannot
+  be shown.
 - `--allow-root` (not recommended) and `--help`.
 
 Before it installs anything, the installer checks the existing configuration. It refuses a file that sets both token
-settings, a plaintext token shorter than 16 characters, a malformed hash, `CAW_REQUIRE_AUTH=0` or `CAW_ENGINE=mock`, and it
-names the setting to fix. `--rotate-token` skips the token checks, because it replaces the stored token.
+settings, a plaintext token shorter than 16 characters, a malformed hash, `CAW_REQUIRE_AUTH=0` or `CAW_ENGINE=mock`, and
+it names the setting to fix. `--rotate-token` skips the token checks, because it replaces the stored token.
 
 The deployment guide in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers the whole server setup, updates and backups.
 
@@ -144,10 +164,10 @@ Expose the gateway only over HTTPS, and never publish its port directly. Choose 
 - **A TLS reverse proxy** that you operate, such as Caddy or nginx. Streaming requires response buffering to be off. The
   examples in the deployment guide set that.
 
-Whichever you choose, set `CAW_PUBLIC_ORIGIN` to the exact origin that appears in the browser's address bar: scheme, host
-and port, without a path or a trailing slash. A write from any other origin is refused with `ORIGIN_REJECTED`. The gateway
-also accepts a request only when its `Host` header is that host or a loopback name, so the proxy must forward the `Host`
-header unchanged. Otherwise the gateway answers `421 HOST_REJECTED`.
+Whichever you choose, set `CAW_PUBLIC_ORIGIN` to the exact origin that appears in the browser's address bar: scheme,
+host and port, without a path or a trailing slash. A write from any other origin is refused with `ORIGIN_REJECTED`. The
+gateway also accepts a request only when its `Host` header is that host or a loopback name, so the proxy must forward
+the `Host` header unchanged. Otherwise the gateway answers `421 HOST_REJECTED`.
 
 Behind a proxy or tunnel on the same host, set `CAW_TRUST_PROXY=1` so that each visitor has its own login and stream
 limits. Read the deployment guide before you do: it is safe only when the proxy sets the client address header itself.
@@ -155,43 +175,49 @@ limits. Read the deployment guide before you do: it is safe only when the proxy 
 ## Configuration
 
 The gateway reads every setting from the environment. The production service reads them from the configuration file.
+Boolean settings accept `0`, `1`, `true` or `false`. An invalid value stops the gateway at startup with a message that
+names the variable, and the exit status is 2.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CAW_HOST` | `127.0.0.1` | Address the gateway listens on. Keep it on loopback and publish through HTTPS. |
-| `CAW_PORT` | `4180` | Port the gateway listens on. |
+| `CAW_HOST` | `127.0.0.1` | Address the gateway listens on: an IP address or host name, up to 255 characters without spaces. Keep it on loopback and publish through HTTPS. |
+| `CAW_PORT` | `4180` | Port the gateway listens on, from 1 to 65535. |
 | `CAW_REQUIRE_AUTH` | `1` | `1` requires the login token. `0` turns login off and is accepted only with a loopback `CAW_HOST`; the installer refuses it. |
 | `CAW_TOKEN` | none | Login token in plaintext, 16 to 1024 characters. Use it or `CAW_TOKEN_SHA256`, not both. `--plain-token` writes it. |
 | `CAW_TOKEN_SHA256` | none | SHA-256 of the login token, as 64 hexadecimal characters. The installer writes this by default. |
-| `CAW_PUBLIC_ORIGIN` | unset | The canonical origin users open, for example `https://claude.example.com`. Set it behind any proxy or tunnel. |
-| `CAW_ACCESS_PROFILE` | `full` | `read` (viewing only), `standard` (everything except deleting sessions, the terminal and bypass mode) or `full`. |
-| `CAW_APP_NAME` | `Agent Web` | The product name shown in the interface. |
-| `CAW_WORKSPACE_ROOTS` | `$HOME` | Colon-separated existing directories where sessions may start and the directory browser looks. Prefer a projects directory. The roots limit sessions, not the agent. |
-| `CAW_STATE_DIR` | `~/.local/state/claude-official-web` | The gateway's state directory, which holds the session revocations and the trusted folders. |
+| `CAW_PUBLIC_ORIGIN` | unset | The canonical origin users open, for example `https://claude.example.com`: scheme, host and port, with no path, query, fragment, credentials or trailing slash. Set it behind any proxy or tunnel. |
+| `CAW_ACCESS_PROFILE` | `full` | `read` (viewing only), `standard` (everything except deleting sessions, the account sign-in, the terminal, browser tools, the settings view and bypass mode) or `full`. |
+| `CAW_APP_NAME` | `Agent Web` | The product name shown in the interface, at most 60 characters. |
+| `CAW_WORKSPACE_ROOTS` | `$HOME` | Colon-separated existing absolute directories where sessions may start and the directory browser looks. Prefer a projects directory. The roots limit sessions, not the agent. |
+| `CAW_STATE_DIR` | `$XDG_STATE_HOME/claude-official-web`, or `~/.local/state/claude-official-web` | The gateway's state directory: session revocations, trusted folders and the folders for its own queries. An absolute path. |
 | `CAW_ENGINE` | `sdk` | `sdk` runs Claude Code through the Agent SDK. `mock` selects the built-in demo engine; the installer refuses it. |
-| `CAW_CLAUDE_BIN` | unset (the SDK's bundled binary) | Absolute path to a Claude Code executable, used for chat and terminal sessions instead of the bundled binary. There is no fallback when it is set. |
-| `CAW_DEFAULT_MODEL` | unset (Claude Code's default) | Model for new sessions. |
-| `CAW_DEFAULT_PERMISSION_MODE` | `default` | Permission mode for new sessions. `bypassPermissions` needs `CAW_ALLOW_BYPASS=1` and the `full` profile. |
+| `CAW_CLAUDE_BIN` | unset (the SDK's bundled binary) | Absolute path to an existing Claude Code executable, used for chats, sign-in and the terminal instead of the bundled binary. There is no fallback when it is set. |
+| `CAW_DEFAULT_MODEL` | unset (Claude Code's default) | Model for new sessions, at most 200 characters. |
+| `CAW_DEFAULT_PERMISSION_MODE` | unset (Claude Code's settings decide) | Permission mode for new sessions: `default`, `acceptEdits`, `plan`, `auto`, `dontAsk` or `bypassPermissions`. Unset, the mode comes from Claude Code's own settings, as it does in the terminal. `bypassPermissions` needs `CAW_ALLOW_BYPASS=1`. |
 | `CAW_DEFAULT_EFFORT` | unset (Claude Code's default) | Effort level for new sessions: `low`, `medium`, `high`, `xhigh` or `max`. |
+| `CAW_FALLBACK_MODEL` | unset | Fallback model for new sessions (`--fallback-model`), at most 200 characters. A refused answer can be retried on it. |
+| `CAW_CHROME` | `0` | `1` starts each query with Claude in Chrome (the CLI's `--chrome` flag). It needs a claude.ai sign-in, and Chrome with the Claude in Chrome extension on the gateway's machine. |
+| `CAW_BROWSER_MCP_COMMAND` | unset | A JSON array with the command and its arguments for a browser MCP server, for example `["npx","-y","@playwright/mcp@0.0.82","--headless","--isolated"]`. Sessions can switch it on as the `browser` server. The array holds 1 to 32 strings of up to 1024 characters; the first is an absolute path or a bare command name. |
 | `CAW_TERMINAL` | `0` | `1` enables the terminal tab. It needs the `full` profile and node-pty, and it is equivalent to shell access. |
-| `CAW_ALLOW_BYPASS` | `0` | `1` allows the `bypassPermissions` mode, including as the default mode. It needs the `full` profile. |
-| `CAW_IDLE_TIMEOUT_MS` | `1800000` (30 minutes) | Idle live sessions close after this time and resume when you send the next message. |
-| `CAW_MAX_LIVE_SESSIONS` | `4` | The maximum number of live Claude Code processes at once. |
-| `CAW_UPLOAD_MAX_BYTES` | `26214400` (25 MiB) | The largest accepted attachment. |
-| `CAW_IMAGE_MAX_BYTES` | `5242880` (5 MiB) | The largest accepted image attachment. |
-| `CAW_UPLOAD_RETENTION_DAYS` | `7` | Attachment batches created by the gateway are removed after this many days. |
-| `CAW_SESSION_TTL_HOURS` | `168` (7 days) | How long a web login session stays valid, in hours. |
+| `CAW_ALLOW_BYPASS` | `0` | `1` allows the `bypassPermissions` mode, including as the default mode. It needs `CAW_ACCESS_PROFILE=full`; under `read` or `standard` the gateway refuses to start with it. |
+| `CAW_IDLE_TIMEOUT_MS` | `1800000` (30 minutes) | Idle live sessions close after this time, from 60000 to 86400000 milliseconds, and resume when you send the next message. |
+| `CAW_MAX_LIVE_SESSIONS` | `4` | The maximum number of live Claude Code processes at once, from 1 to 32. |
+| `CAW_UPLOAD_MAX_BYTES` | `26214400` (25 MiB) | The largest accepted attachment, from 1 KiB to 1 GiB. |
+| `CAW_IMAGE_MAX_BYTES` | `5242880` (5 MiB) | The largest image sent inline as an image, from 1 KiB to 20 MiB. A larger image, up to `CAW_UPLOAD_MAX_BYTES`, is sent as a file path. |
+| `CAW_UPLOAD_RETENTION_DAYS` | `7` | Attachment batches created by the gateway are removed after this many days, from 1 to 365. |
+| `CAW_SESSION_TTL_HOURS` | `168` (7 days) | How long a web login session stays valid, in hours, from 1 to 8760. |
 | `CAW_TRUST_PROXY` | `0` | `1` takes the client address from `CF-Connecting-IP`, then `X-Real-IP`, then the last `X-Forwarded-For` entry. Use it only when the gateway is reachable only through a proxy that sets one of those headers itself. |
 | `CAW_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
-| `CAW_MOCK_DELAY_MS` | `12` | The delay between simulated output tokens. Mock engine only. |
+| `CAW_MOCK_DELAY_MS` | `12` | The delay between simulated output tokens, from 0 to 10000 milliseconds. Mock engine only. |
+| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | unset | Read from the gateway's environment and inherited by Claude Code. A non-empty value other than `0` or `false` turns background tasks off, and the gateway then offers no Run in background action. |
 
 ## Security model
 
 The full threat model and the list of controls are in [SECURITY.md](SECURITY.md). In brief:
 
 - One operator and one login token. The token signs you in, and the session afterwards is an HttpOnly, SameSite=Strict
-  cookie. The installer stores only the token's SHA-256 hash, so the configuration file cannot be used to sign in. To hash
-  a token that you choose yourself, run these commands, then put the 64-character output in `CAW_TOKEN_SHA256`:
+  cookie. The installer stores only the token's SHA-256 hash, so the configuration file cannot be used to sign in. To
+  hash a token that you choose yourself, run these commands, then put the 64-character output in `CAW_TOKEN_SHA256`:
 
   ```bash
   read -r -s -p "Login token: " TOKEN && echo
@@ -204,27 +230,48 @@ The full threat model and the list of controls are in [SECURITY.md](SECURITY.md)
 - Every write must come from the configured origin. This blocks cross-site requests and cross-site WebSocket hijacking.
 - In the default hash mode, sessions end when the gateway restarts, including after an installer run. With a plaintext
   `CAW_TOKEN`, they survive restarts. A logout stays in effect across restarts in both modes.
-- Logins are throttled: ten failures per client address in ten minutes. Event streams are limited to 64 open at once and 16
-  per client address. A request body that stops arriving for 30 seconds is closed, and control calls to Claude Code time
-  out after 10 seconds.
-- Folder trust: an untrusted folder runs with your user settings only. Trust a folder only after you have read what is in
-  it.
+- Logins are throttled: ten failures per client address in ten minutes. Event streams are limited to 64 open at once and
+  16 per client address. A request body that stops arriving for 30 seconds is closed. Most control calls to Claude Code
+  time out after 10 seconds; a few allow longer (usage 15 seconds, side questions and sign-in 120 seconds).
+- Folder trust: an untrusted folder runs with your user settings only. Trusting a folder also records Claude Code's own
+  trust for it, through the runtime's handshake, and the gateway cannot revoke that record. To remove it, stop Claude
+  Code, then set `hasTrustDialogAccepted` to `false` for the folder under `projects` in `~/.claude.json`, or delete that
+  folder's entry. Trust a folder only after you have read what is in it.
 - The gateway never reads Claude credentials. It removes the login token and every `CAW_*` variable from the environment
   of Claude Code.
 - Model output is untrusted. Markdown is sanitized, and tool output is shown as text.
 - Permissions are Claude Code's own. Approve only what you have read: an approved command runs with the service user's
-  full authority.
+  full authority. Browser tools have the same authority; see [Browser](#browser).
+
+## Browser
+
+Claude can drive a browser in two ways. They are separate, and you can enable either or both.
+
+- **Claude in Chrome** (`CAW_CHROME=1`) uses the Claude in Chrome extension in a Chrome browser on the same machine as
+  the gateway, with that browser's sign-ins. It needs a claude.ai sign-in for Claude Code, so it does not work on a
+  headless server. The Claude in Chrome tab in the runtime panels shows whether it is allowed, installed and connected,
+  with links to install it and to reconnect it.
+- **A browser MCP server** (`CAW_BROWSER_MCP_COMMAND`) is a server that you start on the gateway's host. The example in
+  the configuration table runs Playwright's browser server headless, which suits a server without a display. A session
+  gets it as the `browser` server when someone with the `full` profile turns on **Browser tools** in the session
+  settings. Only the operator sets the command, and a user cannot supply one. The deployment guide explains the setup.
+
+Browser tools act with the service user's network access and files, and what a web page says can steer the model. Turn
+them on only for the sessions that need them.
 
 ## Terminal fallback
 
-Some Claude Code features exist only in the terminal: `/theme`, `/terminal-setup`, vim mode, custom keybindings, `!` shell
-mode, full-screen pickers such as `/resume` and `/config`, and `/login`. The optional terminal tab runs Claude Code in a
-pseudo-terminal. It either attaches to a session (`claude --resume <id>`) or starts a fresh `claude` in a project.
+Some Claude Code features exist only in the terminal: `/theme`, `/terminal-setup`, vim mode, custom keybindings, `!`
+shell mode, full-screen dialogs such as `/resume` and `/config`, changing hooks and permission rules (the panels show
+them read-only), choosing among several Chrome browsers (`/chrome`), and `/logout`. Sign-in is in Settings → Account, so
+`/login` no longer needs the terminal. The optional terminal tab runs Claude Code in a pseudo-terminal. It either
+attaches to a session (`claude --resume <id>`) or starts a fresh `claude` in a project.
 
-Enable it with `CAW_TERMINAL=1`. It needs the `full` profile, and node-pty must be built, which requires `build-essential`
-and `python3`. The terminal is equivalent to a shell as the service user, so enable it only on a host that only you
-operate. While the terminal is attached to a session, the browser cannot write to that session. Detach the terminal to
-continue in the browser.
+Enable it with `CAW_TERMINAL=1`. It needs the `full` profile, and node-pty must be built, which requires
+`build-essential` and `python3`. The terminal is equivalent to a shell as the service user, so enable it only on a host
+that only you operate. While the terminal is attached to a session, the browser cannot send messages, rewind, fork,
+delete or use live controls in that session; it can still rename and tag it, and settings changes are kept for its next
+start. Detach the terminal to continue in the browser.
 
 The terminal runs the executable from `CAW_CLAUDE_BIN` when that is set, with no fallback. Otherwise it runs the native
 binary that the SDK ships for the platform, and only when that is missing, the first `claude` on `PATH`.
@@ -241,13 +288,14 @@ Anthropic's help center says:
 
 > You can still use the Claude Agent SDK, `claude -p`, and third-party apps with your subscription limits.
 
-Source: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+Source: [Use the Claude Agent SDK with your Claude
+plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 
 The Agent SDK documentation adds this note:
 
-> Unless previously approved, Anthropic does not allow third party developers to offer claude.ai login or rate limits for
-> their products, including agents built on the Claude Agent SDK. Use the API key authentication methods described in the
-> Quickstart instead.
+> Unless previously approved, Anthropic does not allow third party developers to offer claude.ai login or rate limits
+> for their products, including agents built on the Claude Agent SDK. Use the API key authentication methods described
+> in the Quickstart instead.
 
 Source: [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview).
 
@@ -258,14 +306,16 @@ What this means for you:
 - If you give access to other people, or run the gateway for a team or for customers, do not share a claude.ai login.
   Use Anthropic API keys, as the Agent SDK quickstart describes.
 - Every turn uses the account you logged in with, and it counts against that account's limits or billing.
+- Settings → Account shows whether Claude Code uses a Claude subscription, with its plan, or an API account, with its
+  provider. That choice decides what is billed.
 
 ## Development
 
 ```bash
 npm ci
 npm run dev            # mock engine, restarts on change, no login
-npm test               # unit and integration tests
-npm run test:e2e       # 30 browser tests; install Chromium first: npx playwright-core install chromium
+npm test               # unit and integration tests (about 1,700)
+npm run test:e2e       # 50 browser tests; install Chromium first: npx playwright-core install chromium
 npm run typecheck      # tsc over the JSDoc types
 npm run check          # static rules over the whole tree
 npm run seal           # runs the checks above and verifies the source manifest; writes .state/seal-receipt.json
@@ -273,8 +323,8 @@ npm run seal           # runs the checks above and verifies the source manifest;
 
 The other scripts are `npm run manifest` and `npm run manifest:verify` (source manifest), `npm run smoke:runtime` and
 `npm run smoke:gateway` (real-engine and deployed-gateway validation, see
-[docs/PRODUCTION_SEAL.md](docs/PRODUCTION_SEAL.md)), `npm run screenshots` (renders the images in `docs/screenshots` with
-Chromium), and `npm run maintenance:prune` (removes expired attachments).
+[docs/PRODUCTION_SEAL.md](docs/PRODUCTION_SEAL.md)), `npm run screenshots` (renders the images in `docs/screenshots`
+with Chromium), and `npm run maintenance:prune` (removes expired attachments).
 
 The layout is:
 
@@ -285,15 +335,18 @@ The layout is:
 - `deploy/`: the systemd user unit template.
 - `docs/`: the deployment, feature, seal, protocol, frontend and engineering documents.
 
-The contracts are [ARCHITECTURE.md](ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/FRONTEND.md](docs/FRONTEND.md)
-and [docs/ENGINEERING.md](docs/ENGINEERING.md). Dependencies are pinned exactly, and adding one requires an architecture
-decision.
+The contracts are [ARCHITECTURE.md](ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md),
+[docs/FRONTEND.md](docs/FRONTEND.md) and [docs/ENGINEERING.md](docs/ENGINEERING.md). Dependencies are pinned exactly,
+and adding one requires an architecture decision.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ENGINE_UNAVAILABLE` (HTTP 503), or a notice with this code in a session | Claude Code is not logged in for the user that runs the gateway, its binary cannot be found, or its sign-in was rejected during a session | Run `claude` as that user and complete `/login`, then reopen the session. Set `CAW_CLAUDE_BIN` if the binary cannot be found. Restart the service after a configuration change. |
+| `ENGINE_UNAVAILABLE` (HTTP 503), or a notice with this code in a session | Claude Code is not logged in for the user that runs the gateway, its binary cannot be found, or its sign-in was rejected during a session | Run `claude` as that user and complete `/login`, or sign in from Settings → Account with the `full` profile. Then reopen the session. Set `CAW_CLAUDE_BIN` if the binary cannot be found. Restart the service after a configuration change. |
+| Settings → Account says that sign-in needs the full access profile | `CAW_ACCESS_PROFILE` is `read` or `standard` | Use `full`, or sign in with `claude` and `/login` in a terminal on the server. |
+| `FEATURE_DISABLED` (HTTP 501) when a session turns on browser tools | `CAW_BROWSER_MCP_COMMAND` is not set | Set the command in the configuration file, restart the service, and turn browser tools on again. |
+| The Claude in Chrome tab shows that it is not installed or not connected | The extension is missing from the Chrome that runs on the gateway's machine, Chrome is not running, or Claude Code has no claude.ai sign-in | Install the Claude in Chrome extension in that Chrome, make sure Claude Code is signed in with a claude.ai account, then use the reconnect link in the tab. |
 | `HOST_REJECTED` (HTTP 421) | The `Host` header is neither a loopback name nor the host of `CAW_PUBLIC_ORIGIN`. Usually `CAW_PUBLIC_ORIGIN` is missing, or a proxy rewrites `Host` | Set `CAW_PUBLIC_ORIGIN` to the address in the browser, make the proxy forward `Host` unchanged (`proxy_set_header Host $host;` in nginx), then restart the service. |
 | `ORIGIN_REJECTED` | The browser's origin differs from `CAW_PUBLIC_ORIGIN`, which is common behind a proxy or tunnel | Set `CAW_PUBLIC_ORIGIN` to the exact origin in the address bar, then restart the service. |
 | `INVALID_TOKEN` (HTTP 401) | The login token does not match the configured token | Enter the token that the installer printed. If it is lost, run `scripts/install-linux.sh --rotate-token` in your own terminal. Every session ends. |

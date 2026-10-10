@@ -4,7 +4,9 @@
 
 import { h } from '../../dom.js';
 import { formatDuration, stripAnsi } from '../format.js';
-import { backgroundAction, chip, codeBlock, copyButton, prettyJson, statusOf, toolShell, verbOf } from './shell.js';
+import {
+  backgroundAction, chip, codeBlock, copyButton, copyIconButton, prettyJson, statusOf, toolShell, verbOf,
+} from './shell.js';
 import { finiteNumber, firstLine, isRecord, resultText, str, truncate } from './summaries.js';
 
 const TAIL_LINES = 40;
@@ -24,7 +26,8 @@ export function render(card, ctx) {
   const actions = [];
   if (command) actions.push(copyButton({ text: command, t: ctx.t, label: ctx.t('tools.bash.copyCommand') }));
   if (output) actions.push(copyButton({ text: output, t: ctx.t, label: ctx.t('tools.bash.copyOutput') }));
-  // Only a Bash command can move to the background; the other shell tools (output, kill, monitor) only read or stop tasks.
+  // Only a Bash command can move to the background; the other shell tools (output, kill, monitor) only read or stop
+  // tasks.
   const background = card.name === 'Bash' ? backgroundAction(card, ctx) : null;
   if (background) actions.push(background);
   return toolShell({
@@ -37,6 +40,25 @@ export function render(card, ctx) {
     t: ctx.t,
     family: 'bash',
   });
+}
+
+/**
+ * The detail of a command as a permission card shows it: the command in one mono block with a copy icon in its
+ * corner, and the timeout or background flags as a muted line above it. No row, no rule. Null without a command.
+ * @param {import('./index.js').ToolCard} card
+ * @param {import('./index.js').ToolContext} ctx
+ * @returns {HTMLElement | null}
+ */
+export function renderDetail(card, ctx) {
+  const input = isRecord(card.input) ? card.input : {};
+  const command = str(input.command);
+  if (!command) return null;
+  const meta = metaChips(input, null, ctx.t);
+  return h('div', { class: 'tool-detail' },
+    meta.length > 0 ? h('div', { class: 'tool-meta' }, meta) : null,
+    h('div', { class: 'tool-command-block' },
+      codeBlock(command, { className: 'tool-command', label: ctx.t('tools.bash.command') }),
+      copyIconButton({ text: command, t: ctx.t, label: ctx.t('tools.bash.copyCommand') })));
 }
 
 /**

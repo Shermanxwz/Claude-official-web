@@ -2,8 +2,8 @@ import { errorText } from '../api.js';
 import { clear, h, icon } from '../dom.js';
 import {
   applyCompletion, detachChip, detectTrigger, draftKey, escapeAction, filterCommands, formatBytes, HISTORY_IDLE,
-  isSendShortcut, joinRestoredText, keyDecision, mergeCommands, modeWordKey, parseSideQuestion, promptHistory,
-  runtimeHasCommand, stepHistory,
+  isSendShortcut, joinRestoredText, keyDecision, mergeCommands, modeShortKey, modeWordKey, parseSideQuestion,
+  promptHistory, runtimeHasCommand, stepHistory,
 } from './composer-logic.js';
 import { createRunningLine, createTodoBar } from './activity.js';
 import { createSideQuestion } from './side-question.js';
@@ -30,8 +30,8 @@ const COARSE_QUERY = '(pointer: coarse)';
 const COMPACT_QUERY = `${MOBILE_QUERY}, ${COARSE_QUERY}`;
 
 /**
- * Commands the GUI implements, as the palette lists them (docs/FRONTEND.md). Picking one runs its panel or action; typed
- * text is never a GUI command, except `/btw <question>` when the runtime has no `btw` command.
+ * Commands the GUI implements, as the palette lists them (docs/FRONTEND.md). Picking one runs its panel or action;
+ * typed text is never a GUI command, except `/btw <question>` when the runtime has no `btw` command.
  */
 const GUI_COMMANDS = [
   { id: 'model', name: 'model' },
@@ -226,12 +226,14 @@ export function createComposer({ container, api, store, t, actions }) {
     attrs: { type: 'button', 'aria-label': t('composer.attach') },
     on: { click: () => fileInput.click() },
   }, icon('paperclip')));
+  // A phone shows the short name (CSS hides the long one there); the tooltip always carries the full name.
   const modeText = h('span', { class: 'composer-mode-text' });
+  const modeShort = h('span', { class: 'composer-mode-short' });
   const modeBtn = /** @type {HTMLButtonElement} */ (h('button', {
     class: 'composer-mode',
     attrs: { type: 'button', 'aria-haspopup': 'menu', title: t('composer.mode.title') },
     on: { click: () => openModeMenu() },
-  }, modeText));
+  }, modeText, modeShort));
   // On phones the label is hidden and the round button shows only its icon, so aria-label and title carry the name.
   const stopBtn = /** @type {HTMLButtonElement} */ (h('button', {
     class: 'composer-stop',
@@ -386,8 +388,13 @@ export function createComposer({ container, api, store, t, actions }) {
   /** The footer's mode line: the mode in words, or the flash line for two seconds after Shift+Tab. */
   function paintMode() {
     const live = view.id ? store.get().live?.[view.id] : null;
-    const word = flashText ?? t(modeWordKey(live?.permissionMode ?? null));
+    const mode = live?.permissionMode ?? null;
+    const word = flashText ?? t(modeWordKey(mode));
     if (modeText.textContent !== word) modeText.textContent = word;
+    const short = flashText ?? t(modeShortKey(mode));
+    if (modeShort.textContent !== short) modeShort.textContent = short;
+    const tooltip = `${t('composer.mode.title')}: ${t(modeWordKey(mode))}`;
+    if (modeBtn.title !== tooltip) modeBtn.title = tooltip;
     footerEl.classList.toggle('is-flash', flashText !== null);
   }
 
@@ -725,7 +732,9 @@ export function createComposer({ container, api, store, t, actions }) {
     if (kind === 'slash') {
       // The open palette's own element: the shortcut hint stays with it until it closes.
       const root = shell.querySelector(':scope > .palette');
-      if (root && !root.querySelector('.palette-hint')) root.append(h('p', { class: 'palette-hint', text: t('composer.palette.hint') }));
+      if (root && !root.querySelector('.palette-hint')) {
+        root.append(h('p', { class: 'palette-hint', text: t('composer.palette.hint') }));
+      }
     }
   }
 
@@ -851,8 +860,8 @@ export function createComposer({ container, api, store, t, actions }) {
   }
 
   /**
-   * The GUI `/fast` command: flips fast mode the way the header toggle does. When the session's model does not offer fast
-   * mode and nothing requests or runs it, the command says so instead.
+   * The GUI `/fast` command: flips fast mode the way the header toggle does. When the session's model does not offer
+   * fast mode and nothing requests or runs it, the command says so instead.
    */
   /** The header owns the fast mode control, including a change still in flight, so `/fast` goes through it. */
   function toggleFast() {
@@ -939,7 +948,8 @@ export function createComposer({ container, api, store, t, actions }) {
     if (!id || !canSend || !hasContent) return;
     const record = recordFor(id);
     const text = input.value.replace(/\s+$/u, '');
-    // `/btw <question>` is the side question when the runtime has no btw command of its own; it never enters the transcript.
+    // `/btw <question>` is the side question when the runtime has no btw command of its own; it never enters the
+    // transcript.
     const question = parseSideQuestion(text);
     if (question !== null && !runtimeHasCommand(store.get().capabilities?.[id]?.commands, 'btw')) {
       historyState = HISTORY_IDLE;

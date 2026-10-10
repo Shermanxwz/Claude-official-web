@@ -55,8 +55,13 @@ Engine adapter: src/engine/sdk-adapter.mjs (real)  |  src/engine/mock/ (determin
 - Thinking is shown as the terminal shows it: queries start with the runtime's `--thinking-display summarized` flag
   (`extraArgs`), because a non-interactive session ignores `showThinkingSummaries`; a setting that turns summaries
   off (`showThinkingSummaries: false`) is honored.
-- Stop behaves like Esc: queries declare `perTaskStopAffordance`, so an interrupt ends the turn and background tasks keep
-  running until they are stopped from the Tasks panel. Ctrl+B is `backgroundTasks()`.
+- Readiness follows the SDK handshake, not the first prompt. A new or resumed session becomes `idle` once Claude Code
+  answers its initialize handshake (`initializationResult()`, which makes no model call). Claude Code sends
+  `system/init` only with the first prompt of a streaming session, so the model, the permission mode and the Claude Code
+  version are the gateway's own choice, or unknown, until then (`docs/PROTOCOL.md`, "Session states and the ready
+  state").
+- Stop behaves like Esc: queries declare `perTaskStopAffordance`, so an interrupt ends the turn and background tasks
+  keep running until they are stopped from the Tasks panel. Ctrl+B is `backgroundTasks()`.
 
 ## Official interfaces
 
@@ -65,7 +70,14 @@ Every Claude Code behavior goes through `@anthropic-ai/claude-agent-sdk`, in thi
 1. Public, typed exports: `query()` and its options, control methods and callbacks (`canUseTool`, `onElicitation`,
    `onUserDialog`), the session functions (`listSessions`, `getSessionMessages`, `renameSession`, `forkSession`, …),
    `resolveSettings()` and `setMcpServers()`. Settings change only through the runtime (`applyFlagSettings`,
-   `updateSettings`, permission updates returned from `canUseTool`), never by editing files.
+   `updateSettings`, permission updates returned from `canUseTool`), never by editing files. The query methods used
+   besides those named above are `initializationResult()` (readiness and the capabilities), `accountInfo()`,
+   `readFile()` (memory files, with the read permission rules), `setMcpPermissionModeOverride()`,
+   `reconnectMcpServer()`, `toggleMcpServer()`, `setMcpServers()` (the operator's browser server), `reloadPlugins()`,
+   `reloadSkills()`, `reloadOutputStyles()`, `rewindFiles()`, `stopTask()`, `backgroundTasks()` and `getContextUsage()`.
+   The usage view calls `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET`: it is typed, and the view is
+   offered only while the method exists. The options `agent`, `additionalDirectories` and `fallbackModel` map to
+   `--agent`, `--add-dir` and `--fallback-model`.
 2. Runtime controls the SDK's query object carries without public typings — the calls behind the terminal's own
    screens: `getStatus` (`/status`), `listPermissionRules` (`/permissions`), `getHooksListing` (`/hooks`),
    `getMemoryDialog` (`/memory`), `getSettings` (`/config`), `getSkillsDialog`, `getSandboxDialog`, `getPlan`,
@@ -73,7 +85,8 @@ Every Claude Code behavior goes through `@anthropic-ai/claude-agent-sdk`, in thi
    `askSideQuestion` (`/btw`), `setCwd` (the trust handshake), `claudeAuthenticate` / `claudeOAuthCallback`
    (`/login`) and `mcpAuthenticate` / `mcpSubmitOAuthCallbackUrl` / `mcpClearAuth` (`/mcp` sign-in), plus the declared
    `file_suggestions` control request through the query's generic control call. They are used only when present
-   (feature detection; a missing one answers `501 FEATURE_UNAVAILABLE` and the UI points to the terminal tab); their
+   (feature detection; a missing one answers `501 FEATURE_UNAVAILABLE`, and the UI points to the terminal tab when it
+   is enabled for a `full` profile, else offers Retry); their
    answers are passed on as data and never trusted as HTML. The SDK version is pinned exactly, and the integration
    tests and the real-runtime smoke cover them.
 3. The CLI's own flags through the public `extraArgs` option: `--thinking-display summarized` and, opt-in, `--chrome`.
@@ -101,7 +114,7 @@ Interfaces that are deliberately not used:
 | `createSdkMcpServer`, `tool()` | Custom tools belong in Claude Code's own MCP configuration, which the GUI loads |
 | `generateSessionTitle`, `submitFeedback`, `messageRated`, `launchUltrareview` | The runtime titles sessions itself; feedback and cloud review are product features of Anthropic's apps |
 | `getChromeBrowsers`, `selectChromeBrowser` | Choosing among several connected Chromes cannot be verified here; `/chrome` in the terminal tab does it |
-| `filterEscalatingDefaultMode` | The gateway no longer computes a default mode; the runtime applies its own settings and filter |
+| `filterEscalatingDefaultMode` | The gateway does not compute a default mode; the runtime applies its own settings and trust rules |
 
 ## Process model
 
@@ -118,11 +131,13 @@ message.
 - Requests must carry an allowed `Host` (loopback or the public origin's host) and, for writes and the terminal
   upgrade, the exact `Origin`; this blocks CSRF, cross-site WebSocket hijacking and DNS rebinding.
 - The gateway never reads Claude credentials (`~/.claude/.credentials.json`, keychains) and never edits settings or
-  history files directly; all such changes go through SDK calls.
+  history files directly; all such changes go through SDK calls. The one file write of its own is the saving of a
+  `CLAUDE.md` or `CLAUDE.local.md` that the runtime lists as editable (see SECURITY.md).
 - Model output is untrusted: Markdown is sanitized with DOMPurify, tool output is rendered as text, and no
   model-provided HTML is executed.
 - The terminal is equivalent to shell access and is disabled unless `CAW_TERMINAL=1` and the profile is `full`.
-- `bypassPermissions` mode is disabled unless `CAW_ALLOW_BYPASS=1` and the profile is `full`.
+- `bypassPermissions` mode needs `CAW_ALLOW_BYPASS=1`, which the gateway accepts only with the `full` profile (see
+  SECURITY.md).
 
 See `docs/PROTOCOL.md` for the wire contract, `docs/FRONTEND.md` for the browser module contracts and
 `docs/ENGINEERING.md` for code standards.

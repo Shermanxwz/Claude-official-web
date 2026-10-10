@@ -492,16 +492,15 @@ describe('bypass permissions', { timeout: 60000 }, () => {
     }
   });
 
-  it('answers 403 FORBIDDEN to the standard profile even when CAW_ALLOW_BYPASS is on', async () => {
-    const server = await startTestServer({ CAW_ACCESS_PROFILE: 'standard', CAW_ALLOW_BYPASS: '1' });
-    try {
-      const api = client(server.url);
-      await api.login();
-      assertError(await api.post('/api/sessions', { cwd: server.proj, permissionMode: 'bypassPermissions' }),
-        403, 'FORBIDDEN');
-    } finally {
-      await server.close();
-    }
+  it('refuses to start with CAW_ALLOW_BYPASS on under the standard profile, so no route can reach bypass', async () => {
+    // A server that starts anyway is closed at once, so a regression fails this test instead of hanging the run.
+    const refusal = await startTestServer({ CAW_ACCESS_PROFILE: 'standard', CAW_ALLOW_BYPASS: '1' }).then(
+      async (server) => {
+        await server.close();
+        return 'started';
+      },
+      (error) => error.message);
+    assert.equal(refusal, 'CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full');
   });
 
   it('is accepted for the full profile when CAW_ALLOW_BYPASS is on, and advertised in meta', async () => {

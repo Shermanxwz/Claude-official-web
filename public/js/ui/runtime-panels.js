@@ -536,19 +536,8 @@ export function mountRuntimePanel({ body, api, store, t, actions, opts = {} }) {
         on: { click: () => select(tab) },
       }, t(`shell.runtime.tab.${tab}`)));
     }
-    revealActiveTab();
     stage.id = 'runtime-stage';
     stage.setAttribute('aria-labelledby', `runtime-tab-${active}`);
-  }
-
-  /** Scrolls the tab strip sideways until the selected tab is fully visible: a phone shows only part of the row. */
-  function revealActiveTab() {
-    const tab = tabList.querySelector('[aria-selected="true"]');
-    if (!(tab instanceof HTMLElement)) return;
-    const strip = tabList.getBoundingClientRect();
-    const box = tab.getBoundingClientRect();
-    if (box.left < strip.left) tabList.scrollLeft -= strip.left - box.left;
-    else if (box.right > strip.right) tabList.scrollLeft += box.right - strip.right;
   }
 
   /** @param {string} tab */

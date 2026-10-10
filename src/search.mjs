@@ -9,13 +9,16 @@
 import { AppError } from './contracts.mjs';
 
 /** @typedef {import('./contracts.mjs').SessionSearchResult} SessionSearchResult */
+/** @typedef {import('./contracts.mjs').SessionSearchResponse} SessionSearchResponse */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKSessionInfo} SDKSessionInfo */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SessionMessage} SessionMessage */
 
 const QUERY_MIN = 2;
 const QUERY_MAX = 200;
-const LISTING_PAGE = 500;
-const LISTING_MAX = 100_000;
+/**
+ * How many of the most recently modified unmatched sessions a search reads. Every answer reports it as `scanLimit`, so
+ * the client never has to know the number.
+ */
 const SCAN_SESSIONS = 50;
 const SCAN_MESSAGES = 4000;
 const SNIPPETS_MAX = 3;
@@ -26,8 +29,7 @@ const BUDGET_MS = 5000;
 /**
  * @typedef {SDKSessionInfo & {live?: unknown}} ListedSession
  * @typedef {Object} SearchDependencies
- * @property {(options: {limit: number, offset: number}) => Promise<ListedSession[]>} listSessions   every session
- *   the gateway lists, in pages (the host's listSessions without a folder)
+ * @property {() => Promise<ListedSession[]>} listAll   every session the gateway lists, in one listing, newest first
  * @property {(sessionId: string) => Promise<SessionMessage[]>} getSessionMessages
  * @property {() => number} [now]       clock in milliseconds; injectable for tests
  * @property {number} [budgetMs]        overall budget of the content scan
@@ -143,37 +145,20 @@ function resultOf(session, matchedIn, snippets) {
 }
 
 /**
- * Every session the gateway lists, read page by page.
- * @param {SearchDependencies['listSessions']} listSessions
- * @returns {Promise<ListedSession[]>}
- */
-async function listEverything(listSessions) {
-  /** @type {ListedSession[]} */
-  const all = [];
-  while (all.length < LISTING_MAX) {
-    const page = await listSessions({ limit: LISTING_PAGE, offset: all.length });
-    all.push(...page);
-    if (page.length < LISTING_PAGE) break;
-  }
-  return all;
-}
-
-/**
  * @param {SearchDependencies} deps
- * @returns {{search: (q: unknown, limit: number) => Promise<{results: SessionSearchResult[], scanned: number,
- *   truncated: boolean}>}}
+ * @returns {{search: (q: unknown, limit: number) => Promise<SessionSearchResponse>}}
  */
-export function createSessionSearch({ listSessions, getSessionMessages, now = Date.now, budgetMs = BUDGET_MS }) {
+export function createSessionSearch({ listAll, getSessionMessages, now = Date.now, budgetMs = BUDGET_MS }) {
   return {
     /**
      * @param {unknown} q
      * @param {number} limit 1 to 50
-     * @returns {Promise<{results: SessionSearchResult[], scanned: number, truncated: boolean}>}
+     * @returns {Promise<SessionSearchResponse>}
      */
     async search(q, limit) {
       const needle = parseSearchQuery(q);
       const started = now();
-      const sessions = await listEverything(listSessions);
+      const sessions = await listAll();
       /** @type {SessionSearchResult[]} */
       const results = [];
       /** @type {ListedSession[]} */
@@ -187,7 +172,8 @@ export function createSessionSearch({ listSessions, getSessionMessages, now = Da
       }
       unmatched.sort((a, b) => b.lastModified - a.lastModified);
       let scanned = 0;
-      let truncated = false;
+      // Sessions beyond the cap are not read at all, so the answer is partial whether or not the budget runs out.
+      let truncated = unmatched.length > SCAN_SESSIONS;
       for (const session of unmatched.slice(0, SCAN_SESSIONS)) {
         if (now() - started > budgetMs) {
           truncated = true;
@@ -200,7 +186,7 @@ export function createSessionSearch({ listSessions, getSessionMessages, now = Da
         if (snippets.length > 0) results.push(resultOf(session, 'content', snippets));
       }
       results.sort((a, b) => b.lastModified - a.lastModified);
-      return { results: results.slice(0, limit), scanned, truncated };
+      return { results: results.slice(0, limit), scanned, truncated, scanLimit: SCAN_SESSIONS };
     },
   };
 }

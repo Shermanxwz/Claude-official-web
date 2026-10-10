@@ -16,11 +16,15 @@ import {
   isSendShortcut,
   joinRestoredText,
   mergeCommands,
-  modeWordKey,
+    modeShortKey,
+    modeWordKey,
   modelSelectPlan,
   parseSideQuestion,
   runtimeHasCommand,
 } from '../../public/js/ui/composer-logic.js';
+import { setLocale, t } from '../../public/js/i18n.js';
+import '../../public/js/locales/en.composer.js';
+import '../../public/js/locales/zh-CN.composer.js';
 
 describe('detectTrigger', () => {
   test('opens the slash palette with an empty query right after a leading slash', () => {
@@ -306,6 +310,35 @@ describe('modeWordKey', () => {
     assert.equal(modeWordKey(null), 'composer.modeWord.settings');
     assert.equal(modeWordKey(undefined), 'composer.modeWord.settings');
     assert.equal(modeWordKey('mystery'), 'composer.modeWord.settings');
+  });
+});
+
+describe('modeShortKey', () => {
+  test('maps each permission mode to its short footer name, the phone label', () => {
+    assert.equal(modeShortKey('default'), 'composer.modeShort.default');
+    assert.equal(modeShortKey('acceptEdits'), 'composer.modeShort.acceptEdits');
+    assert.equal(modeShortKey('plan'), 'composer.modeShort.plan');
+    assert.equal(modeShortKey('auto'), 'composer.modeShort.auto');
+    assert.equal(modeShortKey('bypassPermissions'), 'composer.modeShort.bypassPermissions');
+    assert.equal(modeShortKey('dontAsk'), 'composer.modeShort.dontAsk');
+  });
+
+  test('says that Claude Code settings decide when the mode is null or unknown', () => {
+    assert.equal(modeShortKey(null), 'composer.modeShort.settings');
+    assert.equal(modeShortKey(undefined), 'composer.modeShort.settings');
+    assert.equal(modeShortKey('mystery'), 'composer.modeShort.settings');
+  });
+
+  test('has a short name in English and Chinese for every mode', () => {
+    const keys = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions', 'dontAsk', null].map(modeShortKey);
+    try {
+      for (const locale of ['en', 'zh-CN']) {
+        setLocale(locale);
+        for (const key of keys) assert.notEqual(t(key), key, `${locale} has no message for ${key}`);
+      }
+    } finally {
+      setLocale('en');
+    }
   });
 });
 

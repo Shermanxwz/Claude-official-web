@@ -10,7 +10,7 @@ import { t, getLocale } from './i18n.js';
 const CACHE_LIMIT = 200;
 const COPY_FEEDBACK_MS = 1600;
 const SAFE_IMAGE_DATA_URI = /^data:image\/(?:png|jpeg|gif|webp);base64,[a-z0-9+/=]+$/i;
-const URI_REGEXP = /^(?:(?:https?|mailto):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$)|data:image\/(?:png|jpeg|gif|webp);base64,)/i;
+const URI_REGEXP = /^(?:https?:|mailto:|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$)|data:image\/(?:png|jpeg|gif|webp);base64,)/i;
 const FORBID_TAGS = ['style', 'iframe', 'form', 'input', 'button', 'textarea', 'select', 'object', 'embed', 'script'];
 const FORBID_ATTR = ['style', 'srcset'];
 

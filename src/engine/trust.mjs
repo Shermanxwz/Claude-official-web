@@ -3,8 +3,7 @@
  * Folder trust in Claude Code's own record. Claude Code keeps a trust record per folder and, without it, ignores the
  * project allow rules of that folder. The gateway records trust through the runtime's own `set_cwd` handshake, from a
  * throwaway query that runs no turn: the handshake answers `needs_trust` for an untrusted folder, which is then
- * accepted
- * with `trustAccepted`. The answers are cached per folder for the life of the gateway; a failure is not cached.
+ * accepted with `trustAccepted`. A folder recorded during this gateway process is remembered; a failure is not.
  *
  * `startQuietQuery` is the one kind of query the gateway starts without a session: a probe here and the account query
  * (src/engine/account.mjs). Such a query never sends a prompt and keeps no session file.
@@ -101,18 +100,25 @@ function answerOf(value) {
 }
 
 /**
- * Runs the handshake on an open probe. `ok` means the folder was already trusted.
+ * Runs the handshake on an open probe. `already` means the folder was already trusted. The runtime's request to trust
+ * is accepted only for the folder asked for: a request that names another folder is refused and not recorded.
  * @param {SdkQuery} query
- * @param {string} dir
+ * @param {string} dir the real path of the folder asked for
+ * @param {Logger} log
  * @returns {Promise<RuntimeTrust>}
  */
-async function handshake(query, dir) {
+async function handshake(query, dir, log) {
   await query.initializationResult();
   const setCwd = runtimeMethod(query, 'setCwd');
   if (setCwd === null) return 'failed';
   const first = answerOf(await setCwd(dir));
   if (first.status === 'ok') return 'already';
   if (first.status !== 'needs_trust' || typeof first.directory !== 'string') return 'failed';
+  if (!path.isAbsolute(first.directory) || (await realpathOrNull(first.directory)) !== dir) {
+    log.warn('the runtime asked to trust another folder than the one requested; trust was not recorded',
+      { reason: 'directory_mismatch' });
+    return 'failed';
+  }
   const accepted = answerOf(await setCwd(dir, { trustAccepted: true, trustedDirectory: first.directory }));
   return accepted.status === 'ok' ? 'accepted' : 'failed';
 }
@@ -138,8 +144,8 @@ function budgetOf(ms) {
  * @returns {{record: (dir: string) => Promise<RuntimeTrust>, close: () => Promise<void>}}
  */
 export function createRuntimeTrust({ engine, config, log, env, budgetMs = PROBE_BUDGET_MS }) {
-  /** @type {Map<string, RuntimeTrust>} */
-  const recorded = new Map();
+  /** Real paths of the folders whose trust the runtime has recorded during this gateway process. */
+  const recorded = new Set();
   /** @type {Map<string, Promise<RuntimeTrust>>} */
   const running = new Map();
   /** @type {Set<QuietQuery>} */
@@ -147,19 +153,19 @@ export function createRuntimeTrust({ engine, config, log, env, budgetMs = PROBE_
   let closed = false;
 
   /**
-   * Records trust for one folder. The answer is cached once it is 'accepted' or 'already'.
+   * Records trust for one folder. Only the call that runs the handshake answers 'accepted' or 'failed' for it; every
+   * later call, one that joins the handshake in flight included, finds the folder trusted and answers 'already'.
    * @param {string} dir
    * @returns {Promise<RuntimeTrust>}
    */
   async function record(dir) {
     const real = await realpathOrNull(dir);
     if (real === null) return 'failed';
-    const known = recorded.get(real);
-    if (known !== undefined) return known;
+    if (recorded.has(real)) return 'already';
     const pending = running.get(real);
-    if (pending !== undefined) return pending;
+    if (pending !== undefined) return (await pending) === 'failed' ? 'failed' : 'already';
     const attempt = probe(real).then((result) => {
-      if (result !== 'failed') recorded.set(real, result);
+      if (result !== 'failed') recorded.add(real);
       return result;
     }).finally(() => running.delete(real));
     running.set(real, attempt);
@@ -194,7 +200,7 @@ export function createRuntimeTrust({ engine, config, log, env, budgetMs = PROBE_
     const budget = budgetOf(budgetMs);
     try {
       return await Promise.race([
-        handshake(quiet.query, dir),
+        handshake(quiet.query, dir, log),
         quiet.stopped.then(() => /** @type {RuntimeTrust} */ ('failed')),
         budget.promise,
       ]);

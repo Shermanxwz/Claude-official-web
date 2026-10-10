@@ -166,11 +166,14 @@ describe('conversation search', { timeout: 120000 }, () => {
     assert.deepEqual(match.snippets, []);
     assert.equal(typeof res.json.scanned, 'number');
     assert.equal(res.json.truncated, false);
+    assert.equal(res.json.scanLimit, 50, 'the answer names the scan cap, whatever the match');
   });
 
   it('matches the text of transcripts case-insensitively, with snippets of the answer', async () => {
     const res = await api.get(`/api/sessions/search?q=${enc('DETERMINISTIC MOCK ENGINE')}`);
     assert.equal(res.status, 200, res.text);
+    assert.equal(res.json.scanLimit, 50);
+    assert.equal(res.json.scanned, sessions.length, 'every session of the folder was read');
     assert.deepEqual(new Set(res.json.results.map((/** @type {{sessionId: string}} */ item) => item.sessionId)),
       new Set(sessions.map((session) => session.sessionId)));
     const modified = res.json.results.map((/** @type {{lastModified: number}} */ item) => item.lastModified);

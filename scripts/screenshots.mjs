@@ -74,14 +74,20 @@ const FRAME_CHANGES = `(() => {
   const frame = scroller.getBoundingClientRect();
   const offset = (element) => element.getBoundingClientRect().top - frame.top + scroller.scrollTop;
   const top = offset(diff);
-  const bottom = offset(todo) + todo.getBoundingClientRect().height;
+  const todoBottom = offset(todo) + todo.getBoundingClientRect().height;
+  // When the diff, the todo card and the last turn's footer fit together, the frame ends below that footer, so no line
+  // of text is cut by the edge of the conversation.
+  const results = [...scroller.querySelectorAll('.turn-result')];
+  const last = results[results.length - 1];
+  const footerBottom = last ? offset(last) + last.getBoundingClientRect().height : todoBottom;
   const margin = 12;
   const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
   const clamp = (value) => Math.min(max, Math.max(0, value));
   const high = clamp(top - margin);
-  const low = clamp(bottom - scroller.clientHeight + margin);
+  const low = clamp(todoBottom - scroller.clientHeight + margin);
+  const end = clamp(Math.max(todoBottom, footerBottom) - scroller.clientHeight + margin);
   const fits = low <= high;
-  scroller.scrollTop = fits ? high : low;
+  scroller.scrollTop = fits ? (end <= high ? end : high) : low;
   return JSON.stringify({ fits, scrollTop: Math.round(scroller.scrollTop), max: Math.round(max) });
 })()`;
 

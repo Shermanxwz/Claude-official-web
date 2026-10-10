@@ -112,7 +112,78 @@ describe('runtime trust of a folder', () => {
       ['setCwd', folder],
       ['setCwd', folder, { trustAccepted: true, trustedDirectory: folder }],
     ]);
+    // The folder is trusted now, so a repeated trust answers already, not accepted again.
+    assert.equal(await trust.record(folder), 'already');
+    assert.equal(engine.queries.length, 1);
+    await trust.close();
+  });
+
+  test('a needs_trust answer that names another folder is failed, records nothing and says why', async () => {
+    const folder = path.join(ROOT, 'theta');
+    const other = path.join(ROOT, 'iota');
+    fs.mkdirSync(folder);
+    fs.mkdirSync(other);
+    const engine = fakeEngine({
+      setCwd: (dir, opts) => (opts?.trustAccepted
+        ? { status: 'ok', cwd: dir }
+        : { status: 'needs_trust', directory: other }),
+    });
+    const { trust, warnings } = recorder(engine);
+    assert.equal(await trust.record(folder), 'failed');
+    assert.equal(engine.queries[0].calls.some((call) => call[2]?.trustAccepted === true), false,
+      'no trust was accepted for the other folder');
+    assert.deepEqual(warnings.map((warning) => [warning.msg, warning.fields]), [[
+      'the runtime asked to trust another folder than the one requested; trust was not recorded',
+      { reason: 'directory_mismatch' },
+    ]]);
+    assert.equal(await trust.record(folder), 'failed');
+    assert.equal(engine.queries.length, 2, 'the failure is not kept, so the next record asks again');
+    await trust.close();
+  });
+
+  test('a needs_trust answer that names the folder through a symbolic link is accepted', async () => {
+    const folder = path.join(ROOT, 'kappa');
+    fs.mkdirSync(folder);
+    const link = path.join(ROOT, 'kappa-link');
+    fs.symlinkSync(folder, link, 'dir');
+    const engine = fakeEngine({
+      setCwd: (dir, opts) => (opts?.trustAccepted ? { status: 'ok', cwd: dir, changed: true }
+        : { status: 'needs_trust', directory: link }),
+    });
+    const { trust, warnings } = recorder(engine);
     assert.equal(await trust.record(folder), 'accepted');
+    assert.deepEqual(engine.queries[0].calls.at(-1),
+      ['setCwd', folder, { trustAccepted: true, trustedDirectory: link }]);
+    assert.equal(warnings.length, 0);
+    await trust.close();
+  });
+
+  test('a needs_trust answer with a relative or a missing directory is failed', async () => {
+    const folder = path.join(ROOT, 'lambda');
+    fs.mkdirSync(folder);
+    for (const directory of ['lambda', path.join(ROOT, 'missing-lambda')]) {
+      const engine = fakeEngine({
+        setCwd: (dir, opts) => (opts?.trustAccepted
+          ? { status: 'ok', cwd: dir }
+          : { status: 'needs_trust', directory }),
+      });
+      const { trust } = recorder(engine);
+      assert.equal(await trust.record(folder), 'failed', directory);
+      assert.equal(engine.queries[0].calls.some((call) => call[2]?.trustAccepted === true), false, directory);
+      await trust.close();
+    }
+  });
+
+  test('of two overlapping records of one folder, one is accepted and the other finds it trusted', async () => {
+    const folder = path.join(ROOT, 'mu');
+    fs.mkdirSync(folder);
+    const engine = fakeEngine({
+      setCwd: (dir, opts) => (opts?.trustAccepted ? { status: 'ok', cwd: dir, changed: true }
+        : { status: 'needs_trust', directory: dir }),
+    });
+    const { trust } = recorder(engine);
+    const outcomes = await Promise.all([trust.record(folder), trust.record(folder)]);
+    assert.deepEqual(outcomes.sort(), ['accepted', 'already']);
     assert.equal(engine.queries.length, 1);
     await trust.close();
   });

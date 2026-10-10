@@ -152,7 +152,9 @@ actions = {
                                        // response must not duplicate the turn), else crypto.randomUUID(); POST
   interrupt(),                         // POST /interrupt for the current session
   updateSettings({ model, permissionMode, effort, fastMode }),   // any subset; fastMode: true|false|null
-  openRewind(userMessageId?), openFork(upToMessageId?),   // timeline/rewind.js dialogs
+  openRewind(userMessageId?), openFork(upToMessageId?),   // timeline/rewind.js dialogs; Rewind is disabled while
+                                       // a turn runs or a request waits (the gateway answers 409 CONFLICT then, and
+                                       // the dialog shows that message)
   openTerminal(), openPanel(name), renameSession(), toast(message, level = 'info'),
   confirmEndBackground(sessionId) -> Promise<boolean>,  // asks before close, terminal, trust restart or conversation
                                        // rewind while LiveInfo.backgroundTasks > 0 (ending the query stops them)
@@ -243,7 +245,7 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
      (state only), except memory recall → muted row.
    - `conversation_reset`: divider "Conversation cleared".
    - `rate_limit_event`: banner (shell) when status ≠ `allowed`.
-   - `prompt_suggestion`: suggestion chip above the composer (shell), latest only.
+   - `prompt_suggestion`: suggestion line above the composer (shell), latest only.
    - `auth_status`: banner.
    - `result`: turn footer (duration, turns, error subtype + `errors[]` in red for error results, permission denials).
      A result whose `terminal_reason` starts with `aborted` is shown as a neutral "Interrupted" footer, not an error.
@@ -296,8 +298,9 @@ Colors: `--bg`, `--bg-elev` (cards, menus), `--bg-sunken` (code, inputs), `--bg-
 Shape and type: `--radius-sm` (6px), `--radius-md` (10px), `--radius-lg` (14px), `--shadow-sm`, `--shadow-md`,
 `--font-sans` (system UI stack + "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC"),
 `--font-mono` (ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace), `--fs-xs/sm/md/lg/xl`,
-`--space-1`…`--space-6` (4, 8, 12, 16, 24, 32 px), `--header-h` (52px), `--sidebar-w` (288px),
-`--content-max` (880px, timeline + composer width).
+`--space-1`…`--space-6` (4, 8, 12, 16, 24, 32 px), `--header-h` (52px), `--sidebar-w` (280px),
+`--content-max` (760px, timeline + composer width), `--fs-scale` (Settings → Text size: .93 / 1 / 1.13; every
+font size is a token or `calc(Npx * var(--fs-scale))`, see docs/DESIGN.md).
 Themes: `:root` = light, `:root[data-theme="dark"]` = dark, and `@media (prefers-color-scheme: dark)` applies dark
 when `data-theme="system"`. Neutral greys with a teal/indigo accent; never Anthropic's or Claude Code's brand colors.
 
@@ -395,7 +398,8 @@ command, at.
   then "Search message text" runs `GET /api/sessions/search` and lists matches with snippets.
 - Sidebar search: the filter box filters titles locally as before; when the query has 2+ characters a "Search all
   conversations" row runs the deep search and shows results with snippets (matches highlighted with `<mark>` built by
-  DOM, never HTML strings).
+  DOM, never HTML strings). When the answer has `truncated: true`, both lists end with one muted line that names the
+  answer's `scanLimit` ("Only the 50 most recent sessions were searched.").
 - Session panel: Directories (list of `LiveInfo.additionalDirectories`, add with the folder picker, remove; applying
   restarts the session, confirm first when background tasks run), Agent (select; applies live), Fallback model
   (applies after restart; shows "Restart to apply" button), Browser tools (toggle; `full` profile and

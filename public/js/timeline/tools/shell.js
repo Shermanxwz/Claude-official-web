@@ -65,9 +65,9 @@ export function verbOf(name, translate = defaultT) {
 }
 
 /**
- * Collapsible tool row of the action log: a state glyph, the verb (sans), the target (mono, one line), the extras on the
- * right (a diff stat or a duration). `body` is either a Node or a function returning one. A function is called on the
- * first open (immediately when the row starts open) with the action toolbar, to which it may append controls.
+ * Collapsible tool row of the action log: a state glyph, the verb (sans), the target (mono, one line), the extras on
+ * the right (a diff stat or a duration). `body` is either a Node or a function returning one. A function is called on
+ * the first open (immediately when the row starts open) with the action toolbar, to which it may append controls.
  * @param {{
  *   title: string,
  *   subtitle?: string,
@@ -78,7 +78,8 @@ export function verbOf(name, translate = defaultT) {
  *   extras?: HTMLElement[],
  *   t?: Translate,
  *   family?: string,
- * }} options `title` is the verb, `subtitle` the target, `extras` the chips placed at the right (diff counts, for example)
+ * }} options `title` is the verb, `subtitle` the target, `extras` the chips placed at the right (diff counts, for
+ * example)
  * @returns {HTMLDetailsElement}
  */
 export function toolShell(options) {
@@ -139,6 +140,40 @@ export function copyButton({ text, t: translate = defaultT, label }) {
     icon('copy'),
     labelEl,
   );
+}
+
+/**
+ * Icon-only copy button for the corner of a block. Its name is the label; after a copy it shows a check (or a cross)
+ * for a moment, and the title says what happened.
+ * @param {{ text: string, t?: Translate, label: string }} options
+ * @returns {HTMLButtonElement}
+ */
+export function copyIconButton({ text, t: translate = defaultT, label }) {
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timer = null;
+  const button = /** @type {HTMLButtonElement} */ (h('button', {
+    class: 'tool-copy-icon',
+    attrs: { type: 'button', 'aria-label': label, title: label },
+    on: {
+      click: async () => {
+        let copied = true;
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          copied = false;
+        }
+        button.title = translate(copied ? 'tools.copied' : 'tools.copyFailed');
+        button.replaceChildren(icon(copied ? 'check' : 'x'));
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          button.title = label;
+          button.replaceChildren(icon('copy'));
+          timer = null;
+        }, 1500);
+      },
+    },
+  }, icon('copy')));
+  return button;
 }
 
 /**
@@ -246,8 +281,8 @@ export function section(options) {
 }
 
 /**
- * Inline image from base64 data, shown through a data: URL (allowed by the CSP). The thumbnail is a button: a click opens
- * the image full size in a dialog. Returns null for a media type, encoding or size that images.js does not allow.
+ * Inline image from base64 data, shown through a data: URL (allowed by the CSP). The thumbnail is a button: a click
+ * opens the image full size in a dialog. Returns null for a media type, encoding or size that images.js does not allow.
  * @param {unknown} mediaType
  * @param {unknown} data
  * @param {string} alt
@@ -427,8 +462,8 @@ export function prettyJson(value) {
 
 /**
  * Rendering of a card body: function bodies are built on demand. The action toolbar is one row above the content: the
- * `actions`, then any controls the body adds to the toolbar it receives. A body that throws leaves a short note in place
- * of its content, so one unexpected result never breaks the timeline.
+ * `actions`, then any controls the body adds to the toolbar it receives. A body that throws leaves a short note in
+ * place of its content, so one unexpected result never breaks the timeline.
  * @param {HTMLDetailsElement} details
  * @param {HTMLElement} host
  * @param {Node | ((toolbar: HTMLElement) => Node | null | undefined) | null | undefined} body

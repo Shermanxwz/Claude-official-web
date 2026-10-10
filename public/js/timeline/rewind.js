@@ -24,8 +24,16 @@ let dialogCounter = 0;
 
 /** @typedef {(key: string, vars?: Record<string, string | number>) => string} Translate */
 /** @typedef {{ post: (path: string, body?: unknown) => Promise<any> }} ApiClient */
-/** @typedef {{ toast: (message: string, level?: string) => void, selectSession: (sessionId: string) => unknown }} Actions */
-/** @typedef {{ ok: true, files: string[], insertions: number, deletions: number } | { ok: false, reason: string }} Preview */
+/**
+ * @typedef {Object} Actions
+ * @property {(message: string, level?: string) => void} toast
+ * @property {(sessionId: string) => unknown} selectSession
+ */
+/**
+ * @typedef {{ ok: true, files: string[], insertions: number, deletions: number }} PreviewOk
+ * @typedef {{ ok: false, reason: string }} PreviewFailed
+ * @typedef {PreviewOk | PreviewFailed} Preview
+ */
 
 /**
  * Opens the rewind dialog for one sent prompt. Code rewinds show a dry-run preview first; nothing changes until the
@@ -106,7 +114,7 @@ export function openRewindDialog({ api, sessionId, userMessageId, t, actions }) 
       preview = summarize(result, t);
     } catch (error) {
       if (token !== previewToken) return;
-      preview = { ok: false, reason: errorText(error, t) };
+      preview = { ok: false, reason: failureText(error, t) };
     }
     renderPreview();
     updateControls();
@@ -136,13 +144,16 @@ export function openRewindDialog({ api, sessionId, userMessageId, t, actions }) 
       class: 'rewind-note',
       text: total === 0
         ? t('cards.rewind.preview.none')
-        : t(pluralKey('cards.rewind.preview.summary', total, getLocale()), { files: total, insertions: current.insertions, deletions: current.deletions }),
+        : t(pluralKey('cards.rewind.preview.summary', total, getLocale()),
+          { files: total, insertions: current.insertions, deletions: current.deletions }),
     }));
     if (total > 0) {
       previewEl.append(h('ul', { class: 'rewind-files' }, current.files.slice(0, LISTED_FILES).map((file) => h('li', {},
         h('code', { text: truncateMiddle(file, PATH_LIMIT), attrs: { title: file } })))));
       if (total > LISTED_FILES) {
-        previewEl.append(h('p', { class: 'rewind-note is-muted', text: t('cards.rewind.preview.more', { count: total - LISTED_FILES }) }));
+        previewEl.append(h('p', {
+          class: 'rewind-note is-muted', text: t('cards.rewind.preview.more', { count: total - LISTED_FILES }),
+        }));
       }
     }
     if (mode === 'both') previewEl.append(h('p', { class: 'rewind-note is-muted', text: t('cards.rewind.bothNote') }));
@@ -165,7 +176,7 @@ export function openRewindDialog({ api, sessionId, userMessageId, t, actions }) 
         window.dispatchEvent(new CustomEvent(TIMELINE_RELOAD_EVENT, { detail: { sessionId } }));
       }
     } catch (error) {
-      errorEl.textContent = errorText(error, t);
+      errorEl.textContent = failureText(error, t);
       errorEl.hidden = false;
     } finally {
       busy = false;
@@ -239,6 +250,19 @@ export function openForkDialog({ api, sessionId, upToMessageId, t, actions }) {
       { label: t('cards.fork.confirm'), kind: 'primary', keepOpen: true, onClick: () => create() },
     ],
   });
+}
+
+/**
+ * The text of a failed rewind request. A 409 CONFLICT carries the server's own reason (the turn still runs, for
+ * example), and that reason says what to do, so it is shown as it is.
+ * @param {unknown} error
+ * @param {Translate} t
+ * @returns {string}
+ */
+function failureText(error, t) {
+  const message = error && typeof error.message === 'string' ? error.message.trim() : '';
+  if (error && error.status === 409 && message) return message;
+  return errorText(error, t);
 }
 
 /**

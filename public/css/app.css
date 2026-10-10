@@ -63,7 +63,7 @@
   --scrim: rgba(17, 18, 22, 0.32);
   --fg: #17191c;
   --fg-muted: #5a6068;
-  --fg-subtle: #8a9098;
+  --fg-subtle: #666c74;
   --border: #e2e4e0;
   --border-strong: #c9cdc7;
   --accent: #3949c7;
@@ -94,18 +94,21 @@
     "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
   --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "PingFang SC",
     monospace;
-  --fs-xs: 12px;
-  --fs-sm: 13px;
-  --fs-md: 15px;
-  --fs-prose: 16px;
-  --fs-lg: 17px;
-  --fs-xl: 22px;
-  --lh-xs: 16px;
-  --lh-sm: 18px;
-  --lh-md: 22px;
-  --lh-prose: 26px;
-  --lh-lg: 24px;
-  --lh-xl: 28px;
+  /* Text size. Settings sets html[data-font-size], which sets --fs-scale; every size token and its line height scale
+     with it, so the sidebar, header, panels and prose all follow the choice. */
+  --fs-scale: 1;
+  --fs-xs: calc(12px * var(--fs-scale));
+  --fs-sm: calc(13px * var(--fs-scale));
+  --fs-md: calc(15px * var(--fs-scale));
+  --fs-prose: calc(16px * var(--fs-scale));
+  --fs-lg: calc(17px * var(--fs-scale));
+  --fs-xl: calc(22px * var(--fs-scale));
+  --lh-xs: calc(16px * var(--fs-scale));
+  --lh-sm: calc(18px * var(--fs-scale));
+  --lh-md: calc(22px * var(--fs-scale));
+  --lh-prose: calc(26px * var(--fs-scale));
+  --lh-lg: calc(24px * var(--fs-scale));
+  --lh-xl: calc(28px * var(--fs-scale));
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -134,7 +137,7 @@
     --scrim: rgba(0, 0, 0, 0.55);
     --fg: #e8eaed;
     --fg-muted: #a2a9b2;
-    --fg-subtle: #6e757e;
+    --fg-subtle: #858c95;
     --border: #2a2d33;
     --border-strong: #3a3e46;
     --accent: #8d99ff;
@@ -167,7 +170,7 @@
   --scrim: rgba(0, 0, 0, 0.55);
   --fg: #e8eaed;
   --fg-muted: #a2a9b2;
-  --fg-subtle: #6e757e;
+  --fg-subtle: #858c95;
   --border: #2a2d33;
   --border-strong: #3a3e46;
   --accent: #8d99ff;
@@ -189,18 +192,18 @@
 
 /* ---- Base --------------------------------------------------------------- */
 html {
-  font-size: 15px;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   background: var(--bg);
 }
 
+/* The text-size setting changes the scale the --fs-* tokens multiply; the root font size stays the browser's. */
 html[data-font-size="sm"] {
-  font-size: 14px;
+  --fs-scale: 0.93;
 }
 
 html[data-font-size="lg"] {
-  font-size: 17px;
+  --fs-scale: 1.13;
 }
 
 html.is-locked {
@@ -417,7 +420,6 @@ button {
   background: var(--bg-elev);
   border-color: var(--border-strong);
   color: var(--fg);
-  box-shadow: var(--shadow-sm);
 }
 
 .btn-secondary:hover:not(:disabled) {
@@ -580,7 +582,7 @@ button {
 
 .field-hint {
   font-size: var(--fs-xs);
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
 }
 
 .form-stack {
@@ -611,7 +613,7 @@ kbd {
   border-radius: 999px;
   background: var(--bg-hover);
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   line-height: 1;
 }
@@ -680,11 +682,11 @@ kbd {
 kbd {
   padding: 1px 6px;
   border: 1px solid var(--border-strong);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--bg-sunken);
   color: var(--fg-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   box-shadow: inset 0 -1px 0 var(--border-strong);
 }
 
@@ -836,6 +838,11 @@ kbd {
   background: var(--bg);
 }
 
+/* Focus rests on the main region only when nothing else can take it (a sheet closed on the welcome page). */
+.app-main:focus {
+  outline: none;
+}
+
 .app-header-slot {
   position: relative;
   z-index: 2;
@@ -905,9 +912,18 @@ kbd {
   padding-bottom: env(safe-area-inset-bottom);
 }
 
+/* A zero-height anchor after the banner stack: the toast host hangs from its top, so toasts open below every banner. */
+.app-toast-anchor {
+  position: relative;
+  flex: none;
+  height: 0;
+}
+
 .app-toasts {
-  position: fixed;
-  inset: 0;
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
   z-index: 60;
   pointer-events: none;
 }
@@ -1020,8 +1036,7 @@ kbd {
 .welcome-logo {
   width: 56px;
   height: 56px;
-  border-radius: 16px;
-  box-shadow: var(--shadow-sm);
+  border-radius: var(--radius-lg);
 }
 
 .welcome-title {
@@ -1111,7 +1126,7 @@ kbd {
   grid-area: path;
   min-width: 0;
   overflow: hidden;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1160,7 +1175,7 @@ kbd {
 .fatal-logo {
   width: 44px;
   height: 44px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
 }
 
 .fatal-title {
@@ -1207,7 +1222,7 @@ kbd {
 .login-logo {
   width: 44px;
   height: 44px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
 }
 
 .login-app {
@@ -1246,7 +1261,7 @@ kbd {
   display: flex;
   align-items: flex-start;
   gap: var(--space-2);
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
 }
 
@@ -1270,7 +1285,7 @@ kbd {
   flex: none;
   width: 26px;
   height: 26px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
 }
 
 .sidebar-app {
@@ -1340,9 +1355,10 @@ kbd {
   pointer-events: none;
 }
 
+/* The field's clear button sits at the end of the text, left of the quick switcher button (66 px wide, 6 px in). */
 .sidebar-search-input {
   padding-left: 34px;
-  padding-right: 58px;
+  padding-right: 80px;
 }
 
 /* The ⌘K hint opens the quick switcher; it is a mouse target, the key is the shortcut. */
@@ -1380,8 +1396,10 @@ kbd {
   padding: 0 var(--space-2) var(--space-3);
 }
 
+/* minmax(0, 1fr): a long title truncates inside its row instead of pushing the time and the count off the edge. */
 .session-group {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 2px;
 }
 
@@ -1395,7 +1413,7 @@ kbd {
   border: 0;
   border-radius: var(--radius-sm);
   background: none;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   font-weight: 600;
   text-align: left;
@@ -1427,6 +1445,7 @@ kbd {
 
 .group-items {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 2px;
   list-style: none;
   padding: 0;
@@ -1455,7 +1474,7 @@ kbd {
   bottom: 7px;
   left: 0;
   width: 2px;
-  border-radius: 2px;
+  border-radius: var(--radius-pill);
   background: var(--accent);
 }
 
@@ -1505,7 +1524,7 @@ kbd {
   align-items: center;
   gap: 6px;
   max-width: 50%;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   line-height: var(--lh-xs);
 }
@@ -1596,7 +1615,7 @@ kbd {
   border-radius: 50%;
   background: var(--danger);
   color: var(--danger-fg);
-  font-size: 9px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   line-height: 12px;
   text-align: center;
@@ -1686,8 +1705,17 @@ kbd {
 .sidebar-deep-status {
   min-width: 0;
   margin: 0;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
+}
+
+/* The search-scope line under the results (the search read only the most recent sessions). */
+.sidebar-deep-note {
+  margin: 0;
+  padding: 0 var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
 }
 
 .search-results {
@@ -1739,14 +1767,14 @@ kbd {
 }
 
 .search-result-head .session-time {
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
 }
 
 .search-result-project {
   min-width: 0;
   overflow: hidden;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1779,7 +1807,7 @@ kbd {
   gap: 6px;
   min-width: 0;
   overflow: hidden;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
 }
 
@@ -1823,7 +1851,6 @@ kbd {
   background: var(--bg-elev);
   color: var(--fg);
   font-size: var(--fs-sm);
-  box-shadow: var(--shadow-sm);
 }
 
 .banner > .icon {
@@ -1871,10 +1898,13 @@ kbd {
   color: var(--danger);
 }
 
+/* Toasts open 12 px below the banner stack (the anchor sits under the header and any banners), so no banner's action
+   is covered. */
 .toast-region {
   position: absolute;
+  top: var(--space-3);
   right: var(--space-4);
-  bottom: calc(var(--space-4) + env(safe-area-inset-bottom));
+  bottom: auto;
   display: grid;
   gap: var(--space-2);
   width: min(380px, calc(100vw - 2 * var(--space-4)));
@@ -1939,13 +1969,12 @@ kbd {
   margin: -4px -4px 0 0;
 }
 
+/* The side safe-area insets are already the padding of .app, which the toast host sits inside. */
 @media (max-width: 767.98px) {
   .toast-region {
-    left: 50%;
-    right: auto;
-    bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
-    width: min(420px, calc(100vw - 2 * var(--space-3)));
-    transform: translateX(-50%);
+    left: var(--space-4);
+    right: var(--space-4);
+    width: auto;
   }
 }
 
@@ -2104,8 +2133,11 @@ kbd {
   font-weight: 600;
 }
 
+/* Rows take the height of their content, and the body scrolls. Auto rows would grow into the free height of the sheet
+   and clip a tall section under the one after it (the memory editor's footer covered its text). */
 .sheet-body {
   display: grid;
+  grid-auto-rows: max-content;
   align-content: start;
   flex: 1;
   gap: var(--space-5);
@@ -2162,7 +2194,7 @@ kbd {
 
 .sheet .kv-row {
   display: grid;
-  grid-template-columns: minmax(7.5rem, auto) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(calc(7.5 * var(--fs-md)), auto) minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-2);
   min-height: 40px;
@@ -2250,12 +2282,12 @@ kbd {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-1) var(--space-3);
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
 }
 
 .item-hint {
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
 }
 
@@ -2395,7 +2427,7 @@ kbd {
 .seg-btn {
   min-height: calc(var(--control-h) - 8px);
   padding: 4px 10px;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--fg-muted);
@@ -2407,9 +2439,10 @@ kbd {
   color: var(--fg);
 }
 
+/* The pressed segment is a raised tint with a border, not a shadow (docs/DESIGN.md: depth is for floating layers). */
 .seg-btn[aria-pressed="true"] {
+  border-color: var(--border-strong);
   background: var(--bg-elev);
-  box-shadow: var(--shadow-sm);
   color: var(--fg);
   font-weight: 600;
 }
@@ -2433,9 +2466,9 @@ kbd {
   left: 2px;
   width: 18px;
   height: 18px;
+  border: 1px solid var(--border-strong);
   border-radius: 50%;
   background: var(--bg-elev);
-  box-shadow: var(--shadow-sm);
   transition: transform var(--dur) var(--ease);
 }
 
@@ -2618,7 +2651,7 @@ kbd {
 
 .dir-empty {
   padding: var(--space-4);
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-sm);
   text-align: center;
 }
@@ -2711,19 +2744,7 @@ kbd {
 
 /* ---- Responsive refinements -------------------------------------------- */
 @media (max-width: 767.98px) {
-  html {
-    font-size: 16px;
-  }
-
-  html[data-font-size="sm"] {
-    font-size: 15px;
-  }
-
-  html[data-font-size="lg"] {
-    font-size: 18px;
-  }
-
-  /* 16px inputs stop iOS from zooming the page when a field is focused. */
+  /* iOS zooms the page when a field under 16px is focused, so fields never go below 16px; Large still grows them. */
   .input,
   .select,
   .textarea,
@@ -2731,7 +2752,7 @@ kbd {
   input,
   select,
   textarea {
-    font-size: 16px;
+    font-size: max(16px, calc(16px * var(--fs-scale)));
   }
 
   .btn {
@@ -2822,33 +2843,6 @@ kbd {
   }
 }
 
-/* ---- Touch sizing: form controls and segmented buttons grow to 44 px ----- */
-@media (pointer: coarse) {
-  :root {
-    --control-h: 44px;
-  }
-
-  .runtime-tab,
-  .switcher-option {
-    min-height: var(--control-h);
-  }
-
-  /* Shortcut hints are for keyboards: a touch screen does not show the sidebar's ones. */
-  .sidebar-new .sidebar-new-hint,
-  .sidebar-switch > .kbd {
-    display: none;
-  }
-
-  .seg {
-    padding: 0;
-    border-width: 0;
-  }
-
-  .seg-btn {
-    min-height: var(--control-h);
-  }
-}
-
 /* ---- Utilities and keys ------------------------------------------------- */
 .visually-hidden {
   position: absolute !important;
@@ -2873,11 +2867,11 @@ kbd {
   padding: 0 5px;
   border: 1px solid var(--border);
   border-bottom-width: 2px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--bg-elev);
   color: var(--fg-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
@@ -2885,19 +2879,18 @@ kbd {
 
 mark {
   padding: 0 1px;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   background: var(--accent-soft);
   color: var(--fg);
 }
 
 /* ---- Runtime panel: tabs, tables, memory and settings sources ---------- */
+/* Every tab stays in view: the strip wraps onto a second line instead of scrolling sideways. */
 .runtime-tabs {
   display: flex;
-  gap: var(--space-4);
+  flex-wrap: wrap;
+  gap: 0 var(--space-4);
   margin: 0 calc(-1 * var(--space-2));
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-  scrollbar-width: thin;
   border-bottom: 1px solid var(--border);
 }
 
@@ -2942,7 +2935,7 @@ mark {
 }
 
 .runtime-updated {
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
@@ -2972,7 +2965,7 @@ mark {
 
 .runtime-body .table th {
   padding: 0 var(--space-2) var(--space-2) 0;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   font-weight: 600;
   text-align: left;
@@ -2992,12 +2985,12 @@ mark {
 
 .table-rule {
   color: var(--fg);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   overflow-wrap: anywhere;
 }
 
 .table-source {
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   white-space: nowrap;
 }
@@ -3047,7 +3040,7 @@ mark {
 .runtime-memory {
   min-height: 160px;
   resize: vertical;
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale));
   line-height: 1.55;
 }
 
@@ -3055,10 +3048,10 @@ mark {
   display: block;
   margin-top: 4px;
   padding: 6px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--bg-sunken);
   color: var(--fg-muted);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -3084,7 +3077,7 @@ mark {
   border-radius: var(--radius-md);
   background: var(--bg-sunken);
   color: var(--fg);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale));
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -3123,8 +3116,8 @@ mark {
 
 .evt-time {
   flex: none;
-  color: var(--fg-subtle);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
 
@@ -3139,7 +3132,7 @@ mark {
   min-width: 0;
   overflow: hidden;
   color: var(--fg-muted);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -3147,14 +3140,14 @@ mark {
 .evt-size {
   flex: none;
   margin-left: auto;
-  color: var(--fg-subtle);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
 
 .evt-note {
   margin: 4px 0 0;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
 }
 
@@ -3210,12 +3203,21 @@ mark {
   flex: none;
   margin: 0;
   padding: 6px var(--space-4) 0;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
 }
 
 .switcher-status:empty {
   display: none;
+}
+
+.switcher-note {
+  flex: none;
+  margin: 0;
+  padding: 4px var(--space-4) 10px;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
 }
 
 .switcher-list {
@@ -3232,7 +3234,7 @@ mark {
 
 .switcher-group {
   padding: 10px 10px 4px;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   font-weight: 600;
 }
@@ -3285,7 +3287,7 @@ mark {
 
 .switcher-hint {
   flex: none;
-  color: var(--fg-subtle);
+  color: var(--fg-muted);
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -3359,7 +3361,7 @@ mark {
 }
 
 .account-code {
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .account-reopen {
@@ -3383,7 +3385,7 @@ mark {
   border-radius: var(--radius-md);
   background: var(--bg-sunken);
   color: var(--fg);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale));
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -3518,6 +3520,64 @@ mark {
 .login-token {
   font-family: var(--font-mono);
   letter-spacing: 0.02em;
+}
+
+/* ---- Touch targets: 44 px on coarse pointers (docs/DESIGN.md, Keys) ----------------------------------------------
+   These rules come after the base rules they refine. Earlier in this file, the base rules of .runtime-tab and
+   .switcher-option would win over a touch rule of the same specificity. Small controls keep their look and get a
+   larger ::before hit area instead. */
+@media (pointer: coarse) {
+  :root {
+    --control-h: 44px;
+  }
+
+  .group-head {
+    min-height: var(--control-h);
+  }
+
+  .runtime-tab,
+  .switcher-option,
+  .menu-item {
+    min-height: var(--control-h);
+  }
+
+  /* The New session shortcut hint is for keyboards. The quick switcher button keeps its hint: without it the 44 px
+     button would be a blank target on a touch screen. */
+  .sidebar-new .sidebar-new-hint {
+    display: none;
+  }
+
+  .sidebar-switch {
+    min-width: var(--control-h);
+    min-height: var(--control-h);
+  }
+
+  .seg {
+    padding: 0;
+    border-width: 0;
+  }
+
+  .seg-btn {
+    min-height: var(--control-h);
+  }
+
+  /* The switch is 42 x 24 px: its hit area adds 10 px above and below, and 1 px beside the border. */
+  .switch::before {
+    content: "";
+    position: absolute;
+    inset: -11px -2px;
+  }
+
+  /* The header title is about 23 px tall: its hit area adds 11 px above and below. */
+  .hdr-title {
+    position: relative;
+  }
+
+  .hdr-title::before {
+    content: "";
+    position: absolute;
+    inset: -11px 0;
+  }
 }
 
 /* ---- Motion preferences ------------------------------------------------- */

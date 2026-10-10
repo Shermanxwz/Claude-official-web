@@ -53,19 +53,35 @@ async function sessionOf(api, sessionId) {
 }
 
 /**
- * The live session once its runtime has started: the permission mode is known from the runtime's init message on, so
- * the live state leaves `starting` only then.
+ * The live session once its initialize handshake is answered: the live state leaves `starting` then, before any prompt.
+ * Claude Code reports its mode, model and version with system/init, which comes with the first prompt (see
+ * firstPrompt), so until then the live session shows only what the user chose, or null.
  * @param {ReturnType<typeof client>} api
  * @param {string} sessionId
  * @returns {Promise<any>}
  */
-async function startedLive(api, sessionId) {
+async function readyLive(api, sessionId) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const live = (await sessionOf(api, sessionId)).live;
     if (live !== null && live.state !== 'starting') return live;
     await sleep(50);
   }
-  assert.fail('the session did not start');
+  assert.fail('the session did not become ready');
+}
+
+/**
+ * Sends the first prompt of a session and waits for its turn to end. system/init comes with that prompt, so after this
+ * the live session reports what the runtime started in.
+ * @param {ReturnType<typeof client>} api
+ * @param {string} sessionId
+ */
+async function firstPrompt(api, sessionId) {
+  const events = await api.events({ watch: sessionId, after: 0 });
+  try {
+    await runTurn(api, events, sessionId, 'Tell me something');
+  } finally {
+    events.close();
+  }
 }
 
 describe('folder trust', { timeout: 120000 }, () => {
@@ -90,8 +106,9 @@ describe('folder trust', { timeout: 120000 }, () => {
     assert.equal(trusted.status, 200, trusted.text);
     assert.deepEqual(trusted.json, { path: folder, trusted: true, runtimeTrust: 'accepted' });
     assert.deepEqual((await api.get(query)).json, { path: folder, trusted: true });
-    // The runtime's answer is kept for the life of the gateway, so the folder is not recorded again.
-    assert.equal((await api.post('/api/fs/trust', { path: folder, trusted: true })).json.runtimeTrust, 'accepted');
+    // The runtime's answer is kept for the life of the gateway, so the folder is not recorded again: the folder is
+    // trusted already.
+    assert.equal((await api.post('/api/fs/trust', { path: folder, trusted: true })).json.runtimeTrust, 'already');
   });
 
   it('a folder whose trust is withdrawn is skipped by the runtime', async () => {
@@ -149,9 +166,14 @@ describe('options a session starts with, and settings of a live session', { time
 
   it('starts in the mode the settings default to, unless the request names a mode', async () => {
     const byDefault = await createLive(api, { cwd: server.proj });
-    assert.equal((await startedLive(api, byDefault.sessionId)).permissionMode, 'acceptEdits');
+    // Before the first prompt the runtime has not reported a mode, so the live session has none to show.
+    assert.equal((await readyLive(api, byDefault.sessionId)).permissionMode, null);
+    await firstPrompt(api, byDefault.sessionId);
+    assert.equal((await readyLive(api, byDefault.sessionId)).permissionMode, 'acceptEdits');
     const named = await createLive(api, { cwd: server.proj, permissionMode: 'plan' });
-    assert.equal((await startedLive(api, named.sessionId)).permissionMode, 'plan');
+    assert.equal((await readyLive(api, named.sessionId)).permissionMode, 'plan', 'the mode chosen is shown at once');
+    await firstPrompt(api, named.sessionId);
+    assert.equal((await readyLive(api, named.sessionId)).permissionMode, 'plan', 'and the runtime reports the same');
   });
 
   it('starts with a main-thread agent, extra folders and a fallback model', async () => {
@@ -369,10 +391,13 @@ describe('without the browser server, bypass and browser tools are refused', { t
       const events = await api.events({ after: 0 });
       try {
         const live = await createLive(api, { cwd: server.proj });
+        // The runtime reports bypass with system/init, which comes with the first prompt.
+        assert.equal((await readyLive(api, live.sessionId)).permissionMode, null);
+        await firstPrompt(api, live.sessionId);
         const notice = await events.next(eventNamed('notice', { code: 'BYPASS_REFUSED' }), 5000);
         assert.equal(notice.data.level, 'warning');
         assert.equal(notice.data.sessionId, live.sessionId);
-        assert.equal((await startedLive(api, live.sessionId)).permissionMode, 'default');
+        assert.equal((await readyLive(api, live.sessionId)).permissionMode, 'default');
       } finally {
         events.close();
       }
@@ -430,6 +455,13 @@ describe('a bypass the runtime cannot leave closes the session', { timeout: 1200
     const events = await api.events({ after: 0 });
     try {
       const live = await createLive(api, { cwd: server.proj });
+      // The runtime reports bypass with system/init, which comes with the first prompt. The refusal then closes the
+      // session, so the prompt is only sent to make the runtime start; its turn is not awaited.
+      const sent = await api.post(`/api/sessions/${live.sessionId}/messages`, {
+        clientMessageId: randomUUID(),
+        text: 'Tell me something',
+      });
+      assert.equal(sent.status, 200, sent.text);
       const notice = await events.next(eventNamed('notice', { code: 'BYPASS_REFUSED' }), 5000);
       assert.equal(notice.data.level, 'error');
       assert.equal(notice.data.sessionId, live.sessionId);
@@ -467,9 +499,9 @@ describe('bypass permissions when the gateway allows it', { timeout: 120000 }, (
     const live = await createLive(api, { cwd: server.proj, permissionMode: 'bypassPermissions' });
     const events = await api.events({ watch: live.sessionId, after: 0 });
     try {
-      assert.equal((await startedLive(api, live.sessionId)).permissionMode, 'bypassPermissions');
+      assert.equal((await readyLive(api, live.sessionId)).permissionMode, 'bypassPermissions');
       await runTurn(api, events, live.sessionId, 'Tell me something');
-      assert.equal((await startedLive(api, live.sessionId)).permissionMode, 'bypassPermissions');
+      assert.equal((await readyLive(api, live.sessionId)).permissionMode, 'bypassPermissions');
       assert.equal(events.all().some(eventNamed('notice', { code: 'BYPASS_REFUSED' })), false);
     } finally {
       events.close();
@@ -534,7 +566,7 @@ describe('a standard profile cannot attach browser tools', { timeout: 120000 }, 
     assert.equal((await api.get('/api/meta')).json.profile, 'standard');
     assertError(await api.post('/api/sessions', { cwd: server.proj, browserTools: true }), 403, 'FORBIDDEN');
     const live = await createLive(api, { cwd: server.proj, permissionMode: 'plan' });
-    assert.equal((await startedLive(api, live.sessionId)).permissionMode, 'plan');
+    assert.equal((await readyLive(api, live.sessionId)).permissionMode, 'plan');
     assertError(await api.post(`/api/sessions/${live.sessionId}/settings`, { browserTools: true }), 403, 'FORBIDDEN');
   });
 });

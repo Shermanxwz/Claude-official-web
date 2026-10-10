@@ -6,6 +6,48 @@
 
 import { h, clear, icon } from '../dom.js';
 import { ApiError, errorText } from '../api.js';
+import { t } from '../i18n.js';
+
+/** The runtime's `apiProvider` values (SDK `apiProvider`) and their names. Other values are shown as given. */
+const PROVIDER_KEYS = new Map([
+  ['firstParty', 'shell.provider.firstParty'],
+  ['bedrock', 'shell.provider.bedrock'],
+  ['vertex', 'shell.provider.vertex'],
+  ['foundry', 'shell.provider.foundry'],
+  ['anthropicAws', 'shell.provider.anthropicAws'],
+  ['anthropicGoogleCloud', 'shell.provider.anthropicGoogleCloud'],
+  ['gateway', 'shell.provider.gateway'],
+]);
+
+/** The plan names behind the runtime's `subscriptionType` values (matched without regard to case). */
+const PLAN_KEYS = new Map([
+  ['pro', 'shell.plan.pro'],
+  ['max', 'shell.plan.max'],
+  ['team', 'shell.plan.team'],
+  ['enterprise', 'shell.plan.enterprise'],
+]);
+
+/**
+ * The display name of an API provider; an unknown value is returned as given.
+ * @param {unknown} value the runtime's `apiProvider`
+ * @returns {string | null} null when there is no value
+ */
+export function providerLabel(value) {
+  if (typeof value !== 'string' || value === '') return null;
+  const key = PROVIDER_KEYS.get(value);
+  return key ? t(key) : value;
+}
+
+/**
+ * The plan name for a subscription type; an unknown value is returned as given.
+ * @param {unknown} value the runtime's `subscriptionType`
+ * @returns {string | null} null when there is no value
+ */
+export function planLabel(value) {
+  if (typeof value !== 'string' || value === '') return null;
+  const key = PLAN_KEYS.get(value.toLowerCase());
+  return key ? t(key) : value;
+}
 
 /**
  * Rows that describe the signed-in account. Values are shown as text.
@@ -20,8 +62,8 @@ export function accountFacts(account) {
   };
   add('email', account.email);
   add('organization', account.organization);
-  add('subscription', account.subscriptionType);
-  add('provider', account.apiProvider);
+  add('subscription', planLabel(account.subscriptionType));
+  add('provider', providerLabel(account.apiProvider));
   return facts;
 }
 

@@ -371,7 +371,7 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   const securityHeaders = () => secureHeaders({}, { https });
   const router = createRouter();
   const search = createSessionSearch({
-    listSessions: (options) => engineHost.listSessions(options),
+    listAll: () => engineHost.listAllSessions(),
     getSessionMessages: (sessionId) => engine.getSessionMessages(sessionId),
   });
   /** Last Claude Code version seen on a live session; remembered once known. */

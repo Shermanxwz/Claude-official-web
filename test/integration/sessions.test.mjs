@@ -99,9 +99,11 @@ describe('sessions: lifecycle', { timeout: 120000 }, () => {
       const turn = await runTurn(api, events, sessionId, 'Summarise the project');
       assert.deepEqual(turn.accepted, { accepted: true, duplicate: false });
       const messages = sdkMessagesOf(events, sessionId);
-      assert.equal(messages[0].type, 'system');
-      assert.equal(messages[0].subtype, 'init');
-      assert.equal(messages[0].claude_code_version, CLAUDE_CODE_VERSION);
+      // The prompt is announced as queued, then system/init, the first system message of the session, comes.
+      const init = messages.findIndex((msg) => msg.type === 'system');
+      assert.ok(messages.slice(0, init).every((msg) => msg.type === 'command_lifecycle'));
+      assert.equal(messages[init].subtype, 'init');
+      assert.equal(messages[init].claude_code_version, CLAUDE_CODE_VERSION);
       assert.ok(messages.some((msg) => msg.type === 'stream_event'), 'the answer streams as partial messages');
       assert.ok(messages.some((msg) => msg.type === 'assistant'), 'the answer ends as an assistant message');
       const result = turn.result;

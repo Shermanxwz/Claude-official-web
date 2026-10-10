@@ -16,7 +16,10 @@ const QUESTION_LIMIT = 2000;
 /**
  * @param {{
  *   t: Translate,
- *   actions: { sideQuestion: (question: string) => Promise<SideAnswer>, toast: (message: string, level?: string) => void },
+ *   actions: {
+ *     sideQuestion: (question: string) => Promise<SideAnswer>,
+ *     toast: (message: string, level?: string) => void,
+ *   },
  *   renderMarkdown: (text: string) => HTMLElement,
  *   onClose: (restoreFocus: boolean) => void,
  * }} options

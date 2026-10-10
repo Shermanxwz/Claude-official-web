@@ -419,6 +419,7 @@ async function* singlePrompt(text) {
  * @property {Map<string, BackgroundTask>} background    tasks running in the background, by task id
  * @property {Set<string>} pendingPlugins           plugins installed but not applied by a reload yet
  * @property {Set<string>} appliedPlugins           plugins a reload applied
+ * @property {boolean} started                      system/init was sent (with the first prompt, see sessionStart)
  * @property {boolean} closed
  */
 
@@ -748,6 +749,7 @@ export function createCore({
     background: new Map(),
     pendingPlugins: new Set(),
     appliedPlugins: new Set(),
+    started: false,
     closed: false,
   };
   return core;
@@ -1656,6 +1658,7 @@ export async function* runTurn(core, options, prompts, streamPartials) {
     return message;
   };
   for (const prompt of prompts) yield seen(commandLifecycle(ctx, prompt.uuid, 'started'));
+  yield* sessionStart(core, ctx);
   yield seen(stateChanged(ctx, 'running'));
   /** @type {SDKResultMessage} */
   let result;
@@ -1893,10 +1896,26 @@ async function backgroundIdle(core) {
 }
 
 /**
- * The session generator: init, the autocompact and goal settings, then one turn per batch of prompts, until the prompts
- * end or the session closes. A batch is the prompt that was taken plus every prompt already waiting behind it, so
- * prompts sent close together are answered by one turn. Control messages are yielded while the session waits for its
- * next prompt.
+ * Like Claude Code in a streaming session, the mock answers the initialize handshake at once but sends system/init,
+ * and the state messages that follow it, only with the first prompt: right after that prompt's command_lifecycle
+ * `started` (Claude Code 2.1.295 sends queued, started, then init).
+ * @param {SessionCore} core
+ * @param {SessionView} view
+ * @returns {Generator<SDKMessage, void, unknown>}
+ */
+function* sessionStart(core, view) {
+  if (core.started) return;
+  core.started = true;
+  yield initMessage(core);
+  yield autocompactState(view);
+  yield activeGoal(view);
+}
+
+/**
+ * The session generator: one turn per batch of prompts, until the prompts end or the session closes; init and the
+ * autocompact and goal settings come with the first prompt (see sessionStart). A batch is the prompt that was taken
+ * plus every prompt already waiting behind it, so prompts sent close together are answered by one turn. Control
+ * messages are yielded while the session waits for its next prompt.
  * @param {SessionCore} core
  * @param {InputQueue} queue
  * @param {SdkOptions} options
@@ -1905,9 +1924,6 @@ async function backgroundIdle(core) {
 export async function* sessionLoop(core, queue, options) {
   try {
     const view = sessionView(core);
-    yield initMessage(core);
-    yield autocompactState(view);
-    yield activeGoal(view);
     for (;;) {
       const next = yield* waitFor(core, queue.take(), core.sessionAbort.signal);
       if (next.done === true) {
@@ -1927,6 +1943,7 @@ export async function* sessionLoop(core, queue, options) {
         } else {
           // A prompt that does not query has no turn, so it starts and completes at once.
           yield commandLifecycle(view, prompt.uuid, 'started');
+          yield* sessionStart(core, view);
           yield commandLifecycle(view, prompt.uuid, 'completed');
         }
       }

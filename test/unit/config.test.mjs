@@ -240,11 +240,35 @@ describe('loadConfig validation', () => {
     assert.equal(config.allowBypass, true);
   });
 
-  it('requires the full access profile for bypassPermissions as the default mode', () => {
+  it('refuses CAW_ALLOW_BYPASS=1 under the read and standard profiles, with one message', () => {
+    for (const profile of ['read', 'standard']) {
+      assert.throws(() => loadConfig(env({ CAW_ALLOW_BYPASS: '1', CAW_ACCESS_PROFILE: profile })), (error) => {
+        assert.ok(error instanceof ConfigError, `expected ConfigError, got ${error?.name}`);
+        assert.equal(error.message, 'CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full', profile);
+        return true;
+      });
+    }
+  });
+
+  it('accepts CAW_ALLOW_BYPASS=1 under the full profile, and the switch off under any profile', () => {
+    const config = loadConfig(env({ CAW_ALLOW_BYPASS: '1', CAW_ACCESS_PROFILE: 'full' }));
+    assert.equal(config.profile, 'full');
+    assert.equal(config.allowBypass, true);
+    assert.equal(loadConfig(env({ CAW_ALLOW_BYPASS: '1' })).allowBypass, true, 'full is the default profile');
+    for (const profile of ['read', 'standard', 'full']) {
+      assert.equal(loadConfig(env({ CAW_ALLOW_BYPASS: '0', CAW_ACCESS_PROFILE: profile })).allowBypass, false);
+    }
+  });
+
+  it('refuses bypassPermissions as the default mode under any profile but full, through the same rule', () => {
     const bypass = { CAW_DEFAULT_PERMISSION_MODE: 'bypassPermissions', CAW_ALLOW_BYPASS: '1' };
-    assertInvalid({ ...bypass, CAW_ACCESS_PROFILE: 'standard' }, 'CAW_ACCESS_PROFILE');
-    assertInvalid({ ...bypass, CAW_ACCESS_PROFILE: 'read' }, 'CAW_ACCESS_PROFILE');
-    assert.equal(loadConfig(env({ ...bypass, CAW_ACCESS_PROFILE: 'full' })).profile, 'full');
+    assertInvalid({ ...bypass, CAW_ACCESS_PROFILE: 'standard' }, 'CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full');
+    assertInvalid({ ...bypass, CAW_ACCESS_PROFILE: 'read' }, 'CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full');
+    assertInvalid({ CAW_DEFAULT_PERMISSION_MODE: 'bypassPermissions', CAW_ACCESS_PROFILE: 'standard' },
+      'CAW_ALLOW_BYPASS=1');
+    const config = loadConfig(env({ ...bypass, CAW_ACCESS_PROFILE: 'full' }));
+    assert.equal(config.profile, 'full');
+    assert.equal(config.defaults.permissionMode, 'bypassPermissions');
   });
 
   it('validates the default model length', () => {

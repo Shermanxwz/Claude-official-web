@@ -6,8 +6,8 @@ import path from 'node:path';
 import {
   CONTROL_TIMEOUT_MS, ControlTimeout, MEMORY_FILE_NAMES, MEMORY_MAX_BYTES, TIMEOUT_MESSAGE, availableViews,
   exportFilename, fileSuggestionsOf, firstLine, interruptReceipt, isEditableMemoryFile, isPlainObject, isWebUrl,
-  listedMemoryFiles, realpathOrNull, redactSettings, runtimeMethod, sameDirectory, stringsOf, viewArguments,
-  withTimeout, writeMemoryFile,
+  listedMemoryFiles, realpathOrNull, redactCredentials, redactMcpServers, redactSettings, redactView, runtimeMethod,
+  sameDirectory, stringsOf, viewArguments, withTimeout, writeMemoryFile,
 } from '../../src/engine/runtime-views.mjs';
 import { AppError } from '../../src/contracts.mjs';
 
@@ -107,6 +107,245 @@ describe('plain values', () => {
     });
     assert.equal(settings.effective.env.ANTHROPIC_API_KEY, 'sk-live');
     assert.equal(redactSettings('plain'), 'plain');
+  });
+
+  test('redactSettings hides request headers and every value whose key looks like a secret, at any depth', () => {
+    const redacted = redactSettings({
+      mcpServers: {
+        remote: {
+          type: 'http',
+          url: 'https://mcp.example.test',
+          headers: { Authorization: 'Bearer abc.def.ghi', 'X-Team': 'ops' },
+        },
+        local: { command: 'node', args: ['server.js'], env: { GITHUB_TOKEN: 'ghp_x' } },
+      },
+      apiKeyHelper: '/usr/local/bin/print-key',
+      credentials: { user: 'me' },
+      client_secret: 'shh',
+      Password: 'pw',
+      session_cookie: 'c=1',
+      privateKey: 'pem',
+      model: 'sonnet',
+      maxTurns: 5,
+    });
+    assert.deepEqual(redacted, {
+      mcpServers: {
+        remote: {
+          type: 'http',
+          url: 'https://mcp.example.test',
+          headers: { Authorization: '[redacted]', 'X-Team': '[redacted]' },
+        },
+        local: { command: 'node', args: ['server.js'], env: { GITHUB_TOKEN: '[redacted]' } },
+      },
+      apiKeyHelper: '/usr/local/bin/print-key',
+      credentials: '[redacted]',
+      client_secret: '[redacted]',
+      Password: '[redacted]',
+      session_cookie: '[redacted]',
+      privateKey: '[redacted]',
+      model: 'sonnet',
+      maxTurns: 5,
+    });
+  });
+
+  test('redactSettings keeps the keys inside env and headers and hides every value under them', () => {
+    assert.deepEqual(redactSettings({ env: { A: { nested: 'x' }, B: ['y'], C: null } }), {
+      env: { A: { nested: '[redacted]' }, B: '[redacted]', C: '[redacted]' },
+    });
+    assert.deepEqual(redactSettings({ headers: 'Bearer abc' }), { headers: '[redacted]' });
+  });
+
+  test('redactSettings does not mistake ordinary keys for secrets', () => {
+    const settings = { keyboard: 'us', monkey: 1, theme: 'dark', keyName: 'Enter', env: {} };
+    assert.deepEqual(redactSettings(settings), settings);
+  });
+
+  test('a key names a secret when its normal form ends with a secret word, whatever the case and separators', () => {
+    const keys = ['authToken', 'x-api-key', 'GITHUB_TOKEN', 'client_secret', 'Password', 'passwd', 'ANTHROPIC_API_KEY',
+      'AWS_SECRET_ACCESS_KEY', 'session-cookie', 'credentials', 'private.key', 'sessionKey', 'accessKey', 'secretKey',
+      'aws_secret_key'];
+    for (const key of keys) assert.deepEqual(redactSettings({ [key]: 'value' }), { [key]: '[redacted]' }, key);
+  });
+
+  test('keys that only contain a secret word, and do not end with one, stay visible', () => {
+    const settings = {
+      maxTokens: 4096, tokenizer: 'bpe', tokenFile: '/run/token', apiKeyHelper: '/usr/local/bin/print-key',
+      passwordPolicy: 'strict', cookieConsent: true, secretary: 'ops', keyboard: 'us', monkey: 1,
+    };
+    assert.deepEqual(redactSettings(settings), settings);
+  });
+
+  test('every value inside an env or headers object is hidden, whatever its key', () => {
+    assert.deepEqual(redactSettings({ env: { maxTokens: 4096, HOME_DIR: '/home/u' }, headers: { 'X-Team': 'ops' } }), {
+      env: { maxTokens: '[redacted]', HOME_DIR: '[redacted]' },
+      headers: { 'X-Team': '[redacted]' },
+    });
+  });
+
+  test('the settings view redacts by name only: its URLs and arguments are passed as they are', () => {
+    const settings = { url: 'https://x.test/?token=abc', args: ['--token', 'abc'] };
+    assert.deepEqual(redactSettings(settings), settings);
+  });
+
+  test('redactMcpServers redacts each server config and leaves the status and the tool lists alone', () => {
+    const servers = [
+      {
+        name: 'github',
+        status: 'connected',
+        scope: 'user',
+        config: { type: 'http', url: 'https://api.example.test/mcp', headers: { Authorization: 'Bearer abc' } },
+        tools: [{ name: 'search', annotations: { readOnly: true }, inputSchema: { properties: { token: {} } } }],
+      },
+      {
+        name: 'filesystem',
+        status: 'failed',
+        error: 'spawn failed',
+        config: { type: 'stdio', command: 'npx', args: ['fs'], env: { ROOT_TOKEN: 'abc' } },
+      },
+      { name: 'bare', status: 'connected' },
+    ];
+    const redacted = redactMcpServers(servers);
+    assert.deepEqual(redacted[0], {
+      ...servers[0],
+      config: { type: 'http', url: 'https://api.example.test/mcp', headers: { Authorization: '[redacted]' } },
+    });
+    assert.deepEqual(redacted[1].config,
+      { type: 'stdio', command: 'npx', args: ['fs'], env: { ROOT_TOKEN: '[redacted]' } });
+    assert.deepEqual(redacted[2], servers[2]);
+    assert.equal(servers[0].config.headers.Authorization, 'Bearer abc', 'the input is not changed');
+    assert.equal(redactMcpServers('not a list'), 'not a list');
+    assert.deepEqual(redactMcpServers({ config: { url: 'https://u:p@x.test/?token=abc' } }),
+      { config: { url: 'https://x.test/?token=[redacted]' } },
+      'an answer that is not a list is redacted as one config');
+  });
+
+  test('the mcp view hides the user name, the password and every query and fragment value of a URL', () => {
+    const [server] = redactMcpServers([{
+      name: 'remote',
+      config: { type: 'sse', url: 'https://user:pw@mcp.example.test/sse?token=abc&page=2#access_token=xyz' },
+    }]);
+    assert.equal(server.config.url,
+      'https://mcp.example.test/sse?token=[redacted]&page=[redacted]#access_token=[redacted]');
+  });
+
+  test('a URL with nothing to hide is passed as it is, and a bare query item is replaced whole', () => {
+    const [plain, bare] = redactMcpServers([
+      { name: 'a', config: { url: 'https://mcp.example.test' } },
+      { name: 'b', config: { url: 'https://mcp.example.test/mcp?abc123', command: 'ftp://x.test/?token=1' } },
+    ]);
+    assert.equal(plain.config.url, 'https://mcp.example.test');
+    assert.equal(bare.config.url, 'https://mcp.example.test/mcp?[redacted]');
+    assert.equal(bare.config.command, 'ftp://x.test/?token=1');
+  });
+
+  test('the mcp view redacts a URL in any config value, including one inside the arguments', () => {
+    const [server] = redactMcpServers([{
+      name: 'nested',
+      config: { options: { upstream: ['https://u@x.test/a?key=v'] }, args: ['https://x.test/?k=1#frag=2'] },
+    }]);
+    assert.deepEqual(server.config, {
+      options: { upstream: ['https://x.test/a?key=[redacted]'] },
+      args: ['https://x.test/?k=[redacted]#frag=[redacted]'],
+    });
+  });
+
+  test('the mcp view checks the arguments: a secret flag hides the next value, a secret name=value its value', () => {
+    const [server] = redactMcpServers([{
+      name: 'local',
+      config: {
+        type: 'stdio',
+        command: 'npx',
+        args: [
+          '--token', 'abc', '--tokenizer', 'bpe', '--max-tokens', '5', '--token-file', '/run/token',
+          '--api-key=xyz', 'GITHUB_TOKEN=ghp_x', 'Authorization: Bearer abc', '--header', 'X-Team: ops',
+          '--url=https://x.test/?key=v', '--password', 1234, 'plain',
+        ],
+      },
+    }]);
+    assert.deepEqual(server.config.args, [
+      '--token', '[redacted]', '--tokenizer', 'bpe', '--max-tokens', '5', '--token-file', '/run/token',
+      '--api-key=[redacted]', 'GITHUB_TOKEN=[redacted]', 'Authorization: [redacted]', '--header', 'X-Team: ops',
+      '--url=https://x.test/?key=[redacted]', '--password', '[redacted]', 'plain',
+    ]);
+  });
+
+  test('the rest of each mcp status is passed as it is, URLs included', () => {
+    const servers = [{
+      name: 'remote',
+      status: 'failed',
+      error: 'could not reach https://x.test/?token=abc',
+      tools: [{ name: 'fetch', description: 'uses https://x.test/?token=abc' }],
+    }];
+    assert.deepEqual(redactMcpServers(servers), servers);
+  });
+
+  test('redactView redacts only the settings and the mcp views', () => {
+    const env = { A: 'secret' };
+    assert.deepEqual(redactView('settings', { env }), { env: { A: '[redacted]' } });
+    assert.deepEqual(redactView('mcp', [{ name: 'x', config: { env } }]),
+      [{ name: 'x', config: { env: { A: '[redacted]' } } }]);
+    for (const view of ['status', 'usage', 'account', 'permissions']) {
+      assert.deepEqual(redactView(view, { env }), { env }, view);
+    }
+  });
+
+  test('redactCredentials hides the user name and password of a URL written in any string, at any depth', () => {
+    assert.equal(redactCredentials('http://u:p@proxy:3128'), 'http://[redacted]@proxy:3128');
+    assert.equal(redactCredentials('proxy http://user:s3cret@10.0.0.1:8080 is set'),
+      'proxy http://[redacted]@10.0.0.1:8080 is set');
+    assert.deepEqual(redactCredentials({
+      rows: [{ value: 'https://a:b@registry.test/x' }, 'npm: https://c:d@mirror.test'],
+      count: 3,
+      flag: true,
+      nothing: null,
+    }), {
+      rows: [{ value: 'https://[redacted]@registry.test/x' }, 'npm: https://[redacted]@mirror.test'],
+      count: 3,
+      flag: true,
+      nothing: null,
+    });
+  });
+
+  test('redactCredentials keeps a user name alone (ssh://git@host) and a plain loopback address as they are', () => {
+    assert.equal(redactCredentials('ssh://git@host'), 'ssh://git@host');
+    assert.equal(redactCredentials('http://127.0.0.1:44131'), 'http://127.0.0.1:44131');
+    assert.deepEqual(redactCredentials(['ssh://git@host', 'http://127.0.0.1:44131']),
+      ['ssh://git@host', 'http://127.0.0.1:44131']);
+    assert.equal(redactCredentials(44131), 44131);
+  });
+
+  test('redactCredentials returns a copy: the value it was given keeps its password', () => {
+    const row = { value: 'http://corp:hunter2@proxy.test:3128' };
+    const copy = redactCredentials(row);
+    assert.equal(copy.value, 'http://[redacted]@proxy.test:3128');
+    assert.equal(row.value, 'http://corp:hunter2@proxy.test:3128');
+  });
+
+  test('redactView passes a status row with a proxy password through redacted, and no other view loses its data', () => {
+    const status = {
+      sections: [{
+        title: 'Network',
+        rows: [
+          { label: 'Proxy', value: 'http://corp:hunter2@proxy.test:3128' },
+          { label: 'Mirror', value: 'ssh://git@mirror.test' },
+          { label: 'Local', value: 'http://127.0.0.1:44131' },
+        ],
+      }],
+    };
+    const redacted = redactView('status', status);
+    assert.deepEqual(redacted, {
+      sections: [{
+        title: 'Network',
+        rows: [
+          { label: 'Proxy', value: 'http://[redacted]@proxy.test:3128' },
+          { label: 'Mirror', value: 'ssh://git@mirror.test' },
+          { label: 'Local', value: 'http://127.0.0.1:44131' },
+        ],
+      }],
+    });
+    assert.equal(JSON.stringify(redacted).includes('hunter2'), false);
+    assert.deepEqual(redactView('usage', { rate_limits: { five_hour: { utilization: 12 } } }),
+      { rate_limits: { five_hour: { utilization: 12 } } });
   });
 
   test('exportFilename keeps letters, digits, dots, underscores and hyphens, and ends in .txt', () => {

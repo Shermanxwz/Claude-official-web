@@ -4,7 +4,8 @@
  *
  * Action semantics: `onClick({ close })` runs when the button is pressed. The dialog closes afterwards unless the
  * action sets `keepOpen: true`. When `onClick` returns a promise, the button is disabled until it settles and the
- * dialog closes only on success.
+ * dialog closes only on success. `disabled` is a flag or a function. A function is read again when the button is
+ * drawn and when a pending call settles, so the button follows the caller's state.
  */
 
 import { h, icon } from '../dom.js';
@@ -14,7 +15,7 @@ import { t } from '../i18n.js';
  * @typedef {Object} DialogAction
  * @property {string} label
  * @property {'primary'|'danger'|'secondary'} [kind]
- * @property {boolean} [disabled]
+ * @property {boolean | (() => boolean)} [disabled]
  * @property {boolean} [keepOpen]
  * @property {(ctx: {close: () => void}) => void | Promise<unknown>} [onClick]
  */
@@ -144,6 +145,15 @@ function releaseKeyListener() {
 }
 
 /**
+ * The disabled state an action asks for now: its flag, or what its function returns.
+ * @param {DialogAction} action
+ * @returns {boolean}
+ */
+function actionDisabled(action) {
+  return typeof action.disabled === 'function' ? action.disabled() === true : action.disabled === true;
+}
+
+/**
  * @param {DialogAction} action
  * @param {(button: HTMLButtonElement, action: DialogAction) => void} onPress
  * @returns {HTMLButtonElement}
@@ -153,7 +163,7 @@ function actionButton(action, onPress) {
   const className = kind === 'primary' ? 'btn btn-primary' : kind === 'danger' ? 'btn btn-danger' : 'btn btn-secondary';
   const button = /** @type {HTMLButtonElement} */ (h('button', {
     class: className,
-    attrs: { type: 'button', disabled: action.disabled },
+    attrs: { type: 'button', disabled: actionDisabled(action) },
     text: action.label,
   }));
   button.addEventListener('click', () => onPress(button, action));
@@ -198,22 +208,29 @@ export function openDialog({
    */
   function run(button, action) {
     if (busy || closed) return;
+    // Read before onClick: a caller can disable the pressed button synchronously (new-session does), which drops focus.
+    const hadFocus = button.matches(':focus');
     const result = action.onClick?.({ close });
     if (result && typeof (/** @type {Promise<unknown>} */ (result)).then === 'function') {
       busy = true;
       button.disabled = true;
       button.setAttribute('aria-busy', 'true');
+      // Settling ends the busy state. The button takes the disabled state the action asks for now, so a caller whose
+      // state changed during the call (new-session does) is followed rather than overridden.
+      const settled = () => {
+        busy = false;
+        button.disabled = actionDisabled(action);
+        button.removeAttribute('aria-busy');
+        const focusLost = document.activeElement === null || document.activeElement === document.body;
+        if (hadFocus && !button.disabled && focusLost) button.focus({ preventScroll: true });
+      };
       /** @type {Promise<unknown>} */ (result).then(
         () => {
-          busy = false;
-          button.disabled = action.disabled === true;
-          button.removeAttribute('aria-busy');
+          settled();
           if (!action.keepOpen) close();
         },
         (err) => {
-          busy = false;
-          button.disabled = action.disabled === true;
-          button.removeAttribute('aria-busy');
+          settled();
           queueMicrotask(() => {
             throw err;
           });
@@ -262,15 +279,22 @@ export function openDialog({
   document.body.appendChild(backdrop);
   applyScrollLock();
 
-  const firstField = focusableWithin(bodyEl)[0] ?? (footer ? focusableWithin(footer)[0] : null);
-  (firstField ?? dialog).focus({ preventScroll: true });
+  // Initial focus: the first enabled control in the body, else the enabled primary action, else the first enabled
+  // action, else the dialog. Disabled controls are skipped, so a caller syncs their state before opening the dialog.
+  const footerButtons = footer ? focusableWithin(footer) : [];
+  const initialFocus = focusableWithin(bodyEl)[0]
+    ?? footerButtons.find((el) => el.classList.contains('btn-primary'))
+    ?? footerButtons[0]
+    ?? dialog;
+  initialFocus.focus({ preventScroll: true });
 
   return { close, element: dialog };
 }
 
 /**
  * Ask for confirmation. Resolves true only when the confirm button is pressed.
- * @param {{title: string, message?: string | Node, danger?: boolean, confirmLabel?: string, cancelLabel?: string}} options
+ * @param {{title: string, message?: string | Node, danger?: boolean, confirmLabel?: string,
+ *   cancelLabel?: string}} options
  * @returns {Promise<boolean>}
  */
 export function confirmDialog({ title, message, danger = false, confirmLabel, cancelLabel }) {

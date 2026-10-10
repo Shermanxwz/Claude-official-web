@@ -136,7 +136,8 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {string|null} claudeCodeVersion
  * @property {{code: string, message: string}|null} error
  * @property {boolean} trusted              project settings, hooks, skills and MCP servers of cwd are loaded
- * @property {boolean|null} fastMode        fast mode the gateway requested (flag settings layer); null = settings decide
+ * @property {boolean|null} fastMode        fast mode the gateway requested (flag settings layer);
+ *   null = settings decide
  * @property {FastModeState|null} fastModeState   what the runtime last reported (init or result); null = unknown
  * @property {string|null} fastModeDisabledReason   FastModeDisabledReason from the same report; null = nothing blocks
  * @property {number} backgroundTasks       live non-ambient background tasks (system/background_tasks_changed)
@@ -284,6 +285,15 @@ export const SESSION_COOKIE = 'caw_session';
  */
 
 /**
+ * The answer of GET /api/sessions/search (src/search.mjs).
+ * @typedef {Object} SessionSearchResponse
+ * @property {SessionSearchResult[]} results
+ * @property {number} scanned     sessions whose transcript was read
+ * @property {boolean} truncated  not every session was scanned (the cap or the time budget)
+ * @property {number} scanLimit   the cap: how many of the most recent unmatched sessions a search reads at most
+ */
+
+/**
  * Claude Code's own sign-in, run by the runtime (src/engine/account.mjs).
  * @typedef {Object} AccountApi
  * @property {() => Promise<{account: AccountInfo|null, signInPending: boolean}>} status
@@ -297,6 +307,8 @@ export const SESSION_COOKIE = 'caw_session';
  * Public surface of src/engine/host.mjs (class EngineHost). Every method throws AppError for expected failures.
  * @typedef {Object} EngineHostApi
  * @property {(opts?: {cwd?: string, limit?: number, offset?: number}) => Promise<SessionSummary[]>} listSessions
+ * @property {() => Promise<SessionSummary[]>} listAllSessions   every session the gateway lists, newest first, from
+ *   one listing of the runtime
  * @property {(sessionId: string) => Promise<SessionDetail>} getSession
  * @property {(sessionId: string, opts: {tail?: number, before?: number, limit?: number}) =>
  *   Promise<{messages: Array<SessionMessage & {index: number}>, total: number, start: number, hasMore: boolean}>}
@@ -320,7 +332,8 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {(sessionId: string, server: string, action: {action: 'start'|'callback'|'clear', callbackUrl?: string}) =>
  *   Promise<Record<string, unknown>>} mcpAuth
  * @property {(sessionId: string) => Promise<{views: string[]}>} runtimeViews
- * @property {(sessionId: string, view: string) => Promise<{view: string, data: unknown, fetchedAt: number}>} runtimeView
+ * @property {(sessionId: string, view: string) =>
+ *   Promise<{view: string, data: unknown, fetchedAt: number}>} runtimeView
  *   the caller (app.mjs) checks RUNTIME_VIEWS[view].profile first
  * @property {(sessionId: string) => Promise<{files: MemoryFile[], folders: unknown[], autoMemory: unknown,
  *   autoDream: unknown}>} getMemory
@@ -340,8 +353,8 @@ export const SESSION_COOKIE = 'caw_session';
  *   moves foreground Bash commands and subagents to the background (the terminal's Ctrl+B)
  * @property {(sessionId: string, style: string) => Promise<{outputStyle: string, availableOutputStyles: string[]}>}
  *   setOutputStyle   writes the project's local settings through the runtime's own writer
- * @property {(sessionId: string, opts: {userMessageId: string, mode: 'code'|'conversation'|'both', dryRun?: boolean}) =>
- *   Promise<{files?: RewindFilesResult, conversation?: {resumeAt: string}}>} rewind
+ * @property {(sessionId: string, opts: {userMessageId: string, mode: 'code'|'conversation'|'both',
+ *   dryRun?: boolean}) => Promise<{files?: RewindFilesResult, conversation?: {resumeAt: string}}>} rewind
  * @property {(sessionId: string, opts: {upToMessageId?: string, title?: string}) => Promise<{sessionId: string}>} fork
  * @property {(sessionId: string, title: string) => Promise<void>} rename
  * @property {(sessionId: string, tag: string|null) => Promise<void>} tag

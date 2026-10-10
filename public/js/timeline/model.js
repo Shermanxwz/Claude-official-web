@@ -27,8 +27,8 @@
  *  - result:         { subtype, durationMs, durationApiMs, numTurns, isError, interrupted, errors,
  *                      permissionDenials: [{toolName}], terminalReason, totalCostUsd }
  *  - request:        { request }   (PendingRequest, placed after the active turn)
- *  - generic:        { label, raw, diagnostic: true }   (unknown message types or subtypes, kept for diagnostics; the view
- *                      shows them only while the runtime-events preference is on)
+ *  - generic:        { label, raw, diagnostic: true }   (unknown message types or subtypes, kept for diagnostics;
+ *                      the view shows them only while the runtime-events preference is on)
  *
  * Inputs are kept in an operation log, so an older transcript page can be prepended (prependTranscript) and the
  * state rebuilt. Pending requests and the session state are applied on top of the replayed state.
@@ -94,8 +94,8 @@ const INTERRUPT_NOTICES = new Map([
  *   getEntries: () => Array<Record<string, any>>,
  *   getVersion: () => number,
  *   getUserMessages: () => Array<{uuid: string, text: string, index: number}>,
- *   getPendingUserMessages: () => Array<{clientMessageId: string, text: string, attachments: Array<Record<string, any>>,
- *                                        accepted: boolean, status: string, error: string|null}>,
+ *   getPendingUserMessages: () => Array<{clientMessageId: string, text: string,
+ *     attachments: Array<Record<string, any>>, accepted: boolean, status: string, error: string|null}>,
  *   getRunState: () => {running: boolean, status: string|null, compactResult: string|null, activity: string|null}
  * }}
  */
@@ -145,7 +145,10 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   let activity = null;
   /** @type {Array<{request: Record<string, any>, version: number}>} */
   let pending = [];
-  /** Requests the model was told about and that are not resolved yet, by id (a resolution may arrive after the list changed). */
+  /**
+   * Requests the model was told about and that are not resolved yet, by id (a resolution may arrive after the list
+   * changed).
+   */
   /** @type {Map<string, Record<string, any>>} */
   let known = new Map();
   /** @type {string|null} */
@@ -245,7 +248,10 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   const webSearchResultFrom = (block) => {
     const body = block.content;
     if (isObject(body) && body.type === 'web_search_tool_result_error') {
-      return { result: { content: String(body.error_code ?? 'error'), isError: true, images: [] }, structured: undefined };
+      return {
+        result: { content: String(body.error_code ?? 'error'), isError: true, images: [] },
+        structured: undefined,
+      };
     }
     const hits = Array.isArray(body) ? body.filter((hit) => isObject(hit)) : [];
     const content = hits.map((hit) => `${String(hit.title ?? '')}\n${String(hit.url ?? '')}`).join('\n\n');
@@ -443,7 +449,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     const last = flow.entries[flow.entries.length - 1];
     let group = last && last.kind === 'work' ? last : null;
     if (!group) {
-      group = pushEntry(flow, { kind: 'work', key: `w:${item.key}`, label: null, count: 0, items: [], open: false, running: false });
+      group = pushEntry(flow, {
+        kind: 'work', key: `w:${item.key}`, label: null, count: 0, items: [], open: false, running: false,
+      });
     }
     group.items.push(item);
     containerOf.set(item, flow);
@@ -599,7 +607,14 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     return live ? liveFlow() : baseFlow();
   };
 
-  /** @param {Flow} flow @param {string} level @param {string} code @param {Record<string, any>} vars @param {string} text @param {string|null} key */
+  /**
+   * @param {Flow} flow
+   * @param {string} level
+   * @param {string} code
+   * @param {Record<string, any>} vars
+   * @param {string} text
+   * @param {string|null} key
+   */
   const addNotice = (flow, level, code, vars, text, key) => {
     pushEntry(flow, { kind: 'notice', key: key ?? nextKey('n', null), level, code, text, vars });
     return flow;
@@ -641,7 +656,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     const toolResults = blocks.filter((block) => block.type === 'tool_result');
     const rest = blocks.filter((block) => block.type !== 'tool_result');
     for (const block of toolResults) {
-      const structured = toolResults.length === 1 && raw.tool_use_result !== undefined ? raw.tool_use_result : undefined;
+      const structured = toolResults.length === 1 && raw.tool_use_result !== undefined
+        ? raw.tool_use_result
+        : undefined;
       deliverResult(String(block.tool_use_id ?? ''), toolResultFrom(block), structured, uuid);
     }
     if (toolResults.length > 0 && rest.length === 0) return current ?? null;
@@ -664,7 +681,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     if (raw.isSynthetic === true || raw.is_meta === true || raw.isCompactSummary === true ||
         (origin && typeof origin.kind === 'string' && origin.kind !== 'human')) {
       const flow = live ? liveFlow() : baseFlow();
-      addNotice(flow, 'muted', 'user-meta', { source: origin && typeof origin.kind === 'string' ? origin.kind : 'synthetic' },
+      addNotice(flow, 'muted', 'user-meta',
+        { source: origin && typeof origin.kind === 'string' ? origin.kind : 'synthetic' },
         visible || stripReminders(rawText, true), nextKey('n', uuid));
       return flow;
     }
@@ -732,14 +750,19 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     if (type === 'text') {
       appendBubble(flow, { kind: 'text', text: String(block.text ?? '') }, messageId, uuid, raw);
     } else if (type === 'thinking') {
-      appendBubble(flow, { kind: 'thinking', text: String(block.thinking ?? ''), redacted: false }, messageId, uuid, raw);
+      appendBubble(flow, { kind: 'thinking', text: String(block.thinking ?? ''), redacted: false },
+        messageId, uuid, raw);
     } else if (type === 'redacted_thinking') {
       appendBubble(flow, { kind: 'thinking', text: '', redacted: true }, messageId, uuid, raw);
     } else if (type === 'tool_use') {
-      addTool(flow, { id: String(block.id ?? ''), name: String(block.name ?? 'tool'), input: block.input, messageUuid: uuid });
+      addTool(flow, {
+        id: String(block.id ?? ''), name: String(block.name ?? 'tool'), input: block.input, messageUuid: uuid,
+      });
     } else if (type === 'server_tool_use' && block.name === 'web_search') {
       const input = isObject(block.input) ? block.input : {};
-      addTool(flow, { id: String(block.id ?? ''), name: 'WebSearch', input: { query: input.query ?? '' }, messageUuid: uuid });
+      addTool(flow, {
+        id: String(block.id ?? ''), name: 'WebSearch', input: { query: input.query ?? '' }, messageUuid: uuid,
+      });
     } else if (type === 'web_search_tool_result') {
       const id = String(block.tool_use_id ?? '');
       const card = toolIndex.get(id) ?? addTool(flow, { id, name: 'WebSearch', input: {}, messageUuid: uuid });
@@ -790,8 +813,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   };
 
   /**
-   * A final assistant message settles the streaming draft of the same message id: its blocks count as finalized, so only
-   * the blocks it does not cover stay visible. Each message settles a draft once, by uuid.
+   * A final assistant message settles the streaming draft of the same message id: its blocks count as finalized, so
+   * only the blocks it does not cover stay visible. Each message settles a draft once, by uuid.
    * @param {Record<string, any>} raw
    */
   const settleDraft = (raw) => {
@@ -835,7 +858,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     /** @type {Record<string, any>} */
     const fields = { rowKind: 'task', taskId };
     if (subtype === 'task_started') {
-      Object.assign(fields, { description: String(raw.description ?? ''), status: 'running', subagentType: raw.subagent_type ?? null });
+      Object.assign(fields, {
+        description: String(raw.description ?? ''), status: 'running', subagentType: raw.subagent_type ?? null,
+      });
     } else if (subtype === 'task_progress') {
       Object.assign(fields, {
         description: String(raw.description ?? ''),
@@ -968,9 +993,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   };
 
   /**
-   * The primary model refused a turn and a fallback model answered it. The retracted messages are withdrawn, and an open
-   * streaming draft goes too: the retry streams a new message. A subagent or side question that fell back shows the
-   * notice inside its work group, the session-level fallback as a notice in the turn.
+   * The primary model refused a turn and a fallback model answered it. The retracted messages are withdrawn, and an
+   * open streaming draft goes too: the retry streams a new message. A subagent or side question that fell back shows
+   * the notice inside its work group, the session-level fallback as a notice in the turn.
    * @param {Record<string, any>} raw
    * @param {boolean} live
    * @param {string|null} uuid
@@ -980,13 +1005,15 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     const flow = resolveFlow(raw, live);
     if (!flow) return null;
     if (live) markLive(flow.state);
-    // A subagent or side question that fell back streams nothing into the main draft, so only a session fallback drops it.
+    // A subagent or side question that fell back streams nothing into the main draft; only a session fallback drops it.
     if (raw.scope !== 'local') clearDraft();
     withdrawMessages(uuidSet(raw, 'retracted_message_uuids'));
     const vars = { category: typeof raw.api_refusal_category === 'string' ? raw.api_refusal_category : null };
     const text = typeof raw.content === 'string' ? raw.content : '';
     if (raw.scope === 'local') {
-      upsertRow(flow, `refusal:${uuid ?? nextKey('r', null)}`, { rowKind: 'notice', level: 'warning', code: 'refusal-fallback', vars, text });
+      upsertRow(flow, `refusal:${uuid ?? nextKey('r', null)}`, {
+        rowKind: 'notice', level: 'warning', code: 'refusal-fallback', vars, text,
+      });
       return flow;
     }
     return addNotice(flow, 'warning', 'refusal-fallback', vars, text, uuid ? `n:${uuid}` : null);
@@ -1029,7 +1056,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       name: typeof raw.name === 'string' ? raw.name : '',
       error: typeof raw.error === 'string' ? raw.error : '',
     };
-    return addNotice(flow, status === 'failed' ? 'warning' : 'muted', 'plugin-install', vars, '', uuid ? `n:${uuid}` : null);
+    return addNotice(flow, status === 'failed' ? 'warning' : 'muted', 'plugin-install', vars, '',
+      uuid ? `n:${uuid}` : null);
   };
 
   /**
@@ -1102,7 +1130,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       }
       case 'local_command_output': {
         const flow = live ? liveFlow() : baseFlow();
-        pushEntry(flow, { kind: 'command-output', key: nextKey('c', uuid), text: stripAnsi(String(raw.content ?? '')) });
+        pushEntry(flow, {
+          kind: 'command-output', key: nextKey('c', uuid), text: stripAnsi(String(raw.content ?? '')),
+        });
         return flow;
       }
       case 'informational': {
@@ -1115,8 +1145,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
         if (raw.state === 'idle' && live) endIdle();
         return null;
       case 'task_summary':
-        // The runtime's one-line activity for the running turn: it shows beside the working indicator, not as a row. A
-        // summary that arrives after the turn closed has no turn to show beside, so it is dropped rather than carried on.
+        // The runtime's one-line activity for the running turn: it shows beside the working indicator, not as a row.
+        // A summary that arrives after the turn closed has no turn beside it, so it is dropped rather than carried on.
         if (live && current && !current.state.closed) {
           activity = typeof raw.detail === 'string' && raw.detail.trim() ? raw.detail.trim() : null;
         }
@@ -1229,7 +1259,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     if (type === 'text') made = { key, kind: 'text', text: String(block.text ?? '') };
     else if (type === 'thinking') made = { key, kind: 'thinking', text: String(block.thinking ?? ''), redacted: false };
     else if (type === 'redacted_thinking') made = { key, kind: 'thinking', text: '', redacted: true };
-    else if (type === 'tool_use' || type === 'server_tool_use') made = { key, kind: 'tool-draft', name: String(block.name ?? 'tool'), partial: '' };
+    else if (type === 'tool_use' || type === 'server_tool_use')
+      made = { key, kind: 'tool-draft', name: String(block.name ?? 'tool'), partial: '' };
     else made = { key, kind: 'generic', raw: block, label: String(type ?? 'block') };
     touch(made);
     return made;
@@ -1239,7 +1270,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   const applyDelta = (block, delta) => {
     if (delta.type === 'text_delta' && block.kind === 'text') block.text += String(delta.text ?? '');
     else if (delta.type === 'thinking_delta' && block.kind === 'thinking') block.text += String(delta.thinking ?? '');
-    else if (delta.type === 'input_json_delta' && block.kind === 'tool-draft') block.partial += String(delta.partial_json ?? '');
+    else if (delta.type === 'input_json_delta' && block.kind === 'tool-draft')
+      block.partial += String(delta.partial_json ?? '');
     else return;
     touch(block);
   };
@@ -1253,7 +1285,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     markLive(flow.state);
     switch (event.type) {
       case 'message_start': {
-        const id = isObject(event.message) && typeof event.message.id === 'string' ? event.message.id : nextKey('stream', null);
+        const id = isObject(event.message) && typeof event.message.id === 'string'
+          ? event.message.id
+          : nextKey('stream', null);
         if (draft && draft.messageId !== id) clearDraft();
         ensureDraft(id);
         touch(draft);
@@ -1339,10 +1373,12 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
 
   /** @param {Record<string, any>} raw */
   const isActivity = (raw) => {
-    if (raw.type === 'assistant' || raw.type === 'user' || raw.type === 'stream_event' || raw.type === 'tool_progress') return true;
+    if (raw.type === 'assistant' || raw.type === 'user' || raw.type === 'stream_event' ||
+        raw.type === 'tool_progress') return true;
     if (raw.type !== 'system') return false;
     if (raw.subtype === 'status') return Boolean(raw.status);
-    return raw.subtype === 'api_retry' || raw.subtype === 'permission_denied' || String(raw.subtype).startsWith('hook_');
+    return raw.subtype === 'api_retry' || raw.subtype === 'permission_denied' ||
+      String(raw.subtype).startsWith('hook_');
   };
 
   /**
@@ -1707,7 +1743,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     setField(entry, 'status', 'failed');
     setField(entry, 'error', errorText(error) || 'failed');
     const turn = containerOf.get(entry);
-    // A turn that holds only this message never reached the SDK, so it is not running and the messages behind it can go.
+    // A turn that holds only this message never reached the SDK, so it is not running and the messages behind can go.
     if (turn && !turn.state.closed && turn.entries.every((item) => item.kind === 'user')) closeTurn(turn.state);
   };
 
@@ -1757,7 +1793,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     discardEntry(clientMessageId);
   };
 
-  // ---------------------------------------------------------------------------------------------------------------------
+  // -------------------------------------------------------------------------------------------------------------------
   // Activity and todos (the composer's running line and todo bar)
 
   /**
@@ -1818,7 +1854,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       for (const entry of turn.entries) {
         if (entry.kind !== 'work') continue;
         for (const item of entry.items) {
-          if (item.kind === 'tool' && item.name === 'TodoWrite' && isObject(item.input) && Array.isArray(item.input.todos)) {
+          if (item.kind === 'tool' && item.name === 'TodoWrite' && isObject(item.input) &&
+              Array.isArray(item.input.todos)) {
             latest = item.input.todos;
           }
         }
@@ -1830,7 +1867,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     for (const todo of latest) {
       if (!isObject(todo) || typeof todo.content !== 'string' || !todo.content.trim()) continue;
       const content = todo.content.trim();
-      const activeForm = typeof todo.activeForm === 'string' && todo.activeForm.trim() ? todo.activeForm.trim() : content;
+      const activeForm = typeof todo.activeForm === 'string' && todo.activeForm.trim()
+        ? todo.activeForm.trim()
+        : content;
       const status = todo.status === 'in_progress' || todo.status === 'completed' ? todo.status : 'pending';
       todos.push({ content, activeForm, status });
     }
@@ -1851,7 +1890,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     return '';
   };
 
-  // ---------------------------------------------------------------------------------------------------------------------
+  // -------------------------------------------------------------------------------------------------------------------
   // Public API
 
   return {
@@ -1956,8 +1995,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     },
 
     /**
-     * A request was answered or dropped. A refusal dialog that resolves evicts the refused messages it retracted, without
-     * a marker: the retry replaces them. The eviction is logged, so a replay keeps it.
+     * A request was answered or dropped. A refusal dialog that resolves evicts the refused messages it retracted,
+     * without a marker: the retry replaces them. The eviction is logged, so a replay keeps it.
      * @param {string} requestId
      */
     resolvePending(requestId) {
@@ -2030,7 +2069,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       }
       for (const entry of pending) {
         const prompt = entry.request.kind === 'dialog' ? promptOfCurrentTurn() : '';
-        out.push({ kind: 'request', key: `req:${entry.request.id}`, request: entry.request, version: entry.version, prompt });
+        out.push({
+          kind: 'request', key: `req:${entry.request.id}`, request: entry.request, version: entry.version, prompt,
+        });
       }
       out.push(...queued);
       return out;
@@ -2089,7 +2130,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     /**
      * Local messages that the transcript does not confirm yet (sending, queued or failed), oldest first. The view
      * restores them with addOptimistic after a reload, so they survive it.
-     * @returns {Array<{clientMessageId: string, text: string, attachments: Array<Record<string, any>>, accepted: boolean, status: string, error: string|null}>}
+     * @returns {Array<{clientMessageId: string, text: string, attachments: Array<Record<string, any>>,
+     *   accepted: boolean, status: string, error: string|null}>}
      */
     getPendingUserMessages() {
       return locals

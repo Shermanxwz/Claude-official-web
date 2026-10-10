@@ -322,6 +322,8 @@
 /* ---- Composer ----------------------------------------------------------------------------------------------------- */
 
 .composer {
+  /* The text edge inside the box: its 1 px border plus the 16 px textarea padding. The lines above the box use it too. */
+  --composer-indent: 17px;
   position: relative;
   box-sizing: border-box;
   width: 100%;
@@ -515,11 +517,28 @@
   color: var(--fg);
 }
 
-.composer-mode-text {
+/* Desktop shows the full word; the short name stays hidden until the phone layout swaps the two. The tooltip and the
+   menu always carry the full word. */
+.composer-mode-text,
+.composer-mode-short {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.composer-mode-short {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .composer-mode-text {
+    display: none;
+  }
+
+  .composer-mode-short {
+    display: block;
+  }
 }
 
 .composer-footer.is-flash .composer-mode {
@@ -559,7 +578,7 @@
 .composer-notice,
 .composer-usage,
 .composer-queued {
-  padding: 0 var(--space-2);
+  padding: 0 var(--composer-indent);
   color: var(--fg-muted);
   font-size: var(--fs-xs);
   line-height: 16px;
@@ -577,18 +596,47 @@
   color: var(--fg-subtle);
 }
 
-/* A single-line suggestion sits above the composer with the same left edge as the text. */
+/* The prompt suggestion is one quiet line above the composer: no border or fill, its text on the composer's text edge.
+   The whole line is one button, so it stays clickable and keyboard reachable; focus shows the shared focus ring. */
 .composer-suggestion {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   min-width: 0;
-  min-height: 36px;
-  padding: 4px var(--space-2) 4px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg-sunken);
+  min-height: 32px;
+  padding: 0 var(--space-2) 0 var(--composer-indent);
   font-size: var(--fs-sm);
+}
+
+.composer-suggestion-use {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: var(--fs-sm);
+  text-align: start;
+  cursor: pointer;
+  transition: color 140ms var(--ease);
+}
+
+.composer-suggestion-use:hover {
+  color: var(--fg);
+}
+
+.composer-suggestion-use > .icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
 }
 
 .composer-suggestion-text {
@@ -597,13 +645,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--fg);
-}
-
-.composer-suggestion-use {
-  flex: 0 0 auto;
-  color: var(--accent);
-  font-weight: 500;
 }
 
 /* ---- Running line (the activity bar) and the todo bar ------------------------------------------------------------- */
@@ -614,7 +655,7 @@
   gap: var(--space-2);
   min-width: 0;
   min-height: 28px;
-  padding: 0 var(--space-2);
+  padding: 0 var(--composer-indent);
   color: var(--fg-muted);
   font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
@@ -686,7 +727,7 @@
   flex-direction: column;
   gap: 4px;
   min-width: 0;
-  padding: 0 var(--space-2);
+  padding: 0 var(--composer-indent);
   font-size: var(--fs-sm);
 }
 
@@ -1317,6 +1358,8 @@
   .composer-send,
   .composer-stop,
   .composer-stop-more,
+  .composer-mode,
+  .composer-suggestion-use,
   .hdr-icon-btn,
   .ctx-meter,
   .hdr-select,
@@ -1336,8 +1379,14 @@
     min-width: 44px;
   }
 
+  /* The mode control and the stop-menu trigger are 44 px wide as well as tall. */
+  .composer-mode,
   .composer-stop-more {
-    min-width: 28px;
+    min-width: 44px;
+  }
+
+  .composer-mode {
+    justify-content: center;
   }
 
   .palette-hint {

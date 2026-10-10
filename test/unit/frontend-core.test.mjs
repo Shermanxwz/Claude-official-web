@@ -50,7 +50,7 @@ import {
   sessionCwd,
   sessionTitle,
 } from '../../public/js/ui/sidebar-model.js';
-import { accountFacts, validSignInCode } from '../../public/js/ui/account.js';
+import { accountFacts, planLabel, providerLabel, validSignInCode } from '../../public/js/ui/account.js';
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -1178,9 +1178,22 @@ describe('account section helpers', () => {
     assert.deepEqual(accountFacts({ email: 'a@example.com', organization: '', subscriptionType: 'Max', apiProvider: 'firstParty' }), [
       { label: 'email', value: 'a@example.com' },
       { label: 'subscription', value: 'Max' },
-      { label: 'provider', value: 'firstParty' },
+      { label: 'provider', value: 'Anthropic API' },
     ]);
     assert.deepEqual(accountFacts(null), []);
+  });
+
+  it('names the runtime providers and plans, and shows unknown values as given', () => {
+    assert.equal(providerLabel('bedrock'), 'Amazon Bedrock');
+    assert.equal(providerLabel('anthropicGoogleCloud'), 'Anthropic on Google Cloud');
+    assert.equal(providerLabel('gateway'), 'Cloud gateway');
+    assert.equal(providerLabel('someNewProvider'), 'someNewProvider');
+    assert.equal(providerLabel(''), null);
+    assert.equal(providerLabel(undefined), null);
+    assert.equal(planLabel('pro'), 'Pro');
+    assert.equal(planLabel('MAX'), 'Max');
+    assert.equal(planLabel('Claude API'), 'Claude API');
+    assert.equal(planLabel(null), null);
   });
 
   it('accepts only a sign-in code with a non-empty part on each side of the #', () => {

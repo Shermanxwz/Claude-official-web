@@ -14,7 +14,7 @@ The seal runs these gates in order and stops at the first failure:
 | 2 | `check` | Static rules hold across the tree: no `TODO`, `FIXME` or `XXX` markers; no `console.*` in `src/`; every backend module starts with `// @ts-check`; no `eval`, `new Function`, `shell: true` or shell-based `exec` in `src/`; no `innerHTML`, `outerHTML`, `insertAdjacentHTML` or `document.write` in browser code; no inline scripts or inline event handlers in HTML; LF line endings, no trailing whitespace, no tab indentation and a final newline; valid JSON; every module passes `node --check`; relative imports resolve; no file over 300 KiB; no symbolic links. |
 | 3 | `typecheck` | `tsc -p jsconfig.json` passes with JSDoc types checked, including the scripts. |
 | 4 | `test` | Unit and integration tests pass with no network access, temporary directories and random ports. Integration tests use the mock engine. |
-| 5 | `test:e2e` | The 30 browser tests pass in Chromium, driving the real interface against the mock engine. |
+| 5 | `test:e2e` | The 50 browser tests in five files pass in Chromium, driving the real interface against the mock engine. |
 
 The seal uses the deterministic mock engine. It proves the gateway, the wire protocol, the access rules and the browser
 interface behave as specified. It does not prove that a real model answers correctly, and it does not prove that Claude
@@ -37,8 +37,8 @@ The receipt records:
 - `steps`: each executed step with its duration in milliseconds;
 - `at`: the completion time, in ISO 8601 format.
 
-A receipt always describes the run that wrote it. The seal removes the previous receipt before it starts, so a failed run
-leaves no receipt behind.
+A receipt always describes the run that wrote it. The seal removes the previous receipt before it starts, so a failed
+run leaves no receipt behind.
 
 ### `--skip-e2e`
 
@@ -48,10 +48,11 @@ seal on a machine with Chromium (for example, the CI workflow) before a release.
 
 ## 2. Manifest
 
-`npm run manifest` writes `SOURCE_MANIFEST.sha256`. It lists one `<sha256>  <path>` line for every file under `src`,
+`npm run manifest` writes `SOURCE_MANIFEST.sha256`. It lists one `<sha256> <path>` line for every file under `src`,
 `public`, `scripts`, `test` (except `test/e2e/artifacts`), `docs`, `deploy` and `.github`, plus the root documentation,
-configuration and license files. Symbolic links are refused. `npm run manifest:verify` recomputes the digests and reports
-each added, removed or changed path. It exits with status 1 on any difference, including a formatting-only difference.
+configuration and license files. Symbolic links are refused. `npm run manifest:verify` recomputes the digests and
+reports each added, removed or changed path. It exits with status 1 on any difference, including a formatting-only
+difference.
 
 Regenerate the manifest after every change, as the last step before a seal. A stale manifest fails step 1 on purpose.
 
@@ -69,13 +70,13 @@ state directory. It then:
 3. sends a prompt asking the model to reply with a unique marker, and waits up to 180 seconds for the turn result;
 4. checks that the assistant's reply contains the marker, that the transcript on disk lists the prompt and the reply,
    and that the capabilities list models and slash commands;
-5. with `--with-tools`, asks the model to write a file with the marker using the Write tool, approves that request through
-   the request API, and checks the file;
+5. with `--with-tools`, asks the model to write a file with the marker using the Write tool, approves that request
+   through the request API, and checks the file;
 6. closes and deletes the session, stops the gateway and removes the temporary directories.
 
-It prints a JSON receipt with the SDK version and the Claude Code version reported by `/api/meta`, and the duration of each
-stage, followed by `RUNTIME_VALIDATED`. Failures print one actionable line. For example, an unavailable engine prints the
-instruction to log in with `claude` and `/login`.
+It prints a JSON receipt with the SDK version and the Claude Code version reported by `/api/meta`, and the duration of
+each stage, followed by `RUNTIME_VALIDATED`. Failures print one actionable line. For example, an unavailable engine
+prints the instruction to log in with `claude` and `/login`.
 
 The command ignores `CAW_*` variables in the calling shell, except `CAW_CLAUDE_BIN`, so its result does not depend on
 local gateway settings. Session transcripts are removed with the session. Empty project folders that Claude Code created
@@ -86,9 +87,9 @@ This command uses model usage on the account you are logged in with.
 ### `npm run smoke:gateway`
 
 Validates a deployed gateway over the network. It needs `CAW_GATEWAY_URL` and `CAW_GATEWAY_TOKEN`, and optionally
-`CAW_GATEWAY_ORIGIN`. The token is the one you saved when the installer printed it, or the one from `--rotate-token`. The
-configuration file holds only its hash by default, so enter the token at the prompt shown in the deployment guide rather
-than on the command line. It checks:
+`CAW_GATEWAY_ORIGIN`. The token is the one you saved when the installer printed it, or the one from `--rotate-token`.
+The configuration file holds only its hash by default, so enter the token at the prompt shown in the deployment guide
+rather than on the command line. It checks:
 
 - `/healthz` responds through the public URL, so a proxy that rewrites the `Host` header fails here with 421;
 - the unauthenticated session probe reports that authentication is required;
@@ -98,8 +99,8 @@ than on the command line. It checks:
 - the event stream sends `hello` within 10 seconds and `heartbeat` within 20 seconds;
 - logout revokes the session, and `/api/meta` then returns `UNAUTHENTICATED`.
 
-It creates no sessions and runs no model turns, so it is safe to run against a live gateway. It never prints the token or
-the cookie. It ends with `GATEWAY_VALIDATED`.
+It creates no sessions and runs no model turns, so it is safe to run against a live gateway. It never prints the token
+or the cookie. It ends with `GATEWAY_VALIDATED`.
 
 ## 4. What CI cannot prove
 
@@ -110,7 +111,8 @@ cannot prove:
 - that Claude Code is logged in on a particular host;
 - the deployed configuration: the TLS certificate, the tunnel or proxy, Cloudflare Access or Tailscale rules, and the
   `CAW_PUBLIC_ORIGIN` value;
-- that the proxy forwards the `Host` header unchanged and, with `CAW_TRUST_PROXY=1`, sets the client address header itself;
+- that the proxy forwards the `Host` header unchanged and, with `CAW_TRUST_PROXY=1`, sets the client address header
+  itself;
 - that node-pty compiles on the target host;
 - that systemd user services and lingering behave as expected on the target host;
 - the usage limits and billing of the account in use.
@@ -121,12 +123,12 @@ Those are covered by `smoke:runtime`, `smoke:gateway` and the deployment steps i
 
 1. Make sure the working tree contains only the intended changes, and that `CHANGELOG.md` describes them.
 2. Update `version` in `package.json` if the release changes it, and make the matching entry in `CHANGELOG.md`.
-3. Run `npm ci`. If the interface changed, run `npm run screenshots` and review the three PNG files in `docs/screenshots/`
-   (section 6). Then run `npm run manifest`, then `npm run seal`. Keep the `SEALED` line and the receipt with the release
-   record.
+3. Run `npm ci`. If the interface changed, run `npm run screenshots` and review the three PNG files in
+   `docs/screenshots/` (section 6). Then run `npm run manifest`, then `npm run seal`. Keep the `SEALED` line and the
+   receipt with the release record.
 4. Confirm that the CI workflow passes on the release commit.
-5. On the deployment host, update the code, run `scripts/install-linux.sh`, then `npm run smoke:runtime -- --with-tools` and
-   `npm run smoke:gateway`. Keep the `RUNTIME_VALIDATED` and `GATEWAY_VALIDATED` output with the release record.
+5. On the deployment host, update the code, run `scripts/install-linux.sh`, then `npm run smoke:runtime -- --with-tools`
+   and `npm run smoke:gateway`. Keep the `RUNTIME_VALIDATED` and `GATEWAY_VALIDATED` output with the release record.
 6. Tag the commit with the version number, and publish the release notes from `CHANGELOG.md`.
 
 ## 6. Screenshots (not a gate)

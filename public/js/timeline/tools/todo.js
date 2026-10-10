@@ -4,7 +4,9 @@
  */
 
 import { h } from '../../dom.js';
-import { chip, errorBlock, keyValueList, mutedNote, prettyJson, statusOf, toolShell, cappedList, verbOf } from './shell.js';
+import {
+  chip, errorBlock, keyValueList, mutedNote, prettyJson, statusOf, toolShell, cappedList, verbOf,
+} from './shell.js';
 import { firstLine, isRecord, resultText, str, truncate } from './summaries.js';
 
 const MARKS = { pending: '○', in_progress: '◐', completed: '✓' };

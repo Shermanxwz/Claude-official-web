@@ -12,6 +12,8 @@ import { openMenu } from './menu.js';
  */
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto', 'dontAsk'];
+/** Live states in which a turn runs or a request waits for the user; a rewind is refused meanwhile. */
+const BUSY_STATES = ['running', 'requires_action'];
 const CONTEXT_WARN_PERCENT = 80;
 const MOBILE_QUERY = '(max-width: 767.98px)';
 
@@ -332,7 +334,9 @@ export function createHeader({ container, api, store, t, actions }) {
       label: t(`common.mode.${m}`),
       title: t(`common.mode.${m}.hint`),
     }));
-    if (!modeValue) modeOptions.unshift({ value: '', label: t('header.mode.settings'), title: t('composer.modeWord.settings') });
+    if (!modeValue) {
+      modeOptions.unshift({ value: '', label: t('header.mode.settings'), title: t('composer.modeWord.settings') });
+    }
     else if (!modes.includes(modeValue)) modeOptions.push({ value: modeValue, label: modeValue, title: '' });
 
     const effortValue = settings.effort ?? '';
@@ -493,9 +497,15 @@ export function createHeader({ container, api, store, t, actions }) {
    * @param {{disabled?: boolean, label?: string, checked?: boolean}} [extra]  checked: a checkable row
    */
   function menuItem(labelKey, iconName, onSelect, extra = {}) {
-    /** @type {{label: string, icon: string, disabled: boolean, onClick: () => void, checked?: boolean}} */
-    const item = { label: extra.label ?? t(labelKey), icon: iconName, disabled: Boolean(extra.disabled), onClick: onSelect };
+    /**
+     * @type {{label: string, icon: string, disabled: boolean, onClick: () => void, checked?: boolean,
+     *   title?: string}}
+     */
+    const item = {
+      label: extra.label ?? t(labelKey), icon: iconName, disabled: Boolean(extra.disabled), onClick: onSelect,
+    };
     if (extra.checked !== undefined) item.checked = extra.checked;
+    if (extra.title) item.title = extra.title;
     return item;
   }
 
@@ -539,6 +549,8 @@ export function createHeader({ container, api, store, t, actions }) {
     const live = id ? (s.live?.[id] ?? null) : null;
     const locked = Boolean(id && (live?.lockedBy === 'terminal' || s.terminal?.[id]?.attached));
     const editable = Boolean(id) && !readOnly && !locked;
+    // The runtime refuses a rewind while a turn runs or a request waits (409 CONFLICT), so the item waits too.
+    const busy = Boolean(id) && (BUSY_STATES.includes(live?.state) || (s.pending?.[id]?.length ?? 0) > 0);
     const mobile = globalThis.matchMedia?.(MOBILE_QUERY)?.matches === true;
     /** @type {Array<any>} */
     const items = [];
@@ -575,7 +587,10 @@ export function createHeader({ container, api, store, t, actions }) {
         }
       }
       items.push('separator');
-      items.push(menuItem('header.rewind', 'rewind', () => actions.openRewind(), { disabled: !editable }));
+      items.push(menuItem('header.rewind', 'rewind', () => actions.openRewind(), {
+        disabled: !editable || busy,
+        title: busy ? t('header.rewind.busy') : null,
+      }));
       items.push(menuItem('header.fork', 'fork', () => actions.openFork(), { disabled: !editable }));
       if (meta.features?.terminal && profile === 'full') {
         items.push(menuItem('header.terminal', 'terminal', () => actions.openTerminal(), { disabled: locked }));

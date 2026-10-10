@@ -430,7 +430,9 @@ function ofType(events, type) {
 }
 
 /**
- * Starts a new session and delivers its init message.
+ * Starts a new session, lets its initialize handshake be answered, and delivers its init message (Claude Code sends
+ * it with the first prompt, which the fake stands in for). The handshake's call is dropped from the query's calls, so
+ * a test sees only the calls its own action makes; the handshake has tests of its own.
  * @param {ReturnType<typeof harness>} h
  * @param {Record<string, unknown>} [input]
  * @param {Record<string, unknown>} [init]
@@ -438,13 +440,41 @@ function ofType(events, type) {
 async function startLive(h, input = { cwd: CWD }, init = {}) {
   const info = await h.host.createSession(input);
   const query = h.engine.queries[h.engine.queries.length - 1];
+  await flush();
+  query.calls.length = 0;
   query.emit(initMessage(info.sessionId, init));
   await flush();
   return { sessionId: info.sessionId, query, info };
 }
 
 /**
- * Opens a persisted session and delivers its init message.
+ * Makes every session query the engine starts answer its initialize handshake with what `answer` returns. The handshake
+ * is sent before createSession returns, so the answer has to be set when the query is made. Trust probes (quiet
+ * queries) keep their own answers.
+ * @param {ReturnType<typeof harness>} h
+ * @param {() => Promise<unknown>} answer
+ */
+function handshakeWith(h, answer) {
+  const makeQuery = h.engine.query;
+  h.engine.query = (args) => {
+    const query = makeQuery(args);
+    if (args.options.persistSession !== false) query.values.initializationResult = answer;
+    return query;
+  };
+}
+
+/** A promise that the test settles itself. */
+function deferred() {
+  /** @type {(value: unknown) => void} */
+  let resolve = () => {};
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Opens a persisted session like startLive: the handshake is answered, its call is dropped, then init is delivered.
  * @param {ReturnType<typeof harness>} h
  * @param {string} sessionId
  * @param {Record<string, unknown>} [settings]
@@ -452,6 +482,8 @@ async function startLive(h, input = { cwd: CWD }, init = {}) {
 async function openLive(h, sessionId, settings) {
   const info = await h.host.openSession(sessionId, settings);
   const query = h.engine.queries[h.engine.queries.length - 1];
+  await flush();
+  query.calls.length = 0;
   query.emit(initMessage(sessionId));
   await flush();
   return { sessionId, query, info };
@@ -605,21 +637,108 @@ describe('EngineHost starting queries', () => {
 });
 
 describe('EngineHost stream state and events', () => {
-  test('system init records the model, mode, version and marks the session idle', async () => {
-    const h = harness();
-    const { sessionId, query } = await startLive(h, { cwd: CWD }, {
-      model: 'claude-x', permissionMode: 'plan', effort: 'low', claude_code_version: '2.1.295',
-    });
-    const info = h.host.liveInfo(sessionId);
-    assert.equal(info.state, 'idle');
-    assert.equal(info.model, 'claude-x');
-    assert.equal(info.permissionMode, 'plan');
-    assert.equal(info.effort, 'low');
-    assert.equal(info.claudeCodeVersion, '2.1.295');
-    const detail = await h.host.getSession(sessionId);
-    assert.equal(detail.init.model, 'claude-x');
+  test('the handshake makes a new session idle before any prompt; the values chosen stand, the version is unknown', async () => {
+    // Claude Code's settings decide the mode when none is chosen, so the gateway has no mode of its own to show.
+    const h = harness({ config: { defaults: { permissionMode: null } } });
+    const info = await h.host.createSession({ cwd: CWD, model: 'sonnet', effort: 'low' });
+    const query = h.engine.queries[0];
+    await flush();
+    assert.deepEqual(query.calls.map((call) => call[0]), ['initializationResult']);
+    const live = h.host.liveInfo(info.sessionId);
+    assert.equal(live.state, 'idle');
+    assert.equal(live.model, 'sonnet');
+    assert.equal(live.permissionMode, null);
+    assert.equal(live.effort, 'low');
+    assert.equal(live.claudeCodeVersion, null);
     assert.deepEqual(ofType(h.events, 'session_state').map((e) => e.data.live.state), ['starting', 'idle']);
     assert.equal(query.closed, false);
+  });
+
+  test('system init then records the model, mode, effort and version that the runtime reports', async () => {
+    const h = harness({ config: { defaults: { permissionMode: null } } });
+    const info = await h.host.createSession({ cwd: CWD, model: 'sonnet', effort: 'low' });
+    const query = h.engine.queries[0];
+    await flush();
+    query.emit(initMessage(info.sessionId, {
+      model: 'claude-x', permissionMode: 'plan', effort: 'low', claude_code_version: '2.1.295',
+    }));
+    await flush();
+    const live = h.host.liveInfo(info.sessionId);
+    assert.equal(live.state, 'idle');
+    assert.equal(live.model, 'claude-x');
+    assert.equal(live.permissionMode, 'plan');
+    assert.equal(live.effort, 'low');
+    assert.equal(live.claudeCodeVersion, '2.1.295');
+    const detail = await h.host.getSession(info.sessionId);
+    assert.equal(detail.init.model, 'claude-x');
+    assert.deepEqual(ofType(h.events, 'session_state').map((e) => e.data.live.state), ['starting', 'idle', 'idle']);
+    assert.equal(query.closed, false);
+  });
+
+  test('a stream that never sends init still becomes idle once the handshake is answered, with one publish for it', async () => {
+    const h = harness();
+    const info = await h.host.createSession({ cwd: CWD });
+    const query = h.engine.queries[0];
+    await flush();
+    assert.equal(h.host.liveInfo(info.sessionId).state, 'idle');
+    assert.equal((await h.host.getSession(info.sessionId)).init, null, 'no system/init has arrived');
+    assert.deepEqual(query.calls.map((call) => call[0]), ['initializationResult']);
+    assert.equal(ofType(h.events, 'session_state').filter((event) => event.data.live?.state === 'idle').length, 1);
+    await flush();
+    assert.equal(h.host.liveInfo(info.sessionId).state, 'idle');
+    assert.equal(ofType(h.events, 'session_state').filter((event) => event.data.live?.state === 'idle').length, 1);
+    assert.equal(query.closed, false);
+  });
+
+  test('a handshake that is refused leaves the session starting, publishes nothing, and a later init still makes it idle',
+    async () => {
+      const h = harness();
+      handshakeWith(h, () => Promise.reject(new Error('refused by the runtime')));
+      const info = await h.host.createSession({ cwd: CWD });
+      const query = h.engine.queries[0];
+      await flush();
+      assert.equal(h.host.liveInfo(info.sessionId).state, 'starting');
+      assert.deepEqual(ofType(h.events, 'session_state').map((event) => event.data.live.state), ['starting']);
+      assert.deepEqual(ofType(h.events, 'notice'), []);
+      assert.ok(h.logs.some((entry) => entry.msg === 'initialize handshake not answered'), 'the refusal is logged');
+      assert.equal(query.closed, false);
+      query.emit(initMessage(info.sessionId));
+      await flush();
+      assert.equal(h.host.liveInfo(info.sessionId).state, 'idle');
+    });
+
+  test('a session closed before its handshake is answered is not revived by the answer', async () => {
+    const h = harness();
+    const answer = deferred();
+    handshakeWith(h, () => answer.promise);
+    const info = await h.host.createSession({ cwd: CWD });
+    await flush();
+    assert.equal(h.host.liveInfo(info.sessionId).state, 'starting');
+    await h.host.closeSession(info.sessionId);
+    assert.equal(h.host.liveInfo(info.sessionId), null);
+    const published = h.events.length;
+    answer.resolve(structuredClone(DEFAULT_INIT));
+    await flush();
+    assert.equal(h.host.liveInfo(info.sessionId), null, 'the closed session stays closed');
+    assert.deepEqual(h.events.slice(published), [], 'and the answer publishes nothing for it');
+  });
+
+  test('a handshake that is not answered within 60 s changes nothing: the session stays starting', async (t) => {
+    // The folder is not trusted, so no trust probe runs; the timers are faked before the session starts.
+    const h = harness({ trusted: async () => false });
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    handshakeWith(h, () => new Promise(() => {}));
+    const info = await h.host.createSession({ cwd: CWD });
+    const query = h.engine.queries[0];
+    await flush();
+    t.mock.timers.tick(59_999);
+    await flush();
+    assert.equal(h.host.liveInfo(info.sessionId).state, 'starting');
+    t.mock.timers.tick(1);
+    await flush();
+    assert.equal(h.host.liveInfo(info.sessionId).state, 'starting');
+    assert.equal(query.closed, false);
+    assert.ok(h.logs.some((entry) => entry.msg === 'initialize handshake not answered'), 'the timeout is logged');
   });
 
   test('every SDK message is published with its sequence number and kept in the ring', async () => {
@@ -1466,7 +1585,8 @@ describe('EngineHost rewind', () => {
     await h.host.rewind(S1, { userMessageId: 'u-2', mode: 'code' });
     assert.equal(h.engine.queries.length, 1);
     assert.equal(h.engine.queries[0].options.resume, S1);
-    assert.deepEqual(h.engine.queries[0].calls, [['rewindFiles', 'u-2', { dryRun: false }]]);
+    // The query answers its handshake when it starts; the rewind is its only other call.
+    assert.deepEqual(h.engine.queries[0].calls, [['initializationResult'], ['rewindFiles', 'u-2', { dryRun: false }]]);
   });
 
   test('a refused file rewind is 422 CANNOT_REWIND with its first line, and nothing restarts', async () => {
@@ -1519,7 +1639,9 @@ describe('EngineHost rewind', () => {
     assert.equal(first.closed, true);
     assert.equal(second.options.resume, S1);
     assert.equal(second.options.resumeSessionAt, 'a-1');
-    assert.equal(h.host.liveInfo(S1).state, 'starting');
+    // The restarted query has answered its handshake, so the session is idle again before any prompt reaches it.
+    assert.deepEqual(second.calls, [['initializationResult']]);
+    assert.equal(h.host.liveInfo(S1).state, 'idle');
     assert.equal(ofType(h.events, 'notice').length, 0);
     assert.equal(h.events.some((event) => event.type === 'session_state' && event.data.live === null), false);
     assert.deepEqual(ofType(h.events, 'sessions_changed').at(-1).data, { reason: 'rewind', sessionId: S1 });
@@ -1552,6 +1674,41 @@ describe('EngineHost rewind', () => {
     const { query } = await openLive(h, S1);
     query.values.rewindFiles = { canRewind: false, error: 'nope' };
     await expectError(h.host.rewind(S1, { userMessageId: 'u-2', mode: 'both' }), 422, 'CANNOT_REWIND');
+    assert.equal(query.closed, false);
+    assert.equal(h.engine.queries.length, 1);
+  });
+
+  test('a running turn refuses every rewind mode, a dry run included, with 409 before anything changes', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    await h.host.sendMessage(S1, { clientMessageId: randomUUID(), text: 'a third question' });
+    assert.equal(h.host.liveInfo(S1).state, 'running');
+    for (const [mode, dryRun] of [['code', false], ['conversation', false], ['both', false], ['code', true],
+      ['conversation', true], ['both', true]]) {
+      await expectError(h.host.rewind(S1, { userMessageId: 'u-2', mode, dryRun }), 409, 'CONFLICT');
+    }
+    await assert.rejects(h.host.rewind(S1, { userMessageId: 'u-2', mode: 'both' }),
+      (error) => error.message === 'Stop the running turn before rewinding this session.');
+    assert.equal(query.closed, false);
+    assert.equal(h.engine.queries.length, 1);
+    assert.equal(query.calls.some(([name]) => name === 'rewindFiles' || name === 'close'), false);
+    assert.equal(ofType(h.events, 'sessions_changed').some((event) => event.data.reason === 'rewind'), false);
+
+    query.emit({ type: 'result', subtype: 'success', is_error: false, uuid: randomUUID(), session_id: S1 });
+    await flush();
+    assert.equal(h.host.liveInfo(S1).state, 'idle');
+    assert.deepEqual(await h.host.rewind(S1, { userMessageId: 'u-2', mode: 'code' }), { files: { ...DEFAULT_REWIND } });
+  });
+
+  test('a session waiting for a permission answer refuses the rewind too', async () => {
+    const h = harness();
+    addSession(h.engine, S1, { messages: turns(S1) });
+    const { query } = await openLive(h, S1);
+    callTool(query, 'Bash', { command: 'ls' }, { requestId: 'r-1' });
+    await flush();
+    assert.equal(h.host.liveInfo(S1).state, 'requires_action');
+    await expectError(h.host.rewind(S1, { userMessageId: 'u-2', mode: 'conversation' }), 409, 'CONFLICT');
     assert.equal(query.closed, false);
     assert.equal(h.engine.queries.length, 1);
   });
@@ -1610,6 +1767,43 @@ describe('EngineHost capabilities', () => {
       availableOutputStyles: ['default', 'explanatory'],
     });
     assert.equal(query.calls.filter((call) => call[0] === 'initializationResult').length, 1);
+  });
+
+  test('the MCP servers of the capabilities and of an MCP action keep their tools and lose the secrets of their configs', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    // Secrets exist only in this test: a URL with a password and query values, a header, an argument and an env value.
+    query.values.mcpServerStatus = [{
+      name: 'github',
+      status: 'connected',
+      tools: [{ name: 'search' }],
+      config: { type: 'http', url: 'https://user:pw@mcp.test/sse?token=abc&team=ops', headers: { Authorization: 'Bearer abc' } },
+    }, {
+      name: 'filesystem',
+      status: 'connected',
+      tools: [],
+      config: { type: 'stdio', command: 'npx', args: ['fs', '--api-key', 'abc'], env: { ROOT_TOKEN: 'abc' } },
+    }];
+    const expected = [{
+      name: 'github',
+      status: 'connected',
+      tools: [{ name: 'search' }],
+      config: {
+        type: 'http',
+        url: 'https://mcp.test/sse?token=[redacted]&team=[redacted]',
+        headers: { Authorization: '[redacted]' },
+      },
+    }, {
+      name: 'filesystem',
+      status: 'connected',
+      tools: [],
+      config: { type: 'stdio', command: 'npx', args: ['fs', '--api-key', '[redacted]'], env: { ROOT_TOKEN: '[redacted]' } },
+    }];
+    const caps = await h.host.getCapabilities(sessionId);
+    assert.deepEqual(caps.mcpServers, expected);
+    const answer = await h.host.mcpAction(sessionId, 'github', { action: 'reconnect' });
+    assert.deepEqual(answer.mcpServers, expected);
+    assert.doesNotMatch(JSON.stringify([caps, answer]), /abc|pw@/);
   });
 
   test('capabilities are cached for 30 seconds and read again afterwards', async () => {
@@ -1851,7 +2045,7 @@ describe('EngineHost session listing and detail', () => {
     assert.deepEqual(listed.map((session) => session.sessionId), [sessionId, S1]);
     assert.equal(listed[0].summary, 'Fresh');
     assert.equal(listed[0].customTitle, 'Fresh');
-    assert.equal(listed[0].live.state, 'starting');
+    assert.equal(listed[0].live.state, 'idle', 'the handshake is answered, so the new session is idle before a prompt');
     assert.deepEqual(h.engine.calls.at(-1), ['listSessions', { dir: CWD, limit: 100, offset: 0 }]);
   });
 
@@ -3784,7 +3978,8 @@ describe('EngineHost file suggestions, runtime trust and the bypass guard', () =
       ['setCwd', second, { trustAccepted: true, trustedDirectory: second }],
     ]);
     const probes = h.engine.probes.length;
-    assert.equal(await h.host.recordRuntimeTrust(second), 'accepted');
+    // Only the call that ran the handshake answers 'accepted'; a repeat finds the folder trusted.
+    assert.equal(await h.host.recordRuntimeTrust(second), 'already');
     assert.equal(h.engine.probes.length, probes);
   });
 

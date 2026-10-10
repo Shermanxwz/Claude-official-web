@@ -2,7 +2,7 @@
  * Pure formatting helpers shared by the timeline and tool cards. No DOM access; importable in Node.
  */
 
-const ANSI_RE = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[@-Z\\-_]|\u009b[0-?]*[ -/]*[@-~]/g;
+const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x9b[0-?]*[ -/]*[@-~]/g;
 
 /**
  * Milliseconds as a short human duration: "850 ms", "2.4 s", "1m 15s", "1h 1m".
@@ -123,8 +123,8 @@ export function stripAnsi(str) {
 }
 
 /**
- * The key of a count-aware message in a locale: `${base}.one` for the singular form, `${base}.other` for the rest. Every
- * locale file carries both forms; a locale without a separate singular (zh-CN) gives the same text for both.
+ * The key of a count-aware message in a locale: `${base}.one` for the singular form, `${base}.other` for the rest.
+ * Every locale file carries both forms; a locale without a separate singular (zh-CN) gives the same text for both.
  * @param {string} base  e.g. 'cards.task.tools'
  * @param {number} count
  * @param {string} locale  e.g. 'en' or 'zh-CN'

@@ -42,6 +42,41 @@ function isWithinRoots(path, roots) {
   return roots.some((root) => path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}\\`));
 }
 
+/** @returns {boolean} true when no element holds the focus, which is what a re-rendered or disabled control leaves */
+function focusIsLost() {
+  return document.activeElement === null || document.activeElement === document.body;
+}
+
+/**
+ * Moves the focus to the first of `targets` that takes it. A disabled button does not, so the next one is tried.
+ * @param {Array<HTMLElement | null | undefined>} targets in order of preference
+ */
+function focusFirstOf(targets) {
+  for (const target of targets) {
+    if (!target?.isConnected) continue;
+    target.focus({ preventScroll: true });
+    if (document.activeElement === target) return;
+  }
+}
+
+/**
+ * Where the focus goes after a folder list was drawn again because the user acted on it. `focus.row` is the path of the
+ * row that was activated, or of the folder that was left: that row when the new list has it, else the first row, else
+ * the fallbacks in order. The focus moves only while it is still the list's own: it fell to the page body, or it is on
+ * the list or one of the fallbacks. A focus the user moved elsewhere stays where it is.
+ * @param {HTMLElement} list
+ * @param {{row: string | null} | null} focus null when the list is drawn without the user's action
+ * @param {Array<HTMLElement | null | undefined>} fallbacks
+ */
+function restoreListFocus(list, focus, fallbacks) {
+  if (focus === null) return;
+  const active = document.activeElement;
+  if (!(focusIsLost() || list.contains(active) || fallbacks.includes(active))) return;
+  const rows = [...list.querySelectorAll('.dir-row')];
+  const preferred = focus.row === null ? undefined : rows.find((row) => row.dataset.path === focus.row);
+  focusFirstOf([preferred, rows[0], ...fallbacks]);
+}
+
 /**
  * @param {{
  *   api: { get(path: string): Promise<any>, post(path: string, body?: unknown): Promise<any> },
@@ -82,7 +117,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   const upButton = h('button', {
     class: 'btn btn-ghost btn-sm dir-up',
     attrs: { type: 'button', 'aria-label': t('shell.newSession.up') },
-    on: { click: () => load(parentPath) },
+    on: { click: () => load(parentPath, { row: currentPath }) },
   }, icon('chevron-right'), h('span', { text: t('shell.newSession.up') }));
 
   const folderNameInput = h('input', {
@@ -186,7 +221,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   const extraUp = h('button', {
     class: 'btn btn-ghost btn-sm',
     attrs: { type: 'button', 'aria-label': t('shell.newSession.up') },
-    on: { click: () => loadExtra(extraParent) },
+    on: { click: () => loadExtra(extraParent, { row: extraPath }) },
   }, icon('chevron-right'), h('span', { text: t('shell.newSession.up') }));
   const extraAdd = h('button', {
     class: 'btn btn-secondary btn-sm',
@@ -260,11 +295,15 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   /** @param {boolean} [force] */
   function toggleNewFolder(force) {
     const open = force ?? newFolderRow.hidden;
+    // A row that hides while it holds the focus (Escape in its name field) hands the focus back to its button.
+    const hadFocus = newFolderRow.contains(document.activeElement);
     newFolderRow.hidden = !open;
     newFolderButton.setAttribute('aria-expanded', String(open));
     if (open) {
       folderNameInput.value = '';
       folderNameInput.focus();
+    } else if (hadFocus) {
+      focusFirstOf([newFolderButton, upButton]);
     }
   }
 
@@ -296,8 +335,8 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     for (const entry of entries) {
       listEl.appendChild(h('li', { class: 'dir-item' }, h('button', {
         class: 'dir-row',
-        attrs: { type: 'button', title: entry.path },
-        on: { click: () => load(entry.path) },
+        attrs: { type: 'button', title: entry.path, 'data-path': entry.path },
+        on: { click: () => load(entry.path, { row: entry.path }) },
       },
       icon('folder'),
       h('span', { class: 'dir-name', text: entry.name }),
@@ -306,8 +345,14 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     }
   }
 
-  /** @param {string | null} path */
-  async function load(path) {
+  /**
+   * Lists a folder. `focus` is set when the user acted on the list (a row, or Up), and says where the focus goes once
+   * the list is drawn again (see restoreListFocus). The focus moves after the buttons are enabled again, so Up can take
+   * it.
+   * @param {string | null} path
+   * @param {{row: string | null} | null} [focus]
+   */
+  async function load(path, focus = null) {
     const token = ++loadToken;
     setBrowsing(true);
     try {
@@ -324,8 +369,16 @@ export function openNewSessionDialog({ api, store, t, actions }) {
       if (token !== loadToken) return;
       showError(errorText(err, t));
     } finally {
-      if (token === loadToken) setBrowsing(false);
+      if (token === loadToken) {
+        setBrowsing(false);
+        restoreListFocus(listEl, focus, [upButton, newFolderButton, dialogCancel()]);
+      }
     }
+  }
+
+  /** @returns {HTMLElement | null} the dialog's Cancel button, the last control that takes the focus after a list */
+  function dialogCancel() {
+    return dialogHandle?.element.querySelector('.dialog-footer .btn-secondary') ?? null;
   }
 
   /** Opens or closes the additional-directory browser; it starts at the folder the session starts in. */
@@ -336,8 +389,12 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     if (open) loadExtra(extraPath ?? currentPath ?? null);
   }
 
-  /** @param {string | null} path */
-  async function loadExtra(path) {
+  /**
+   * Lists a folder of the additional-directory browser. `focus` works as in load.
+   * @param {string | null} path
+   * @param {{row: string | null} | null} [focus]
+   */
+  async function loadExtra(path, focus = null) {
     const token = ++extraToken;
     try {
       const query = path ? `?path=${encodeURIComponent(path)}` : '';
@@ -353,10 +410,11 @@ export function openNewSessionDialog({ api, store, t, actions }) {
       for (const entry of extraEntries) {
         extraList.appendChild(h('li', { class: 'dir-item' }, h('button', {
           class: 'dir-row',
-          attrs: { type: 'button', title: entry.path },
-          on: { click: () => loadExtra(entry.path) },
+          attrs: { type: 'button', title: entry.path, 'data-path': entry.path },
+          on: { click: () => loadExtra(entry.path, { row: entry.path }) },
         }, icon('folder'), h('span', { class: 'dir-name', text: entry.name }), icon('chevron-right'))));
       }
+      restoreListFocus(extraList, focus, [extraUp, extraAdd, extraToggle]);
     } catch (err) {
       if (token !== extraToken) return;
       showError(errorText(err, t));
@@ -384,11 +442,18 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     renderChips();
   }
 
-  /** @param {string} path */
+  /**
+   * Removes a folder from the additional directories. Focus moves to the remove button now in the same place (the next
+   * chip's, else the previous chip's), else to "Add folder", so it never falls back to the page.
+   * @param {string} path
+   */
   function removeExtraDir(path) {
     const index = extraDirs.indexOf(path);
     if (index >= 0) extraDirs.splice(index, 1);
     renderChips();
+    const buttons = /** @type {HTMLButtonElement[]} */ ([...chipsEl.querySelectorAll('.dir-chip-remove')]);
+    const next = buttons[Math.min(Math.max(index, 0), buttons.length - 1)] ?? extraToggle;
+    next.focus();
   }
 
   function renderChips() {
@@ -423,7 +488,7 @@ export function openNewSessionDialog({ api, store, t, actions }) {
     try {
       const created = await api.post('/api/fs/mkdir', { parent: currentPath, name });
       toggleNewFolder(false);
-      await load(created.path);
+      await load(created.path, { row: null });
     } catch (err) {
       showError(errorText(err, t));
     } finally {
@@ -516,13 +581,23 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   /** @type {{ close: () => void, element: HTMLElement } | null} */
   let dialogHandle = null;
 
+  // The controls start in the state they have before any folder is listed. This runs before the dialog opens, because
+  // openDialog focuses the first enabled control: a button that is disabled a moment later would drop the focus.
+  syncActions();
   dialogHandle = openDialog({
     title: t('shell.newSession.title'),
     size: 'lg',
     body,
     actions: [
       { label: t('common.cancel'), kind: 'secondary' },
-      { label: t('shell.newSession.create'), kind: 'primary', keepOpen: true, onClick: () => create() },
+      {
+        label: t('shell.newSession.create'),
+        kind: 'primary',
+        keepOpen: true,
+        // A function: the dialog reads it again when the call settles, so the state at that time decides.
+        disabled: () => browsing || creating || currentPath === null,
+        onClick: () => create(),
+      },
     ],
   });
 
@@ -531,7 +606,6 @@ export function openNewSessionDialog({ api, store, t, actions }) {
   const startPath = remembered && isWithinRoots(remembered, roots)
     ? remembered
     : (roots.length === 1 ? roots[0] : null);
-  syncActions();
   load(startPath).then(() => {
     if (currentPath === null && startPath !== null) return load(null);
     return undefined;

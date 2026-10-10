@@ -1216,6 +1216,8 @@ async function* bashScenario(ctx) {
     },
     { type: 'addDirectories', directories: [join(ctx.cwd, '..')], destination: 'session' },
   ];
+  // The summary comes before the ask, so it names the step the permission request is about.
+  yield taskSummary(ctx, `Running ${input.command}`);
   const decision = yield* ctx.askPermission('Bash', input, {
     toolUseId,
     title: 'Claude wants to run ls -la',
@@ -1225,10 +1227,11 @@ async function* bashScenario(ctx) {
   });
   if (decision.allowed === false) {
     yield toolResult(ctx, { toolUseId, content: decision.message, isError: true });
+    // Nothing runs after a denial: an empty summary clears the line that named the command.
+    yield taskSummary(ctx, '');
     yield* modelResponse(ctx, [{ type: 'text', text: "Understood, I won't run that command." }]);
     return;
   }
-  yield taskSummary(ctx, `Running ${input.command}`);
   yield toolProgress(ctx, toolUseId, 'Bash', 1);
   yield* ctx.pause(ctx.delayMs);
   yield toolResult(ctx, {
@@ -1276,6 +1279,8 @@ async function* editScenario(ctx) {
     { type: 'text', text: 'The port is hard-coded. I will read it from the environment.' },
     { type: 'tool_use', id: editId, name: 'Edit', input: edit },
   ], { stopReason: 'tool_use' });
+  // The summary comes before the ask, so it names the step the permission request is about.
+  yield taskSummary(ctx, 'Editing src/app.js');
   const decision = yield* ctx.askPermission('Edit', edit, {
     toolUseId: editId,
     title: 'Claude wants to edit src/app.js',
@@ -1285,10 +1290,11 @@ async function* editScenario(ctx) {
   });
   if (decision.allowed === false) {
     yield toolResult(ctx, { toolUseId: editId, content: decision.message, isError: true });
+    // Nothing runs after a denial: an empty summary clears the line that named the edit.
+    yield taskSummary(ctx, '');
     yield* modelResponse(ctx, [{ type: 'text', text: "I'll leave the file unchanged." }]);
     return;
   }
-  yield taskSummary(ctx, 'Editing src/app.js');
   yield toolResult(ctx, {
     toolUseId: editId,
     content: `The file ${filePath} has been updated successfully.`,
@@ -1349,6 +1355,8 @@ async function* questionScenario(ctx) {
     { type: 'text', text: 'I need two decisions before I continue.' },
     { type: 'tool_use', id: toolUseId, name: 'AskUserQuestion', input },
   ], { stopReason: 'tool_use' });
+  // The summary comes before the ask, so it names the step the question belongs to.
+  yield taskSummary(ctx, `Asking ${questions.length} questions`);
   const decision = yield* ctx.askPermission('AskUserQuestion', input, {
     toolUseId,
     title: 'Claude has questions for you',
@@ -1357,6 +1365,8 @@ async function* questionScenario(ctx) {
   });
   if (decision.allowed === false) {
     yield toolResult(ctx, { toolUseId, content: decision.message, isError: true });
+    // Nothing runs after a refusal: an empty summary clears the line that named the questions.
+    yield taskSummary(ctx, '');
     yield* modelResponse(ctx, [{ type: 'text', text: 'No problem, I will continue with sensible defaults.' }]);
     return;
   }
@@ -1369,7 +1379,6 @@ async function* questionScenario(ctx) {
     answers[item.question] = text === '' ? '(no answer)' : text;
   }
   const pairs = questions.map((item) => `"${item.question}"="${answers[item.question]}"`).join(', ');
-  yield taskSummary(ctx, `Asking ${questions.length} questions`);
   yield toolResult(ctx, {
     toolUseId,
     content: `User has answered your questions: ${pairs}. You can now continue with the user's answers in mind.`,
@@ -1397,6 +1406,8 @@ async function* planScenario(ctx) {
     { type: 'text', text: 'I will explore the codebase before proposing a plan. The routes and tests come first.' },
     { type: 'tool_use', id: toolUseId, name: 'ExitPlanMode', input: { plan } },
   ], { stopReason: 'tool_use' });
+  // The summary comes before the ask, so it names the step the approval belongs to.
+  yield taskSummary(ctx, 'Presenting the plan for approval');
   const decision = yield* ctx.askPermission('ExitPlanMode', { plan }, {
     toolUseId,
     title: 'Claude has a plan ready',
@@ -1405,10 +1416,11 @@ async function* planScenario(ctx) {
   });
   if (decision.allowed === false) {
     yield toolResult(ctx, { toolUseId, content: decision.message, isError: true });
+    // Nothing runs after a rejection: an empty summary clears the line that named the plan.
+    yield taskSummary(ctx, '');
     yield* modelResponse(ctx, [{ type: 'text', text: "Understood — I'll revise the plan." }]);
     return;
   }
-  yield taskSummary(ctx, 'Presenting the plan for approval');
   yield toolResult(ctx, {
     toolUseId,
     content: 'User has approved your plan. You can now start coding.',
@@ -1596,6 +1608,8 @@ async function* mcpScenario(ctx) {
     { type: 'text', text: 'I will check the open bug reports on GitHub.' },
     { type: 'tool_use', id: toolUseId, name, input },
   ], { stopReason: 'tool_use' });
+  // The summary comes before the ask, so it names the step the permission request is about.
+  yield taskSummary(ctx, 'Searching GitHub issues');
   const decision = yield* ctx.askPermission(name, input, {
     toolUseId,
     mcpServer: { name: 'github', source: 'user' },
@@ -1605,10 +1619,11 @@ async function* mcpScenario(ctx) {
   });
   if (decision.allowed === false) {
     yield toolResult(ctx, { toolUseId, content: decision.message, isError: true });
+    // Nothing runs after a denial: an empty summary clears the line that named the search.
+    yield taskSummary(ctx, '');
     yield* modelResponse(ctx, [{ type: 'text', text: 'Okay, I will not query GitHub.' }]);
     return;
   }
-  yield taskSummary(ctx, 'Searching GitHub issues');
   yield toolProgress(ctx, toolUseId, name, 1);
   yield* ctx.pause(ctx.delayMs);
   yield toolResult(ctx, {

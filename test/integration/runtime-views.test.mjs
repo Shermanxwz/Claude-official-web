@@ -18,6 +18,7 @@ const USER_SETTINGS = {
   },
   hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo before' }] }] },
   env: { API_TOKEN: 'secret-value' },
+  apiKeyHelper: '/usr/local/bin/print-key',
 };
 
 describe('runtime views', { timeout: 120000 }, () => {
@@ -95,6 +96,7 @@ describe('runtime views', { timeout: 120000 }, () => {
     const res = await api.get(`/api/sessions/${live.sessionId}/runtime/settings`);
     assert.equal(res.status, 200);
     assert.equal(res.json.data.effective.env.API_TOKEN, '[redacted]');
+    assert.equal(res.json.data.effective.apiKeyHelper, '/usr/local/bin/print-key', 'a script path is not a secret');
     assert.equal(res.text.includes('secret-value'), false, 'the secret never leaves the gateway');
     assert.equal(res.json.data.effective.permissions.defaultMode, 'acceptEdits');
     assert.ok(res.json.data.applied, 'the applied values are part of the view');
@@ -163,5 +165,58 @@ describe('runtime views the query does not offer', { timeout: 120000 }, () => {
     assert.equal(listed.json.views.includes('status'), false);
     assert.ok(listed.json.views.includes('permissions'));
     assertError(await api.get(`/api/sessions/${live.sessionId}/runtime/status`), 501, 'FEATURE_UNAVAILABLE');
+  });
+});
+
+describe('runtime views: the secrets of MCP servers', { timeout: 120000 }, () => {
+  /** @type {Awaited<ReturnType<typeof startTestServer>>} */
+  let server;
+  /** @type {ReturnType<typeof client>} */
+  let api;
+  before(async () => {
+    // The mock's servers carry no configuration. The runtime's do, with the headers and env the operator's files set.
+    server = await startTestServer({}, {
+      wrapEngine: (engine) => ({
+        ...engine,
+        query: (args) => {
+          const query = engine.query(args);
+          const status = query.mcpServerStatus;
+          query.mcpServerStatus = async () => (await status()).map((entry) => (entry.name === 'github'
+            ? {
+              ...entry,
+              config: {
+                type: 'http',
+                url: 'https://mcp.example.test/sse?access_token=top-secret&page=2',
+                headers: { Authorization: 'Bearer top-secret' },
+                env: { GH_TOKEN: 'top-secret' },
+                args: ['--token', 'top-secret', '--tokenizer', 'bpe'],
+              },
+            }
+            : entry));
+          return query;
+        },
+      }),
+    });
+    api = client(server.url);
+    await api.login();
+  });
+  after(async () => {
+    await server.close();
+  });
+
+  it('the mcp view answers each server config with its headers and env values hidden', async () => {
+    const live = await createLive(api, { cwd: server.proj });
+    const res = await api.get(`/api/sessions/${live.sessionId}/runtime/mcp`);
+    assert.equal(res.status, 200);
+    const github = res.json.data.find((entry) => entry.name === 'github');
+    assert.equal(github.status, 'connected');
+    assert.deepEqual(github.config, {
+      type: 'http',
+      url: 'https://mcp.example.test/sse?access_token=[redacted]&page=[redacted]',
+      headers: { Authorization: '[redacted]' },
+      env: { GH_TOKEN: '[redacted]' },
+      args: ['--token', '[redacted]', '--tokenizer', 'bpe'],
+    });
+    assert.equal(res.text.includes('top-secret'), false, 'the secret never leaves the gateway');
   });
 });

@@ -9,16 +9,14 @@ import { AppError } from '../../src/contracts.mjs';
  * @param {Record<string, unknown[]>} transcripts
  */
 function fixture(sessions, transcripts = {}) {
-  /** @type {Array<{limit: number, offset: number}>} */
-  const pages = [];
   /** @type {string[]} */
   const reads = [];
-  return {
-    pages,
+  const data = {
+    listings: 0,
     reads,
-    listSessions: async ({ limit, offset }) => {
-      pages.push({ limit, offset });
-      return sessions.slice(offset, offset + limit).map((session) => ({ cwd: '/work/alpha', ...session }));
+    listAll: async () => {
+      data.listings += 1;
+      return sessions.map((session) => ({ cwd: '/work/alpha', ...session }));
     },
     getSessionMessages: async (/** @type {string} */ sessionId) => {
       reads.push(sessionId);
@@ -27,6 +25,7 @@ function fixture(sessions, transcripts = {}) {
       return messages;
     },
   };
+  return data;
 }
 
 /** @param {string} text */
@@ -132,6 +131,7 @@ describe('session search', () => {
     const outcome = await createSessionSearch(data).search('deploy', 20);
     assert.equal(outcome.scanned, 50);
     assert.deepEqual(outcome.results, []);
+    assert.equal(outcome.truncated, true, 'ten older sessions were not read');
 
     const newer = fixture(
       [session('a', 300), session('b', 200), session('c', 100)],
@@ -175,13 +175,44 @@ describe('session search', () => {
     assert.equal(outcome.scanned, 2);
   });
 
-  test('the listing is read page by page until a short page ends it', async () => {
-    const sessions = Array.from({ length: 501 }, (_, i) => session(`s${i}`, 1000 - i, { customTitle: `title ${i}` }));
+  test('the listing is read once, however many sessions it holds, and no transcript is read twice', async () => {
+    const sessions = Array.from({ length: 1200 }, (_, i) => session(`s${i}`, 5000 - i, { customTitle: `title ${i}` }));
     const data = fixture(sessions);
     const outcome = await createSessionSearch(data).search('title 49', 50);
-    assert.deepEqual(data.pages, [{ limit: 500, offset: 0 }, { limit: 500, offset: 500 }]);
+    assert.equal(data.listings, 1);
     assert.ok(outcome.results.some((r) => r.title === 'title 49'));
-    assert.equal(outcome.scanned, 0);
+    assert.equal(outcome.scanned, 0, 'every transcript read failed, so none counts as scanned');
+    assert.equal(new Set(data.reads).size, data.reads.length, 'each transcript is read at most once');
+    assert.equal(data.reads.length, 50, 'the cap of 50 unmatched sessions holds');
+    assert.equal(outcome.truncated, true);
+  });
+
+  test('a match on the 55th most recent session is outside the cap: not found, and truncated', async () => {
+    const sessions = Array.from({ length: 60 }, (_, i) => session(`s${i}`, 1000 - i));
+    const transcripts = Object.fromEntries(sessions.map((s) => [s.sessionId, [userTurn('the word here')]]));
+    transcripts.s54 = [userTurn('deploy from the 55th most recent')];
+    const outcome = await createSessionSearch(fixture(sessions, transcripts)).search('deploy', 20);
+    assert.deepEqual(outcome.results, []);
+    assert.equal(outcome.scanned, 50);
+    assert.equal(outcome.truncated, true);
+  });
+
+  test('a listing of exactly the cap is searched in full and is not truncated', async () => {
+    const sessions = Array.from({ length: 50 }, (_, i) => session(`s${i}`, 1000 - i));
+    const transcripts = Object.fromEntries(sessions.map((s) => [s.sessionId, [userTurn('nothing')]]));
+    transcripts.s49 = [userTurn('deploy from the 50th most recent')];
+    const outcome = await createSessionSearch(fixture(sessions, transcripts)).search('deploy', 20);
+    assert.deepEqual(outcome.results.map((r) => r.sessionId), ['s49']);
+    assert.equal(outcome.scanned, 50);
+    assert.equal(outcome.truncated, false);
+  });
+
+  test('a title match is found beyond the cap, and the answer says that older transcripts were not read', async () => {
+    const sessions = Array.from({ length: 60 }, (_, i) => session(`s${i}`, 1000 - i,
+      i === 54 ? { customTitle: 'deploy' } : {}));
+    const outcome = await createSessionSearch(fixture(sessions)).search('deploy', 20);
+    assert.deepEqual(outcome.results.map((r) => [r.sessionId, r.matchedIn]), [['s54', 'title']]);
+    assert.equal(outcome.truncated, true);
   });
 
   test('a query that matches nothing answers no results with the number of transcripts it read', async () => {
@@ -190,12 +221,25 @@ describe('session search', () => {
       results: [],
       scanned: 2,
       truncated: false,
+      scanLimit: 50,
     });
+  });
+
+  test('every answer names the scan cap, so the client can say how far the search reached', async () => {
+    const sessions = Array.from({ length: 60 }, (_, i) => session(`s${i}`, 1000 - i));
+    const transcripts = Object.fromEntries(sessions.map((s) => [s.sessionId, [userTurn('nothing')]]));
+    const beyond = await createSessionSearch(fixture(sessions, transcripts)).search('deploy', 5);
+    assert.equal(beyond.scanLimit, 50);
+    assert.equal(beyond.truncated, true);
+    const named = fixture([session('s1', 1, { customTitle: 'deploy' })]);
+    const titled = await createSessionSearch(named).search('deploy', 5);
+    assert.equal(titled.scanLimit, 50, 'a title match answers the cap too');
+    assert.equal(titled.scanned, 0);
   });
 
   test('a session without a working folder answers a null cwd', async () => {
     const data = {
-      listSessions: async () => [{ sessionId: 's1', lastModified: 1, customTitle: 'deploy' }],
+      listAll: async () => [{ sessionId: 's1', lastModified: 1, customTitle: 'deploy' }],
       getSessionMessages: async () => [],
     };
     const [result] = (await createSessionSearch(data).search('deploy', 5)).results;

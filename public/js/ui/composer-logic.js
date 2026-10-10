@@ -126,9 +126,9 @@ export function filterCommands(items, query) {
 }
 
 /**
- * Builds the slash palette rows: the GUI commands first, then the Claude Code commands. A GUI command that a Claude Code
- * command or alias also uses keeps its row and is marked `shadowed` (the palette badges it "Panel"); picking the Claude
- * Code row types the command, picking the GUI row runs the panel or action.
+ * Builds the slash palette rows: the GUI commands first, then the Claude Code commands. A GUI command that a Claude
+ * Code command or alias also uses keeps its row and is marked `shadowed` (the palette badges it "Panel"); picking the
+ * Claude Code row types the command, picking the GUI row runs the panel or action.
  * @param {Array<{name?: string, description?: string, argumentHint?: string, aliases?: string[], builtin?: boolean}>}
  *   sdkCommands  capabilities.commands
  * @param {GuiCommandSpec[]} guiCommands
@@ -203,6 +203,24 @@ export function modeWordKey(mode) {
     case 'bypassPermissions': return 'composer.modeWord.bypassPermissions';
     case 'dontAsk': return 'composer.modeWord.dontAsk';
     default: return 'composer.modeWord.settings';
+  }
+}
+
+/**
+ * The short name of a permission mode for the footer on a phone ("Ask", "Accept edits"...). The full name stays in the
+ * footer's tooltip and in the mode menu.
+ * @param {string | null} mode
+ * @returns {string} the message key of the short name
+ */
+export function modeShortKey(mode) {
+  switch (mode) {
+    case 'default': return 'composer.modeShort.default';
+    case 'acceptEdits': return 'composer.modeShort.acceptEdits';
+    case 'plan': return 'composer.modeShort.plan';
+    case 'auto': return 'composer.modeShort.auto';
+    case 'bypassPermissions': return 'composer.modeShort.bypassPermissions';
+    case 'dontAsk': return 'composer.modeShort.dontAsk';
+    default: return 'composer.modeShort.settings';
   }
 }
 
@@ -293,7 +311,9 @@ export function stepHistory(state, action, entries, current) {
  * @returns {string[]}
  */
 export function promptHistory(transcript, sent) {
-  const seen = Array.isArray(transcript) ? transcript.filter((text) => typeof text === 'string' && text.trim() !== '') : [];
+  const seen = Array.isArray(transcript)
+    ? transcript.filter((text) => typeof text === 'string' && text.trim() !== '')
+    : [];
   const extra = (Array.isArray(sent) ? sent : []).filter((text) => typeof text === 'string' && !seen.includes(text));
   const newestFirst = [...seen, ...extra].reverse();
   return newestFirst.filter((text, index) => index === 0 || text !== newestFirst[index - 1]);

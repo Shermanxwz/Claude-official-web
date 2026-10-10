@@ -15,6 +15,7 @@ import {
 } from '../../src/engine/mock/index.mjs';
 import { createMockQuery } from '../../src/engine/mock/query.mjs';
 import { createMockStore, newRecord } from '../../src/engine/mock/store.mjs';
+import { createModel } from '../../public/js/timeline/model.js';
 import { SCENARIO_NAMES, selectScenario } from '../../src/engine/mock/scenarios.mjs';
 
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
@@ -156,14 +157,19 @@ async function runSingle(adapter, cwd, text, options = {}, uuid = randomUUID()) 
 }
 
 /**
- * Checks the invariants every mock sequence keeps: init first, one session id, unique uuids, every streamed message id
- * finished by an assistant message, and every tool_use answered by a tool_result. Returns the result messages.
+ * Checks the invariants every mock sequence keeps: the first prompt's lifecycle states come before system/init (the
+ * first system message of the session), one session id, unique uuids, every streamed message id finished by an
+ * assistant message, and every tool_use answered by a tool_result. Returns the result messages.
  * @param {any[]} messages
  */
 function assertWellFormed(messages) {
-  assert.equal(messages[0]?.type, 'system', 'the first message is a system message');
-  assert.equal(messages[0].subtype, 'init', 'the first message is init');
-  const sessionId = messages[0].session_id;
+  const init = messages.findIndex((message) => message.type === 'system');
+  assert.equal(messages[init]?.subtype, 'init', 'the first system message is init');
+  // Like Claude Code 2.1.295, the mock announces the first prompt as queued and started before init.
+  assert.ok(messages.slice(0, init).every((message) => message.type === 'command_lifecycle'
+    && (message.state === 'queued' || message.state === 'started')),
+  'only the queued and started states of the first prompt come before init');
+  const sessionId = messages[init].session_id;
   const uuids = new Set();
   const streamed = new Set();
   const finished = new Set();
@@ -241,6 +247,9 @@ const pickFirstAnswers = async (/** @type {string} */ name, /** @type {any} */ i
   const answers = Object.fromEntries(input.questions.map((question) => [question.question, question.options[0].label]));
   return { behavior: 'allow', updatedInput: { ...input, answers } };
 };
+
+/** A task summary: the one-line activity the timeline shows beside the running turn. */
+const isSummary = (/** @type {any} */ message) => message.type === 'system' && message.subtype === 'task_summary';
 
 const SCENARIO_PROMPTS = {
   compact: '/compact',
@@ -613,11 +622,15 @@ describe('interrupt, abort and close', () => {
 
   test('interrupt with no turn running resolves without effect', async (t) => {
     const channel = promptChannel();
-    channel.end();
     const query = adapterAt(tempDir(t)).query({ prompt: channel.stream, options: { cwd: projectDir(t) } });
     assert.deepEqual(await query.interrupt(), { still_queued: [] });
+    channel.push(userPrompt('Tell me something'));
+    channel.end();
     const messages = await collect(query);
-    assert.deepEqual(messages.map((m) => m.subtype ?? m.type), ['init', 'autocompact_state', 'active_goal']);
+    assert.deepEqual(messages.slice(0, 5).map((m) => m.subtype ?? m.type),
+      ['command_lifecycle', 'command_lifecycle', 'init', 'autocompact_state', 'active_goal']);
+    assert.equal(messages.filter((m) => m.type === 'result')[0].subtype, 'success');
+    assertWellFormed(messages);
   });
 
   test('an aborted controller ends the stream without a result, and later calls reject', async (t) => {
@@ -692,8 +705,8 @@ async function pullUntil(query, until) {
 }
 
 /**
- * A query whose prompt stream stays open, with its init message and the two settings messages after it already
- * consumed. It is closed when the test ends.
+ * A query whose prompt stream stays open. Its initialize handshake is answered at once, and nothing is streamed until
+ * the first prompt is pushed (see startedWith). It is closed when the test ends.
  * @param {import('node:test').TestContext} t
  * @param {string} stateDir
  * @param {string} cwd
@@ -717,11 +730,22 @@ async function openOn(t, adapter, cwd, options = {}) {
     channel.end();
     query.close();
   });
-  const init = await query.next();
-  const settings = [await query.next(), await query.next()];
-  assert.deepEqual(settings.map((next) => next.value.type), ['autocompact_state', 'active_goal'],
-    'init is followed by the autocompact and goal settings');
-  return { query, channel, init: init.value };
+  await query.initializationResult();
+  return { query, channel };
+}
+
+/**
+ * Pushes the first prompt of an open query and reads the stream up to the autocompact and goal settings that follow
+ * system/init. Returns the init message. The turn that the prompt starts is still to be read by the test.
+ * @param {any} query
+ * @param {{push: (message: any) => void}} channel
+ * @param {string} [text]
+ */
+async function startedWith(query, channel, text = 'Tell me something') {
+  channel.push(userPrompt(text));
+  const messages = await pullUntil(query, (message) => message.type === 'active_goal');
+  assert.deepEqual(messages.slice(-2).map((message) => message.type), ['autocompact_state', 'active_goal']);
+  return messages.find((message) => message.type === 'system' && message.subtype === 'init');
 }
 
 /** The Agent tool result of a turn: the top-level user message that carries the agent id. */
@@ -834,10 +858,11 @@ describe('persistence across restarts', () => {
   test('a session that never received a prompt is stored but not listed', async (t) => {
     const stateDir = tempDir(t);
     const cwd = projectDir(t);
+    const sessionId = randomUUID();
     const channel = promptChannel();
     channel.end();
-    const messages = await collect(adapterAt(stateDir).query({ prompt: channel.stream, options: { cwd } }));
-    const sessionId = messages[0].session_id;
+    const messages = await collect(adapterAt(stateDir).query({ prompt: channel.stream, options: { cwd, sessionId } }));
+    assert.deepEqual(messages, [], 'nothing is streamed without a prompt');
     const adapter = adapterAt(stateDir);
     assert.deepEqual(await adapter.listSessions({ dir: cwd }), []);
     assert.equal(await adapter.getSessionInfo(sessionId), undefined);
@@ -1405,6 +1430,39 @@ describe('turn linkage', () => {
   });
 });
 
+describe('the first prompt starts the session', () => {
+  test('the handshake is answered at once, and nothing is streamed until the first prompt', async (t) => {
+    const channel = promptChannel();
+    const query = adapterAt(tempDir(t)).query({
+      prompt: channel.stream,
+      options: { cwd: projectDir(t), includePartialMessages: true },
+    });
+    t.after(() => {
+      channel.end();
+      query.close();
+    });
+    const handshake = await query.initializationResult();
+    assert.ok(handshake.commands.some((command) => command.name === 'compact'));
+    const pending = query.next();
+    const meanwhile = await Promise.race([pending.then(() => 'streamed'), pause(50).then(() => 'quiet')]);
+    assert.equal(meanwhile, 'quiet', 'the session waits for its first prompt and streams nothing before it');
+    const promptUuid = randomUUID();
+    channel.push(userPrompt('Tell me something', promptUuid));
+    const messages = [(await pending).value, ...(await pullUntil(query, isTurnEnd))];
+    // As in Claude Code 2.1.295: the prompt is announced as queued and as started, then come system/init, the settings
+    // that follow it, and the turn.
+    assert.deepEqual(messages.slice(0, 5).map((message) => message.type),
+      ['command_lifecycle', 'command_lifecycle', 'system', 'autocompact_state', 'active_goal']);
+    assert.deepEqual([messages[0].state, messages[0].command_uuid], ['queued', promptUuid]);
+    assert.deepEqual([messages[1].state, messages[1].command_uuid], ['started', promptUuid]);
+    assert.equal(messages[2].subtype, 'init');
+    assert.equal(messages.filter((message) => message.type === 'system' && message.subtype === 'init').length, 1);
+    assert.equal(messages.filter((message) => message.type === 'result').length, 1);
+    assert.equal(messages.find((message) => message.type === 'result').subtype, 'success');
+    assertWellFormed(messages);
+  });
+});
+
 describe('runtime messages around each turn', () => {
   test('a prompt goes queued, started and completed around its turn', async (t) => {
     const uuid = randomUUID();
@@ -1488,6 +1546,65 @@ describe('runtime messages around each turn', () => {
     }
   });
 
+  test('each permission is asked after the summary of its step, so the summary names the step being approved',
+    async (t) => {
+      const cases = [
+        ['run the tool', 'Running ls -la', allowAll],
+        ['edit the server file', 'Editing src/app.js', allowAll],
+        ['ask me a question', 'Asking 2 questions', pickFirstAnswers],
+        ['make a plan', 'Presenting the plan for approval', allowAll],
+        ['check mcp issues', 'Searching GitHub issues', allowAll],
+      ];
+      for (const [text, step, decide] of cases) {
+        const messages = [];
+        let askedAt = -1;
+        const canUseTool = async (name, input, options) => {
+          askedAt = messages.length;
+          return decide(name, input, options);
+        };
+        const channel = promptChannel();
+        channel.push(userPrompt(text));
+        channel.end();
+        const options = { cwd: projectDir(t), canUseTool };
+        const query = adapterAt(tempDir(t)).query({ prompt: channel.stream, options });
+        for await (const message of query) messages.push(message);
+        const summary = messages.findIndex((m) => isSummary(m) && m.detail === step);
+        assert.ok(askedAt >= 0, `${text}: the permission is asked`);
+        assert.ok(summary >= 0 && summary < askedAt, `${text}: the summary comes before the permission request`);
+      }
+    });
+
+  test('a denied step ends with an empty summary before the reply, and the timeline drops the line it named',
+    async (t) => {
+      const deny = async () => ({ behavior: 'deny', message: 'Not this time' });
+      const cases = [
+        ['run the tool', 'Running ls -la', "Understood, I won't run that command."],
+        ['edit the server file', 'Editing src/app.js', "I'll leave the file unchanged."],
+        ['ask me a question', 'Asking 2 questions', 'No problem, I will continue with sensible defaults.'],
+        ['make a plan', 'Presenting the plan for approval', "Understood — I'll revise the plan."],
+        ['check mcp issues', 'Searching GitHub issues', 'Okay, I will not query GitHub.'],
+      ];
+      for (const [text, step, reply] of cases) {
+        const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), text, { canUseTool: deny });
+        const announced = messages.findIndex((m) => isSummary(m) && m.detail === step);
+        const cleared = messages.findIndex((m, index) => index > announced && isSummary(m));
+        assert.ok(announced >= 0, `${text}: the step is announced`);
+        assert.equal(messages[cleared]?.detail, '', `${text}: the next summary clears the step`);
+        assert.ok(messages.findIndex((m) => m.type === 'assistant'
+          && m.message.content.some((b) => b.type === 'text' && b.text === reply)) > cleared,
+        `${text}: the reply comes after the step is cleared`);
+
+        const timeline = createModel();
+        const lines = messages.map((message) => {
+          timeline.applyLiveEvent(message);
+          return timeline.getRunState().activity;
+        });
+        assert.equal(lines[announced], step, `${text}: the timeline shows the step while the turn runs`);
+        assert.ok(lines.slice(cleared).every((line) => line === null), `${text}: no stale step line after the denial`);
+        assert.equal(timeline.getRunState().running, false, `${text}: the turn has ended`);
+      }
+    });
+
   test('each result is followed by a post_turn_summary that names the last assistant message', async (t) => {
     const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Tell me something about the project');
     const summaries = messages.filter((m) => m.type === 'system' && m.subtype === 'post_turn_summary');
@@ -1563,15 +1680,17 @@ describe('runtime messages around each turn', () => {
 
   test('autocompact_state and active_goal come once each, right after init', async (t) => {
     const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Tell me something');
-    assert.deepEqual(messages.slice(0, 3).map((m) => m.type), ['system', 'autocompact_state', 'active_goal']);
-    assert.deepEqual(messages[1].value, {
+    assert.deepEqual(messages.slice(0, 5).map((m) => m.type),
+      ['command_lifecycle', 'command_lifecycle', 'system', 'autocompact_state', 'active_goal']);
+    assert.equal(messages[2].subtype, 'init');
+    assert.deepEqual(messages[3].value, {
       enabled: true,
       effective_window: 200000,
       threshold: 167000,
       enforced: true,
       source: 'clientdata',
     });
-    assert.equal(messages[2].value, null);
+    assert.equal(messages[4].value, null);
     assert.equal(messages.filter((m) => m.type === 'autocompact_state').length, 1);
     assert.equal(messages.filter((m) => m.type === 'active_goal').length, 1);
   });
@@ -1665,7 +1784,8 @@ describe('api retries and failures', () => {
 
 describe('model aliases', () => {
   test('each alias names the wire id it resolves to, so the init model matches one row', async (t) => {
-    const { query, init } = await openQuery(t, tempDir(t), projectDir(t));
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
+    const init = await startedWith(query, channel);
     const expected = {
       default: 'claude-sonnet-mock',
       sonnet: 'claude-sonnet-mock',
@@ -1846,8 +1966,9 @@ describe('thinking summaries', () => {
 
 describe('fast mode', () => {
   test('fast mode stays off, with its reason, until the host opts in and the model supports it', async (t) => {
-    const { query, channel, init } = await openQuery(t, tempDir(t), projectDir(t));
-    assert.deepEqual(fastOf(init), { state: 'off', reason: 'sdk_opt_in_required' });
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
+    assert.deepEqual(fastOf(await startedWith(query, channel)), { state: 'off', reason: 'sdk_opt_in_required' });
+    await pullUntil(query, isTurnEnd);
 
     await query.applyFlagSettings({ fastMode: true });
     assert.equal((await query.next()).value.subtype, 'status');
@@ -1867,14 +1988,19 @@ describe('fast mode', () => {
   });
 
   test('a fastMode setting in the query options opens fast mode at start', async (t) => {
-    const { init } = await openQuery(t, tempDir(t), projectDir(t), { model: 'opus', settings: { fastMode: true } });
-    assert.deepEqual(fastOf(init), { state: 'on', reason: null });
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t), {
+      model: 'opus',
+      settings: { fastMode: true },
+    });
+    assert.deepEqual(fastOf(await startedWith(query, channel)), { state: 'on', reason: null });
   });
 
   test('fastMode null hands the decision to the settings files', async (t) => {
     const adapter = adapterWith(tempDir(t), { resolvedSettings: { fastMode: true } });
-    const { query, channel, init } = await openOn(t, adapter, projectDir(t), { model: 'opus' });
-    assert.deepEqual(fastOf(init), { state: 'off', reason: 'sdk_opt_in_required' }, 'the files alone do not opt in');
+    const { query, channel } = await openOn(t, adapter, projectDir(t), { model: 'opus' });
+    assert.deepEqual(fastOf(await startedWith(query, channel)), { state: 'off', reason: 'sdk_opt_in_required' },
+      'the files alone do not opt in');
+    await pullUntil(query, isTurnEnd);
     await query.applyFlagSettings({ fastMode: null });
     assert.equal((await query.next()).value.subtype, 'status');
     assert.deepEqual(fastOf(await turnResult(query, channel)), { state: 'on', reason: null });

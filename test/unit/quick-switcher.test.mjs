@@ -13,6 +13,7 @@ import {
   fuzzyMatch,
   matchTerms,
   rankEntries,
+  scanLimitOf,
   searchRowVisible,
   segmentText,
   shortcutLabel,
@@ -79,6 +80,22 @@ describe('searchRowVisible', () => {
 
   it('caps a search at a fixed number of results', () => {
     assert.equal(SEARCH_LIMIT, 20);
+  });
+});
+
+describe('scanLimitOf', () => {
+  it('is the scanLimit the gateway reports for the search', () => {
+    assert.equal(scanLimitOf({ results: [], scanned: 3, truncated: true, scanLimit: 30 }), 30);
+    assert.equal(scanLimitOf({ scanLimit: 50 }), 50);
+  });
+
+  it('falls back to 50 only when the answer carries no usable scanLimit', () => {
+    assert.equal(scanLimitOf({ results: [], truncated: true }), 50);
+    assert.equal(scanLimitOf({ scanLimit: '30' }), 50);
+    assert.equal(scanLimitOf({ scanLimit: 0 }), 50);
+    assert.equal(scanLimitOf({ scanLimit: 2.5 }), 50);
+    assert.equal(scanLimitOf(null), 50);
+    assert.equal(scanLimitOf(undefined), 50);
   });
 });
 

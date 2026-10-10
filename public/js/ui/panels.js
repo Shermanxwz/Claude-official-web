@@ -12,7 +12,7 @@ import { confirmDialog, hasOpenDialog, lockScroll, openDialog } from './dialog.j
 import { formatClock, mergeLive, sessionTitle } from './sidebar-model.js';
 import { mountRuntimePanel } from './runtime-panels.js';
 import { mountDeveloperPanel } from './devtools.js';
-import { mountAccountSection } from './account.js';
+import { mountAccountSection, planLabel, providerLabel } from './account.js';
 
 const PANEL_NAMES = ['session', 'capabilities', 'context', 'tasks', 'settings', 'runtime', 'developer'];
 /** Task states that can still produce output. */
@@ -1460,8 +1460,8 @@ function capabilitiesPanel({ body, api, store, t, actions, reload }) {
     return h('div', { class: 'kv-list' },
       kvRow(t('shell.caps.email'), account.email ?? null, { mono: true }),
       kvRow(t('shell.caps.organization'), account.organization ?? null),
-      kvRow(t('shell.caps.subscription'), account.subscriptionType ?? null),
-      kvRow(t('shell.caps.provider'), account.apiProvider ?? null));
+      kvRow(t('shell.caps.subscription'), planLabel(account.subscriptionType)),
+      kvRow(t('shell.caps.provider'), providerLabel(account.apiProvider)));
   }
 
   function listOrNote(items, emptyText, renderItem) {
@@ -1967,6 +1967,20 @@ const PANELS = {
 };
 
 /**
+ * Where a closing sheet gives focus back: the element that had it when the sheet opened, while that element is still on
+ * the page; otherwise the composer's text field, then the main region. Focus never falls back to the document body.
+ * @param {Element | null} opener
+ * @returns {HTMLElement | null}
+ */
+function focusReturnTarget(opener) {
+  if (opener instanceof HTMLElement && opener.isConnected && opener !== document.body) return opener;
+  const composer = document.querySelector('.app-composer-slot .composer-input');
+  if (composer instanceof HTMLElement) return composer;
+  const main = document.getElementById('main');
+  return main instanceof HTMLElement ? main : null;
+}
+
+/**
  * Open a side sheet. Opening another sheet replaces the current one. The sheet re-renders when the language
  * changes and closes on Escape, scrim click or its close button. `opts.tab` picks the tab of the Runtime panel;
  * `opts.section` scrolls the sheet to the section with that key (for example `directories` in the session panel).
@@ -1978,7 +1992,7 @@ const PANELS = {
 export function openPanel(name, { api, store, t, actions }, opts = {}) {
   if (!PANEL_NAMES.includes(name)) throw new TypeError(`Unknown panel: ${name}`);
   activeSheet?.close();
-  const previouslyFocused = /** @type {HTMLElement | null} */ (document.activeElement);
+  const opener = document.activeElement;
   const unlockScroll = lockScroll();
 
   const titleEl = h('h2', { class: 'sheet-title', attrs: { id: 'sheet-title' } });
@@ -2067,7 +2081,7 @@ export function openPanel(name, { api, store, t, actions }, opts = {}) {
     unlockScroll();
     layer.remove();
     if (activeSheet === handle) activeSheet = null;
-    if (previouslyFocused && previouslyFocused.isConnected) previouslyFocused.focus({ preventScroll: true });
+    focusReturnTarget(opener)?.focus({ preventScroll: true });
   }
 
   const handle = { close, name };

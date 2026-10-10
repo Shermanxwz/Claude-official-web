@@ -30,6 +30,9 @@ machine: you read what it says, see what it does, and decide when it asks. The d
   `--fs-md` 15/22 (UI body), `--fs-prose` 16/26 (assistant and user message text), `--fs-lg` 17/24 (panel and dialog
   titles), `--fs-xl` 22/28 (welcome title only). Mono runs one step smaller than its context: 13 px in action rows,
   12.5 px in diffs and outputs, line height 1.55.
+- Settings → Text size sets `--fs-scale` (Small .93, Medium 1, Large 1.13). Every size token is `calc(Npx *
+  var(--fs-scale))`, and so is any size outside the scale (the 12.5 px mono), so one setting scales the whole interface.
+  No stylesheet sets a literal pixel font size.
 - Weights: 400 text, 500 labels and controls, 600 titles and primary buttons. No all-caps labels; sentence case
   everywhere. Numbers that line up use `font-variant-numeric: tabular-nums`.
 
@@ -46,7 +49,7 @@ Tokens are defined once in `app.css` for light (`:root`), dark (`:root[data-them
 | `--bg-hover` | `#ECEEEA` | `#22252A` | hover and selected rows |
 | `--fg` | `#17191C` | `#E8EAED` | text |
 | `--fg-muted` | `#5A6068` | `#A2A9B2` | secondary text |
-| `--fg-subtle` | `#8A9098` | `#6E757E` | placeholders, disabled |
+| `--fg-subtle` | `#666C74` | `#858C95` | placeholders, disabled, decorative glyphs |
 | `--border` | `#E2E4E0` | `#2A2D33` | separators, control borders |
 | `--border-strong` | `#C9CDC7` | `#3A3E46` | focused or hovered borders |
 | `--accent` | `#3949C7` | `#8D99FF` | primary actions, links, running state |
@@ -61,7 +64,8 @@ Tokens are defined once in `app.css` for light (`:root`), dark (`:root[data-them
 
 `--warning`/`--warning-soft` stay as aliases of `--attention`/`--attention-soft`; `--info` follows `--accent`. The
 existing `--success-soft`, `--danger-soft`, `--info-soft` keep their roles with values derived from the table. Text on
-every background meets 4.5:1. Never use Anthropic's or Claude Code's brand colors.
+every background meets 4.5:1, `--fg-subtle` included; meta text (times, counts, project headings) uses `--fg-muted`.
+Never use Anthropic's or Claude Code's brand colors.
 
 ## Shape, depth, motion
 
@@ -111,18 +115,31 @@ every background meets 4.5:1. Never use Anthropic's or Claude Code's brand color
   `--attention` left edge, the floating shadow. Top line: icon and "Needs your approval" / "Question" / "Plan to
   review" / "Declined by the model" in `--attention`, time on the right. Title (`--fs-md`, 600), description
   (`--fs-sm`, muted). The preview (diff, command, plan, options) is part of the card, not a card inside it.
-  "Also allow in future" suggestions are a compact checklist; the note to Claude hides behind "Add a note". Actions:
-  primary filled accent, deny outlined danger; each shows its key (`1`, `2`, `3`) as a small `kbd`.
+  The tool's preview is shown directly (a Bash command as one mono block with a copy icon, an edit as its diff), never
+  as a tool row inside the card. "Always allow" applies the checked suggestions, listed as a compact checklist under
+  the legend "Saved with Always allow", each with a muted scope line and no box of its own; long paths are truncated
+  in the middle with the full path in the tooltip. The note to Claude hides behind "Add a note". Actions: primary
+  filled accent, deny outlined danger; each shows its key (`1`, `2`, `3`) as a small `kbd`.
 - **Composer.** `--bg-elev`, border, radius 14 px, `--shadow` of menus only while focused. Textarea `--fs-prose`.
   Bottom row: attach, the current permission mode as quiet text (click opens the mode menu; Shift+Tab cycles), then
   Stop (while running) and Send (accent, round 32 px). Above it, stacked from the composer upwards: the running line,
-  the todo bar, the suggestion chip. All three are single lines with the same left edge as the text.
+  the todo bar, the suggestion line. All three are single quiet lines (no fill, no border) with the same left edge as
+  the composer text, 17 px in; the suggestion line is muted text with an accent spark and a dismiss ×. On phones the
+  permission mode shows its short name ("Ask", "Plan"…); the full name stays in the tooltip and the menu.
 - **Panels.** Right-side panel 440 px (desktop), full-height sheet on phones; header with title and close; tabs as an
-  underlined row; sections separated by space and a heading (`--fs-sm`, 600), not boxes. Tables use hairline rows.
-- **Dialogs.** 520 px wide, radius 14 px, footer actions right-aligned (primary last).
+  underlined row that wraps rather than hiding tabs; sections separated by space and a heading (`--fs-sm`, 600), not
+  boxes. Tables use hairline rows. The sheet body scrolls; a footer never covers content.
+- **Dialogs.** 520 px wide (the New session dialog, which holds a folder browser and a two-column form, is 680 px),
+  radius 14 px, footer actions right-aligned (primary last). Opening focuses the first enabled control of the body,
+  else the primary action; a pending action's button gets focus back when it settles; closing returns focus to the
+  control that opened it.
+- **Toasts.** Under the header and any banners, right-aligned on desktop, full width inside the 16 px gutter on
+  phones; never over the composer, the docked request card or header controls.
+- **Message actions.** Copy, edit and rewind show on hover, or after a tap on touch screens (a second tap hides them).
+  Rewind is disabled while a turn runs or a request waits, with the reason in its tooltip.
 - **Empty states.** No session selected: the logo, "Start a session" (primary), the three most recent projects as
-  one-click rows, and a short key list. An empty session: one line under the composer area — "Describe a task. @ adds
-  files, / runs commands." Errors say what failed and how to fix it.
+  one-click rows, and a short key list. An empty session: the spark icon, "Start the conversation" and one muted line,
+  "Describe a task. @ adds files, / runs commands." Errors say what failed and how to fix it.
 
 ## Keys
 

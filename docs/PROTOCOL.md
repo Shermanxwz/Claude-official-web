@@ -14,10 +14,10 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 - Session ids are UUIDs. Any path segment that should be a UUID but is not → `400 BAD_REQUEST`.
 - `Host` must be a loopback name (`127.0.0.1`, `localhost`, `[::1]`, any port) or the host of `CAW_PUBLIC_ORIGIN`;
   otherwise `421 HOST_REJECTED`. This blocks DNS-rebinding attacks, notably against demo mode without auth.
-- Request bodies must arrive within 30 s of inactivity between chunks, otherwise `408` is not sent; the connection is
-  closed. Session routes for sessions whose `cwd` lies outside the workspace roots answer `404 SESSION_NOT_FOUND`; a
-  live session whose folder stops resolving inside the roots (for example a swapped symlink) is closed and stops
-  publishing events. Selecting a suggestion that switches to `bypassPermissions` needs `CAW_ALLOW_BYPASS=1`.
+- A request body that stops arriving for 30 s is abandoned: the connection is closed without a response (no `408`).
+  Session routes for sessions whose `cwd` lies outside the workspace roots answer `404 SESSION_NOT_FOUND`; a live
+  session whose folder stops resolving inside the roots (for example a swapped symlink) is closed and stops publishing
+  events.
 - Body limit: 1 MiB for JSON (`413 PAYLOAD_TOO_LARGE`). Uploads have their own limit.
 
 ### Error codes
@@ -28,12 +28,12 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 | 401 | `UNAUTHENTICATED` | no/expired session cookie |
 | 401 | `INVALID_TOKEN` | wrong login token |
 | 403 | `ORIGIN_REJECTED` | Origin check failed |
-| 403 | `FORBIDDEN` | access profile does not allow this action |
+| 403 | `FORBIDDEN` | access profile does not allow this action; a sign-in that managed settings refuse |
 | 421 | `HOST_REJECTED` | `Host` header is not an allowed name (DNS-rebinding protection) |
-| 404 | `NOT_FOUND` / `SESSION_NOT_FOUND` / `REQUEST_NOT_FOUND` | unknown route / session / pending request |
+| 404 | `NOT_FOUND` / `SESSION_NOT_FOUND` / `REQUEST_NOT_FOUND` | unknown route, runtime view or task / session / pending request |
 | 409 | `SESSION_LOCKED` | terminal holds the session |
 | 409 | `SESSION_NOT_LIVE` | action needs a live session (call `open` first) |
-| 409 | `CONFLICT` | state conflict (e.g. delete a live session) |
+| 409 | `CONFLICT` | state conflict (e.g. delete a live session; rewind, or change folders, while a turn runs) |
 | 413 | `PAYLOAD_TOO_LARGE` | body or upload too large |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | wrong content type |
 | 422 | `PATH_NOT_ALLOWED` | path outside workspace roots or not a directory |
@@ -50,9 +50,14 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 
 ### Access profiles (`CAW_ACCESS_PROFILE`, default `full`)
 
-- `read`: GET routes, SSE, login/logout only.
-- `standard`: everything except `DELETE /api/sessions/:id`, terminal, `bypassPermissions` mode.
-- `full`: everything (terminal still needs `CAW_TERMINAL=1`; bypass still needs `CAW_ALLOW_BYPASS=1`).
+- `read`: the read-only GET routes, SSE, login/logout, and the runtime views the table below marks `read`.
+- `standard`: everything except the `full` routes: `DELETE /api/sessions/:id`, the account sign-in routes, the terminal,
+  browser tools, the `settings` runtime view (`/config`) and `bypassPermissions` mode.
+- `full`: everything (the terminal still needs `CAW_TERMINAL=1`).
+- The bypass rule, stated once: `CAW_ALLOW_BYPASS=1` is accepted only with `CAW_ACCESS_PROFILE=full`, and under `read`
+  or `standard` the gateway refuses to start with it (`CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full`). A default
+  mode of `bypassPermissions` (`CAW_DEFAULT_PERMISSION_MODE`) needs the switch too. Without the switch, setting
+  `bypassPermissions` answers `501 FEATURE_DISABLED`, and `meta.features.bypass` is false.
 
 ## Auth and meta
 
@@ -78,7 +83,9 @@ Rate limit: 10 failed attempts per 10 minutes per client address → `429 RATE_L
               permissionMode: PermissionMode|null,   // null (default) = Claude Code's own settings decide
               effort: EffortLevel|null,
               fallbackModel: string|null },          // CAW_FALLBACK_MODEL
-  features: { terminal: boolean, bypass: boolean, uploads: boolean, backgroundTasks: boolean,  // see /background
+  features: { terminal: boolean,
+              bypass: boolean,                       // the bypassPermissions mode is offered (see Access profiles)
+              uploads: boolean, backgroundTasks: boolean,  // see POST /api/sessions/:id/background
               accountLogin: boolean,                 // the engine can run Claude Code's own sign-in (see Account)
               browserTools: boolean,                 // CAW_BROWSER_MCP_COMMAND is configured (see Browser tools)
               chrome: boolean },                     // CAW_CHROME=1: queries start with --chrome
@@ -100,9 +107,9 @@ Lists sub-directories (not files) of `path`, which must be a root or inside a ro
 ### `GET /api/fs/trust?path=<abs>` → `{ path: string, trusted: boolean }`
 ### `POST /api/fs/trust` `{ path: string, trusted: boolean }` → `{ path: string, trusted: boolean, runtimeTrust: RuntimeTrust }` (profile `standard`+)
 ```ts
-type RuntimeTrust = 'accepted'   // Claude Code recorded the trust now
-                  | 'already'    // Claude Code already trusted the folder
-                  | 'failed'     // the handshake failed (logged); the gateway record is kept
+type RuntimeTrust = 'accepted'   // Claude Code recorded the trust now (the one call that performed the handshake)
+                  | 'already'    // Claude Code trusted the folder already, or this gateway process recorded it earlier
+                  | 'failed'     // the handshake failed (logged, with the reason); the gateway record is kept
                   | 'skipped';   // trusted: false, or the engine has no runtime trust (never for the real SDK)
 ```
 Folder trust mirrors Claude Code's own trust dialog. A session whose cwd is trusted (the folder itself or any parent
@@ -116,16 +123,21 @@ silently ignores project `allow` permission rules (and other trust-gated project
 are loaded. The gateway therefore records trust through the runtime's own handshake, never by editing that file:
 `trusted: true` starts a throwaway query (cwd `<stateDir>/trust-probe`, `persistSession: false`, `settingSources: []`),
 calls the runtime's `set_cwd` control with the folder (`setCwd(path)`); an answer `{status: 'needs_trust', directory}`
-is accepted with `setCwd(path, {trustAccepted: true, trustedDirectory: directory})` (`runtimeTrust: 'accepted'`), an
-answer `{status: 'ok'}` means it was already trusted (`'already'`). The probe is closed at once; at most 8 s. Starting
-or resuming a session in a folder the gateway trusts runs the same handshake once per folder per gateway process
-(before the query starts; a failure is logged and published once as a `warning` notice with code `RUNTIME_TRUST`, and
-the session still starts). `trusted: false` only removes the gateway's record: Claude Code has no control to revoke its
-own trust (the README says how to remove it in a terminal).
+is accepted with `setCwd(path, {trustAccepted: true, trustedDirectory: directory})` (`runtimeTrust: 'accepted'`) only
+when `directory` is an absolute path whose realpath is the folder asked for. Any other directory fails the handshake
+(`'failed'`, logged with the reason `directory_mismatch`) and records nothing. An answer `{status: 'ok'}` means it was
+already trusted (`'already'`). The probe is closed at once; at most 8 s. Once a folder is recorded in this gateway
+process, every later call answers `'already'`, including a call that joins a handshake already in flight and finds it
+successful; a failed attempt is not recorded, so the next call tries again. Starting or resuming a session in a folder
+the gateway trusts runs the handshake before the query starts, until the folder is recorded (a failure is logged and
+published once per folder as a `warning` notice with code `RUNTIME_TRUST`, and the session still starts).
+`trusted: false` only removes the gateway's record. Claude Code has no control to revoke its own trust, so the README
+says how to remove it in a terminal.
 
 ### `GET /api/fs/search?cwd=<abs>&q=<text>&limit=50&session=<uuid>`
-`session` (optional): a live session whose `cwd` equals `cwd`. The runtime's own `@` index answers first — the
-`file_suggestions` control request (`SDKControlFileSuggestionsRequest`, sent with the query's generic control call),
+`limit` is 1–200 (default 50). `session` (optional): a live session whose `cwd` equals `cwd`. The runtime's own `@`
+index answers first — the `file_suggestions` control request (`SDKControlFileSuggestionsRequest`, sent with the
+query's generic control call),
 the same fuzzy index the terminal's `@` uses, at most 1.5 s. Its paths are relative to `cwd`; a trailing `/` marks a
 directory (`type: 'dir'`, the slash removed). When it returns at least one result the answer is
 `{ results, source: 'runtime' }`; otherwise (no `session`, not live, another cwd, the control is missing or fails or
@@ -145,12 +157,12 @@ Types used below:
 ```ts
 type LiveState = 'starting'|'idle'|'running'|'requires_action'|'closing'|'error';
 type LiveInfo = { sessionId: string, cwd: string, state: LiveState, model: string|null,
-  permissionMode: PermissionMode|null,     // null until system/init reports the mode Claude Code started in
+  permissionMode: PermissionMode|null,     // a mode the user chose, at once; otherwise null until system/init reports one
   effort: EffortLevel|null, title: string|null,
   agent: string|null,                      // main-thread agent the query runs as (`--agent`); null = none
   additionalDirectories: string[],         // extra working directories the query was started with (`--add-dir`)
   fallbackModel: string|null,              // fallback model the query was started with (`--fallback-model`)
-  browserTools: boolean,                   // the operator's browser MCP server is attached (see /browser)
+  browserTools: boolean,                   // the operator's browser MCP server is attached (see Browser tools)
   lockedBy: 'terminal'|null, pendingCount: number, lastActivity: number,
   claudeCodeVersion: string|null, error: { code: string, message: string } | null, trusted: boolean,
   fastMode: boolean|null,                  // fast mode the gateway requested for this session; null = follow settings
@@ -172,6 +184,23 @@ type RefusalFallbackDialog = { dialogKind: 'refusal_fallback_prompt', originalMo
 type LiveEvent = { seq: number, msg: SDKMessage };
 ```
 
+### Session states and the ready state
+
+- A new or resumed session is `starting` until Claude Code answers the SDK's initialize handshake
+  (`initializationResult()`). The gateway then sets it to `idle` at once, before any prompt. The handshake makes no
+  model call. If the handshake fails or does not come within 60 s, the session stays `starting` and the failure is
+  logged at debug level.
+- Claude Code sends `system/init` only with the first prompt of a streaming session. Until then `LiveInfo.model` is the
+  model the query was asked to use (null when Claude Code's settings choose it), `LiveInfo.permissionMode` is the mode
+  the user or `CAW_DEFAULT_PERMISSION_MODE` chose (null when Claude Code's settings decide), and
+  `LiveInfo.claudeCodeVersion` is null. The first `system/init` replaces all three with what the runtime reports.
+- The capabilities of a session (commands, models, agents and account) come from the same handshake, so they are
+  available before the first prompt. `GET /api/sessions/:id` returns `init: null` until `system/init` arrives.
+- `running` is a turn in progress, `requires_action` a turn that waits for a pending request, and `idle` again when the
+  turn ends. `closing` is set when a query ends, and the gateway then publishes `session_state` with `live: null`.
+  A query that fails publishes an `error` notice and sets `LiveInfo.error` when it is still live. The gateway never
+  sets the `error` state, although the type lists it.
+
 ### How live queries are started and kept
 
 - Thinking summaries: Claude Code reads `showThinkingSummaries` only in its interactive terminal; a non-interactive
@@ -184,21 +213,24 @@ type LiveEvent = { seq: number, msg: SDKMessage };
 - Every query declares `perTaskStopAffordance: true` (see interrupt).
 - Permission mode: the `permissionMode` option is passed only when the user or `CAW_DEFAULT_PERMISSION_MODE` chose a
   mode. Otherwise it is omitted and Claude Code applies `permissions.defaultMode` from its settings exactly as
-  `claude` does in a terminal (the runtime itself drops escalating modes that only project settings ask for).
-  `LiveInfo.permissionMode` is `null` until `system/init` reports the mode, then follows `init` and `system/status`.
-  If `init` reports `bypassPermissions` while bypass is not allowed (`CAW_ALLOW_BYPASS` unset; the query was started
-  with `allowDangerouslySkipPermissions: false`), the gateway calls `setPermissionMode('default')` at once and publishes
-  a `warning` notice with code `BYPASS_REFUSED`.
+  `claude` does in a terminal, its own trust rules included (verified with 2.1.295: in a trusted folder, a project
+  `.claude/settings.json` with `defaultMode: "acceptEdits"` starts the session in `acceptEdits`).
+  `LiveInfo.permissionMode` shows a chosen mode at once. While Claude Code's settings decide it is `null` until
+  `system/init` reports the mode, then it follows `init` and `system/status`.
+  If `init` or `system/status` reports `bypassPermissions` while bypass is not allowed (the switch is unset, so the
+  query was started with `allowDangerouslySkipPermissions: false`), the gateway calls `setPermissionMode('default')` at
+  once and publishes a `warning` notice with code `BYPASS_REFUSED`. If that call fails, the gateway publishes an `error`
+  notice with code `BYPASS_REFUSED` and closes the session, so it never keeps running in bypass mode.
 - `agent` → option `agent` (the main thread runs as that agent, like `claude --agent`); `additionalDirectories` →
   option `additionalDirectories` (like `--add-dir`); `fallbackModel` → option `fallbackModel` (like
   `--fallback-model`; default `CAW_FALLBACK_MODEL`). Each is passed only when set.
 - Every query passes `onUserDialog` with `supportedDialogKinds: ['refusal_fallback_prompt']`, so the runtime asks
   before retrying a refused answer on the fallback model instead of ending the turn with the plain refusal error. The
-  dialog becomes a pending request of kind `dialog` (see requests). A dialog of any other kind is answered
-  `{behavior: 'cancelled'}` at once (it cannot arrive, because only this kind is declared).
+  dialog becomes a pending request of kind `dialog` (see requests). A dialog of any other kind, or a refusal dialog
+  without both model names, is answered `{behavior: 'cancelled'}` at once.
 - `CAW_CHROME=1` adds the CLI's own `--chrome` flag (`extraArgs: {chrome: null}`): Claude in Chrome, which drives a
   Chrome browser with the Claude in Chrome extension on the machine that runs the gateway and needs a claude.ai
-  sign-in. Status and browser choice are runtime views (`chrome`, `POST /chrome/browser`).
+  sign-in. Its status is the runtime view `chrome`.
 - Runtime trust: see `POST /api/fs/trust` (the handshake runs before the start when the folder is trusted).
 - `LiveInfo.backgroundTasks` follows `system/background_tasks_changed` (replace semantics; entries with `ambient: true`
   are not counted) and drops to 0 when the query ends. The idle sweep never closes a session whose count is above 0,
@@ -206,12 +238,14 @@ type LiveEvent = { seq: number, msg: SDKMessage };
   tasks (otherwise `429 TOO_MANY_SESSIONS`), so background work is never killed by housekeeping.
 
 ### `GET /api/sessions?cwd=<abs>&limit=100&offset=0`
-→ `{ sessions: SessionSummary[] }` sorted by `lastModified` desc. Without `cwd`: all projects, filtered to sessions
+→ `{ sessions: SessionSummary[] }` sorted by `lastModified` desc (`limit` 1–500, `offset` 0–1000000). Without `cwd`: all
+projects, filtered to sessions
 whose `cwd` is inside a workspace root (sessions without `cwd` are included only if live). Live sessions that have no
 file yet are included.
 
 ### `POST /api/sessions` `{ cwd: string, title?: string } & SessionSettings`
-Starts a new live session with a gateway-assigned UUID → `{ live: LiveInfo }`. `cwd` must be inside a root.
+Starts a new live session with a gateway-assigned UUID → `{ live: LiveInfo }`. `cwd` must be an existing folder inside
+a root (`422 PATH_NOT_ALLOWED` otherwise).
 ```ts
 type SessionSettings = {
   model?: string|null,                 // null = Claude Code's default model
@@ -219,8 +253,9 @@ type SessionSettings = {
   effort?: EffortLevel|null,
   fastMode?: boolean|null,
   agent?: string|null,                 // 1–200 chars; the runtime validates the name (422 with its message)
-  additionalDirectories?: string[],    // ≤ 20 absolute directories inside the roots, realpath'd, deduplicated,
-                                       // the cwd itself dropped; otherwise 422 PATH_NOT_ALLOWED
+  additionalDirectories?: string[],    // at most 20 entries (422 INVALID_ARGUMENT above that); each an absolute folder
+                                       // inside the roots (422 PATH_NOT_ALLOWED otherwise), realpath'd, deduplicated,
+                                       // with the cwd itself dropped
   fallbackModel?: string|null,         // 1–200 chars
   browserTools?: boolean };            // attach the operator's browser MCP server (profile full; see Browser tools)
 ```
@@ -240,6 +275,8 @@ Transcript from disk (`getSessionMessages`, system messages included).
 { messages: (SessionMessage & { index: number })[], total: number, start: number, hasMore: boolean }
 ```
 `tail=N` returns the last N; `before=i&limit=N` returns up to N messages with index < i. `start` = index of first item.
+`tail` and `limit` are 1–1000 and default to 200. `tail` and `before` cannot be combined, and `limit` needs `before`
+(`400 BAD_REQUEST`).
 
 ### `POST /api/sessions/:id/open` `SessionSettings` → `{ live: LiveInfo }`
 Resumes the session in a live query (no-op if already live). `409 SESSION_LOCKED` if the terminal holds it.
@@ -283,18 +320,18 @@ before the call. Other failures → `502 ENGINE_ERROR`.
 ### `POST /api/sessions/:id/settings` `SessionSettings`
 Applies to the live query (`setModel`, `setPermissionMode`, `applyFlagSettings({effortLevel})`,
 `applyFlagSettings({fastMode})`, `applyFlagSettings({agent})`); if not live, stored for the next open.
-`bypassPermissions` requires feature + profile. → `{ live: LiveInfo | null, restartRequired: boolean }`
-`permissionMode: null` on a live query is `400 BAD_REQUEST` (a running query cannot go back to "settings decide").
-`agent: null` clears the main-thread agent (`applyFlagSettings({agent: null})`). `additionalDirectories` changes on a
-live query restart it (close, then resume with the new list), like a trust change; refused with `409 CONFLICT` while a
-turn is running or requests are pending. `fallbackModel` cannot change in a running query: it is stored and
-`restartRequired: true` tells the UI to offer a restart (close + open). `restartRequired` is false otherwise.
-`fastMode` is the terminal's `/fast`, kept in the session's flag settings layer only (nothing is written to settings
-files): `true`/`false` → `applyFlagSettings({fastMode: true|false})`, `null` → `applyFlagSettings({fastMode: null})`,
-which falls back to the user's settings. A stored value is applied at the next start through the `settings` option
-(`{fastMode}`). SDK sessions are opted out of fast mode until the host sets it (`fast_mode_disabled_reason:
-'sdk_opt_in_required'`). `LiveInfo.fastMode` reports the request; whether fast mode serves is `fastModeState` and
-`fastModeDisabledReason`, updated from `system/init` and from every `result` that carries them.
+`bypassPermissions` needs `CAW_ALLOW_BYPASS=1` (`501 FEATURE_DISABLED` otherwise). → `{ live: LiveInfo | null,
+restartRequired: boolean }` `permissionMode: null` on a live query is `400 BAD_REQUEST` (a running query cannot go back
+to "settings decide"). `agent: null` clears the main-thread agent (`applyFlagSettings({agent: null})`).
+`additionalDirectories` changes on a live query restart it (close, then resume with the new list), like a trust change;
+refused with `409 CONFLICT` while a turn is running or requests are pending. `fallbackModel` cannot change in a running
+query: it is stored and `restartRequired: true` tells the UI to offer a restart (close + open). `restartRequired` is
+false otherwise. `fastMode` is the terminal's `/fast`, kept in the session's flag settings layer only (nothing is
+written to settings files): `true`/`false` → `applyFlagSettings({fastMode: true|false})`, `null` →
+`applyFlagSettings({fastMode: null})`, which falls back to the user's settings. A stored value is applied at the next
+start through the `settings` option (`{fastMode}`). SDK sessions are opted out of fast mode until the host sets it
+(`fast_mode_disabled_reason: 'sdk_opt_in_required'`). `LiveInfo.fastMode` reports the request; whether fast mode serves
+is `fastModeState` and `fastModeDisabledReason`, updated from `system/init` and from every `result` that carries them.
 
 ### `POST /api/sessions/:id/requests/:requestId`
 Body depends on the request kind:
@@ -313,6 +350,8 @@ Body depends on the request kind:
 // dialog (refusal_fallback_prompt)
 { result: 'retry_fallback' | 'edit_prompt' | 'cancelled' }
 ```
+A permission answer whose `suggestionIndexes` select a suggestion that switches to `bypassPermissions` is refused with
+`400 BAD_REQUEST` unless bypass is allowed (see Access profiles).
 A dialog answer becomes `{behavior: 'completed', result}`; a dialog cancelled by the gateway (session closed, query
 ended) becomes `{behavior: 'cancelled'}`, after which the runtime applies its default (`cancelled`). `retry_fallback`
 retries the refused turn on `fallbackModel`; `edit_prompt` ends the turn so the user can rephrase (the UI puts the
@@ -336,7 +375,8 @@ the gateway publishes a `notice` with code `ENGINE_UNAVAILABLE` and sets `LiveIn
   mcpServers: McpServerStatus[], outputStyle: string | null, availableOutputStyles: string[] }
 ```
 Live sessions return fresh data (cached ≤ 30 s, commands refreshed by `commands_changed`). Non-live sessions return the
-last known capabilities for the same cwd (or the last known globally) with `stale: true`, or empty lists.
+last known capabilities for the same cwd (or the last known globally) with `stale: true`, or empty lists. `mcpServers`
+carries each server's status with its `config` redacted by the `mcp` view's rules (see Redaction).
 
 ### `POST /api/sessions/:id/mcp` `{ server: string, action: 'toggle'|'reconnect'|'permission-mode', enabled?: boolean, mode?: 'default'|'auto'|null }` → `{ mcpServers, warning?: string }`
 `permission-mode` pins (or clears, `mode: null`) a per-server permission-mode override with
@@ -359,8 +399,10 @@ The terminal's `/mcp` → Authenticate, for servers whose status is `needs-auth`
 `http(s)` URL of at most 4096 characters (`400 BAD_REQUEST`). `requiresUserAction: false` means nothing to do (already
 authorized). Because the runtime's callback listens on the gateway's machine, a browser elsewhere cannot reach it: after
 approving, the user copies the address of the page that fails to load and submits it with `callback`. On the same
-machine the callback completes by itself; the UI polls `GET /capabilities` until the server is `connected` (5 min).
-Profile `standard`+; `409 SESSION_NOT_LIVE`; `501 FEATURE_UNAVAILABLE` when the SDK's query has no such control.
+machine the callback completes by itself; the UI polls `GET /api/sessions/:id/capabilities` until the server is
+`connected` (5 min). Profile `standard`+; `409 SESSION_NOT_LIVE`; `501 FEATURE_UNAVAILABLE` when the SDK's query has no
+such control.
+
 ### `POST /api/sessions/:id/reload` `{ what: 'plugins'|'skills'|'output-styles', force?: boolean }`
 ```ts
 → { ok: true, availableOutputStyles?: string[] }      // applied
@@ -368,22 +410,22 @@ Profile `standard`+; `409 SESSION_NOT_LIVE`; `501 FEATURE_UNAVAILABLE` when the 
                                           lspToolChange: 'adds'|'may-add'|'removes'|'may-remove'|null } }
 ```
 `plugins` runs the check the terminal's `/reload-plugins` makes: without `force` it calls
-`reloadPlugins({holdOnCacheImpact: true})`; when the runtime holds the reload because applying it would change the
-tool list the conversation's prompt cache depends on, nothing is applied and the answer is the `held` form (names are
+`reloadPlugins({holdOnCacheImpact: true})`; when the runtime holds the reload because applying it would change the tool
+list the conversation's prompt cache depends on, nothing is applied and the answer is the `held` form (names are
 plugin-authored: display as text only). `force: true` calls `reloadPlugins()`. `skills` → `reloadSkills()`.
 `output-styles` → `reloadOutputStyles()` and returns the refreshed `availableOutputStyles`. `force` is only valid with
-`plugins`. Every successful reload drops the capabilities cache. Profile `standard`+; `409 SESSION_NOT_LIVE` when not
-live.
+`plugins` (`400 BAD_REQUEST` otherwise). Every successful reload drops the capabilities cache. Profile `standard`+; `409
+SESSION_NOT_LIVE` when not live.
 
 ### `POST /api/sessions/:id/output-style` `{ style: string }` → `{ outputStyle: string, availableOutputStyles: string[] }`
 The terminal's `/config` output-style row: `updateSettings('localSettings', {outputStyle: style})`, the runtime's own
 settings writer, which writes the project's `.claude/settings.local.json` and applies the style to the live session.
 `style` is 1–100 characters once trimmed (`400 BAD_REQUEST` otherwise) and must be one of the session's
-`availableOutputStyles` (`422 INVALID_ARGUMENT`); when the runtime does not answer for its styles the answer is
-`502 ENGINE_ERROR`. Style names longer than 100 characters are left out of `availableOutputStyles`. The runtime refuses sessions that
-do not load local settings, so an untrusted folder answers `409 CONFLICT` ("Trust this folder to change its output
-style.") before any call. Profile `standard`+; `409 SESSION_NOT_LIVE` when not live. The capabilities cache keeps the
-new `outputStyle`.
+`availableOutputStyles` (`422 INVALID_ARGUMENT`); when the runtime does not answer for its styles the answer is `502
+ENGINE_ERROR`. Style names longer than 100 characters are left out of `availableOutputStyles`. The runtime refuses
+sessions that do not load local settings, so an untrusted folder answers `409 CONFLICT` ("Trust this folder to change
+its output style.") before any call. Profile `standard`+; `409 SESSION_NOT_LIVE` when not live. The capabilities cache
+keeps the new `outputStyle`.
 
 ### `POST /api/sessions/:id/tasks/:taskId/stop` → `{ ok: true }`
 
@@ -400,6 +442,9 @@ runtime's message. Profile `read`+; `409 SESSION_NOT_LIVE`; `501 FEATURE_UNAVAIL
 `code` uses `rewindFiles(userMessageId, {dryRun})` (opens the session if needed). `conversation` reopens the live query
 with `resume` + `resumeSessionAt = <uuid of the transcript entry immediately before userMessageId>`; if the target is
 the first message → `422 CANNOT_REWIND`. `dryRun` never changes anything.
+A rewind never races a running turn. While a turn runs, or a request waits for an answer, every mode answers
+`409 CONFLICT` ("Stop the running turn before rewinding this session.") before anything changes, a dry run included.
+Stop the turn and settle any waiting request first (interrupt the turn, or answer the request), then rewind.
 
 ### `POST /api/sessions/:id/fork` `{ upToMessageId?: string, title?: string }` → `{ sessionId: string }`
 ### `PATCH /api/sessions/:id` `{ title?: string, tag?: string|null }` → `{ ok: true }`
@@ -414,41 +459,60 @@ case-insensitively as a plain substring. `limit` 1–50 (default 20).
 { results: { sessionId: string, cwd: string|null, title: string|null, lastModified: number,
              matchedIn: 'title'|'content', snippets: string[] }[],
   scanned: number,       // sessions whose transcript was read
-  truncated: boolean }   // the content scan stopped at its budget
+  truncated: boolean,    // not every session was scanned (cap or time budget)
+  scanLimit: number }    // the cap: how many most recent unmatched sessions are read at most (50)
 ```
-Every session inside the roots is matched first on what `listSessions()` reports (custom title, summary, first prompt;
-`matchedIn: 'title'`, no snippets). Then the transcripts of the 50 most recently modified sessions that did not match
-yet are read with `getSessionMessages()` — only the text blocks of user and assistant messages, at most 4 000 messages
-per session — within an overall budget of 5 s. Up to 3 snippets per session, each at most 160 characters around a
-match, whitespace collapsed. Results are ordered by `lastModified` desc. Profile `read`+. The route is matched before
-`/api/sessions/:id`.
+The session list is read once per search, with one listing of the runtime. Every session inside the roots is matched
+first on what that listing reports (custom title, summary, first prompt; `matchedIn: 'title'`, no snippets). Then the
+transcripts of the `scanLimit` (50) most recently modified sessions that did not match yet are read with
+`getSessionMessages()` — only the text blocks of user and assistant messages, at most 4 000 messages per session —
+within an overall budget of 5 s. `truncated` is true whenever a session was skipped: when more than `scanLimit`
+sessions did not match (even if the budget was not used up), or when the budget ran out first. Up to 3 snippets per
+session, each at most 160 characters around a match, whitespace collapsed. Results are ordered by `lastModified` desc.
+Profile `read`+. The route is matched before `/api/sessions/:id`.
 
 ### `GET /api/sessions/:id/runtime` → `{ views: RuntimeViewName[] }`
 ### `GET /api/sessions/:id/runtime/:view` → `{ view: RuntimeViewName, data: unknown, fetchedAt: number }`
 Read-only views of the live runtime, the data behind the terminal's own screens. `views` lists the ones the installed
 SDK's query offers (method present); the UI shows only those. `data` is the runtime's answer as given, except where
 noted. `409 SESSION_NOT_LIVE` when not live (the UI offers to open the session); `501 FEATURE_UNAVAILABLE` when the
-method is missing; `502 ENGINE_ERROR` on failure or timeout (10 s unless noted).
+method is missing; `502 ENGINE_ERROR` on failure or timeout (10 s unless noted). An unknown view is `404 NOT_FOUND`.
 
 | view | runtime call | terminal screen | profile | notes |
 |---|---|---|---|---|
 | `status` | `getStatus()` | `/status` | `standard` | `{sections: [{title, rows: [{label, value}]}]}` |
 | `permissions` | `listPermissionRules()` | `/permissions` | `read` | `{state: {rules: [{behavior, source, rule, description?, editability}], workspaceDirectories, originalCwd, managedOnly}}` |
 | `hooks` | `getHooksListing()` | `/hooks` | `standard` | `{events, hooks, eventCatalog, policy}` |
-| `settings` | `getSettings()` | `/config` | `full` | `{effective, sources, applied}`; every value inside an `env` object is replaced by `"[redacted]"` |
+| `settings` | `getSettings()` | `/config` | `full` | `{effective, sources, applied}`; secrets are redacted (see Redaction) |
 | `skills` | `getSkillsDialog()` | `/skills` | `read` | `{skills: [...]}` |
 | `sandbox` | `getSandboxDialog()` | `/sandbox` | `read` | sandbox support, mode, dependency errors, restrictions |
 | `plan` | `getPlan()` | plan mode | `read` | `{exists: boolean, ...}` |
 | `usage` | `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({skipBehaviors: true})` | `/usage` | `read` | session cost and totals, `rate_limits_available`, plan windows; 15 s; experimental in the SDK, so the view is listed only while the method exists |
 | `account` | `accountInfo()` | `/status` account | `read` | `AccountInfo` |
 | `init` | `initializationResult()` | — | `standard` | `SDKControlInitializeResponse` |
-| `mcp` | `mcpServerStatus()` | `/mcp` | `read` | `McpServerStatus[]` |
+| `mcp` | `mcpServerStatus()` | `/mcp` | `read` | `McpServerStatus[]`; server configs are redacted (see Redaction) |
 | `chrome` | `getChromeDialog()` | `/chrome` | `read` | Claude in Chrome status (see `CAW_CHROME`) |
 
 The `status`, `permissions`, `hooks`, `settings`, `skills`, `sandbox`, `plan`, `chrome` and `account` calls are
 runtime controls that the SDK ships without public typings (`get_status`, `list_permission_rules`, …); the gateway
 calls them only when present (feature detection, never by constructing raw control requests) and the UI falls back to
 the terminal tab when they are missing.
+
+**Redaction.** The `settings` and `mcp` views, the capabilities answer and the answer of `POST .../mcp` redact
+secrets. In all of them, every value inside an `env` or `headers` object
+is replaced by `"[redacted]"`, and so is every value whose key, lower-cased and without `-`, `_` and `.`, ends with
+`token`, `secret`, `password`, `passwd`, `apikey`, `authorization`, `cookie`, `credential`, `credentials`, `privatekey`,
+`accesskey`, `secretkey`, `clientsecret` or `sessionkey`, at any depth. So `authToken`, `x-api-key`, `GITHUB_TOKEN`,
+`client_secret` and `aws_secret_key` are hidden, while `maxTokens`, `apiKeyHelper` and `tokenizer` stay visible. The
+keys stay, so the view still shows what is configured. The `mcp` view also redacts each server's `config` further: every
+string that is an http or https URL loses its user name and password, and every query and fragment value becomes
+`"[redacted]"`; in `args`, the value after a flag whose name is a secret (`--token abc` becomes `--token [redacted]`)
+and the value of a `name=value` or `name: value` item whose name is one are replaced. The rest of each status, the tool
+lists included, is passed on as the runtime answered it; the capabilities answer and the answer of `POST .../mcp`
+apply the same rules to their `mcpServers`. The `settings` view applies only the name and container rules. Every view
+then drops the password of any URL written inside its strings (`http://user:secret@proxy:3128` becomes
+`http://[redacted]@proxy:3128`; a user name alone, as in `ssh://git@host`, stays); the other runtime views get only that
+pass, so `hooks` shows its commands as configured.
 
 ### `GET /api/sessions/:id/memory`
 The terminal's `/memory`: the memory files Claude Code loads for this session (`getMemoryDialog()`), each read through
@@ -473,8 +537,8 @@ starts, so the UI offers to restart the session to apply the change. Profile `st
 
 ### `GET /api/sessions/:id/export` → `{ text: string, filename: string }`
 The terminal's `/export`: the conversation as plain text (`exportConversation()`); `filename` is the runtime's
-`default_filename` reduced to `[A-Za-z0-9._-]` and ending in `.txt`. Profile `read`+; `409 SESSION_NOT_LIVE`;
-`501 FEATURE_UNAVAILABLE`.
+`default_filename` reduced to `[A-Za-z0-9._-]`, without leading dots, and ending in `.txt` (`conversation.txt` when
+nothing is left). Profile `read`+; `409 SESSION_NOT_LIVE`; `501 FEATURE_UNAVAILABLE`.
 
 ### `POST /api/sessions/:id/side-question` `{ question: string }` → `{ response: string|null, synthetic: boolean, refusalFallback: { originalModel: string, fallbackModel: string }|null }`
 The terminal's `/btw`: a quick question about the conversation, answered by the model without adding a turn to the
@@ -486,12 +550,14 @@ transcript (`askSideQuestion(question)`). `question`: 1–4 000 characters once 
 ### Browser tools (`CAW_BROWSER_MCP_COMMAND`)
 When the operator sets `CAW_BROWSER_MCP_COMMAND` to a JSON array of strings (the command and its arguments, for example
 `["npx","-y","@playwright/mcp@<version>","--headless","--isolated"]`), `meta.features.browserTools` is true and a
-session can attach that MCP server under the name `browser` with `POST /settings {browserTools: true}` (profile
-`full`): a live query gets it through the SDK's public `setMcpServers({browser: {type: 'stdio', command, args}})`, a
-query that starts with it remembered gets it through the `mcpServers` option. `false` detaches it
-(`setMcpServers({})`). The array: 1–32 strings, each 1–1024 characters, the first an absolute path or a bare command
-name; anything else is a configuration error at startup. The user never supplies the command. Screenshots the server
-returns are image blocks in its tool results and render in the MCP tool card.
+session can attach that MCP server under the name `browser` with `POST /api/sessions/:id/settings` and
+`{browserTools: true}` (profile `full`): a live query gets it through the SDK's public
+`setMcpServers({browser: {type: 'stdio', command, args}})`, a query that starts with it remembered gets it through the
+`mcpServers` option. `false` detaches it (`setMcpServers({})`). Any request that sets `browserTools`, `false` included,
+needs profile `full`. Without the command, such a request answers `501 FEATURE_DISABLED`. The array: 1–32 strings, each
+1–1024 characters, the first an absolute path or a bare command name; anything else is a configuration error at startup.
+The user never supplies the command. Screenshots the server returns are image blocks in its tool results and render in
+the MCP tool card.
 
 ## Account (Claude Code's own sign-in)
 
@@ -506,17 +572,19 @@ only when present (`501 FEATURE_UNAVAILABLE` otherwise).
 
 ### `POST /api/account/login` `{ method: 'claudeai'|'console' }` → `{ manualUrl: string, automaticUrl: string|null }`
 Starts the runtime's sign-in (`claudeAuthenticate(method === 'claudeai')`): `claudeai` for a Claude subscription,
-`console` for an Anthropic Console (API) account. A flow already in progress for the same method is joined; a flow for
+`console` for an Anthropic Console (API) account; any other method is `400 BAD_REQUEST`. A flow already in progress for
+the same method is joined; a flow for
 the other method is replaced. The user opens `manualUrl`, signs in, and copies the code the page shows. `automaticUrl`
 completes only in a browser on the gateway's machine. Both must be `https` URLs (`502 ENGINE_ERROR` otherwise).
 Profile `full`. Policy refusals (managed settings) → `403 FORBIDDEN` with the runtime's message.
 
 ### `POST /api/account/login/code` `{ code: string }` → `{ account: AccountInfo }`
-`code` is what the sign-in page shows: `<authorizationCode>#<state>`; anything without exactly one `#` and two
-non-empty parts → `422 INVALID_ARGUMENT` "Invalid code. Please make sure the full code was copied". Then
-`claudeOAuthCallback(code, state)` (waits for the token exchange, at most 2 minutes). On success the gateway drops its
-capability caches, closes the account query and publishes `account_changed` `{ account }`; live sessions keep running
-with the credentials they started with until they are reopened. No flow in progress → `409 CONFLICT`. Profile `full`.
+`code` is what the sign-in page shows: `<authorizationCode>#<state>`, at most 2048 characters; anything longer or
+without exactly one `#` and two non-empty parts → `422 INVALID_ARGUMENT` "Invalid code. Please make sure the full code
+was copied". Then `claudeOAuthCallback(code, state)` (waits for the token exchange, at most 2 minutes). On success the
+gateway drops its capability caches, closes the account query and publishes `account_changed` `{ account }`; live
+sessions keep running with the credentials they started with until they are reopened. No flow in progress → `409
+CONFLICT`. Profile `full`.
 
 ### `DELETE /api/account/login` → `{ ok: true }`
 Abandons the flow in progress (closes the account query). Profile `full`.
@@ -544,7 +612,7 @@ Global events are delivered to every client; `sdk` events only for the watched s
 |---|---|---|
 | `hello` | `{ bootId, version, seq }` | sent first on every connection |
 | `heartbeat` | `{ t: number }` | every 15 s |
-| `resync` | `{ reason: 'gap'|'boot'|'overflow' }` | client must reload snapshot |
+| `resync` | `{ reason: 'gap'|'boot' }` | client must reload snapshot |
 | `sessions_changed` | `{ reason: string, sessionId?: string }` | global |
 | `session_state` | `{ live: LiveInfo }` or `{ sessionId, live: null }` when closed | global |
 | `sdk` | `{ sessionId, msg: SDKMessage }` | watched session only |
@@ -563,6 +631,12 @@ at once and 16 per client address (`429 TOO_MANY_STREAMS`).
 ## Terminal (optional)
 
 `GET /api/terminal?sessionId=<uuid>` WebSocket (or `?cwd=<abs>` for a fresh `claude`). Requires `CAW_TERMINAL=1`,
-profile `full`, valid cookie and Origin. While attached to a session the GUI cannot write to it (`SESSION_LOCKED`).
+profile `full`, valid cookie and Origin. While attached to a session, messages, turns, rewind, fork, delete and live
+controls for it answer `SESSION_LOCKED`; rename, tag and settings (kept for the next start) still work.
 Client → server text frames: `{"type":"input","data":string}` | `{"type":"resize","cols":n,"rows":n}`.
 Server → client: `{"type":"output","data":string}` | `{"type":"exit","code":n}` | `{"type":"error","code","message"}`.
+A refused connection gets one `error` frame and is then closed. At most four terminals are open at once: a fifth gets
+`TOO_MANY_TERMINALS` (close code 1013). An invalid query, or a `cwd` outside the roots, gets `BAD_REQUEST` (close 1008).
+A setup failure sends its own code, such as `PATH_NOT_ALLOWED` (a session folder outside the roots), `SESSION_LOCKED`
+or `ENGINE_UNAVAILABLE` (no Claude Code executable); the close code is 1011 for a 5xx code and 1008 otherwise.
+Anything unexpected is `INTERNAL` (close 1011).

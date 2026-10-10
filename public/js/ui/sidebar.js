@@ -16,7 +16,9 @@ import {
   filterSessions, formatRelativeTime, groupSessions, liveTone, mergeLive, projectName, sessionActivity, sessionCwd,
   sessionTitle,
 } from './sidebar-model.js';
-import { SEARCH_LIMIT, searchRowVisible, segmentText, shortcutLabel, termRanges } from './quick-switcher.js';
+import {
+  SEARCH_LIMIT, scanLimitOf, searchRowVisible, segmentText, shortcutLabel, termRanges,
+} from './quick-switcher.js';
 
 const PAGE_SIZE = 100;
 const TIME_REFRESH_MS = 60 * 1000;
@@ -42,7 +44,8 @@ export function createSidebar({ container, api, store, t, actions }) {
   /**
    * The deep search (GET /api/sessions/search) for `query`. While it is the search for the current query, the list shows
    * its results instead of the session groups.
-   * @type {{query: string, status: 'loading'|'ready'|'failed', results: any[], truncated: boolean, error: string} | null}
+   * @type {{query: string, status: 'loading'|'ready'|'failed', results: any[], truncated: boolean, scanLimit: number,
+   *   error: string} | null}
    */
   let deep = null;
   let deepToken = 0;
@@ -227,6 +230,7 @@ export function createSidebar({ container, api, store, t, actions }) {
     const state = store.get();
     const live = state.live[session.sessionId] ?? session.live ?? null;
     const pendingCount = live?.pendingCount ?? state.pending[session.sessionId]?.length ?? 0;
+    const pendingKey = pendingCount === 1 ? 'shell.sidebar.pending.one' : 'shell.sidebar.pending.other';
     const selected = session.sessionId === activeId;
     const title = sessionTitle(session, t('shell.untitled'));
     const when = formatRelativeTime(sessionActivity(session), {
@@ -250,8 +254,10 @@ export function createSidebar({ container, api, store, t, actions }) {
       session.tag ? h('span', { class: 'chip chip-tag', text: session.tag }) : null,
       h('span', { class: 'session-time', text: when }),
       pendingCount > 0
-        ? h('span', { class: 'badge badge-attention session-pending', attrs: { title: t('shell.sidebar.pending', { count: pendingCount }) } },
-          String(pendingCount))
+        ? h('span', {
+          class: 'badge badge-attention session-pending',
+          attrs: { title: t(pendingKey, { count: pendingCount }) },
+        }, String(pendingCount))
         : null));
 
     const more = h('button', {
@@ -316,7 +322,7 @@ export function createSidebar({ container, api, store, t, actions }) {
     const trimmed = text.trim();
     if (!searchRowVisible(trimmed)) return;
     const token = ++deepToken;
-    deep = { query: trimmed, status: 'loading', results: [], truncated: false, error: '' };
+    deep = { query: trimmed, status: 'loading', results: [], truncated: false, scanLimit: 0, error: '' };
     renderList();
     try {
       const data = await api.get(`/api/sessions/search?q=${encodeURIComponent(trimmed)}&limit=${SEARCH_LIMIT}`);
@@ -326,11 +332,14 @@ export function createSidebar({ container, api, store, t, actions }) {
         status: 'ready',
         results: Array.isArray(data?.results) ? data.results : [],
         truncated: data?.truncated === true,
+        scanLimit: scanLimitOf(data),
         error: '',
       };
     } catch (err) {
       if (destroyed || token !== deepToken) return;
-      deep = { query: trimmed, status: 'failed', results: [], truncated: false, error: errorText(err, t) };
+      deep = {
+        query: trimmed, status: 'failed', results: [], truncated: false, scanLimit: 0, error: errorText(err, t),
+      };
     }
     renderList();
   }
@@ -391,7 +400,9 @@ export function createSidebar({ container, api, store, t, actions }) {
       const key = result.results.length === 1 ? 'shell.sidebar.resultCount.one' : 'shell.sidebar.resultCount.other';
       status = t(key, { count: result.results.length });
     }
-    if (result.status === 'ready' && result.truncated) status = `${status} ${t('shell.sidebar.truncated')}`;
+    const truncated = result.status === 'ready' && result.truncated
+      ? h('p', { class: 'sidebar-deep-note', text: t('shell.search.truncated', { count: result.scanLimit }) })
+      : null;
     return h('section', { class: 'sidebar-deep-results', attrs: { 'aria-label': t('shell.sidebar.searchResults') } },
       h('div', { class: 'sidebar-deep-head' },
         h('p', { class: 'sidebar-deep-status', attrs: { role: 'status' }, text: status }),
@@ -402,7 +413,8 @@ export function createSidebar({ container, api, store, t, actions }) {
         }, t('shell.sidebar.backToList'))),
       result.results.length > 0
         ? h('ul', { class: 'search-results' }, result.results.map((match) => searchResult(match, result.query)))
-        : null);
+        : null,
+      truncated);
   }
 
   function renderList() {

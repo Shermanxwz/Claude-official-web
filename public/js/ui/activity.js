@@ -116,8 +116,8 @@ export function createRunningLine({ t, coarse }) {
 }
 
 /**
- * The pinned todo bar: "{done}/{total}" and the activeForm of the item in progress. A click expands the checklist with a
- * status mark per item. Shown while the list has items and is not all done, or while a turn runs.
+ * The pinned todo bar: "{done}/{total}" and the activeForm of the item in progress. A click expands the checklist with
+ * a status mark per item. Shown while the list has items and is not all done, or while a turn runs.
  * @param {{ t: Translate }} options
  */
 export function createTodoBar({ t }) {

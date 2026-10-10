@@ -22,11 +22,18 @@ const GENERIC_JSON_LIMIT = 20000;
 /** Event types that wait in the queue while the session's history loads, then replay in order. */
 const QUEUED_WHILE_LOADING = new Set(['sdk', 'request', 'request_resolved', 'notice', 'message_cancelled']);
 
-/** @typedef {{ t: (key: string, vars?: Record<string, unknown>) => string, api: any, store: any, actions: any, container: HTMLElement }} Env */
+/**
+ * @typedef {Object} Env
+ * @property {(key: string, vars?: Record<string, unknown>) => string} t
+ * @property {any} api
+ * @property {any} store
+ * @property {any} actions
+ * @property {HTMLElement} container
+ */
 
 /**
- * Creates the timeline for the conversation area. `onTodos` and `onActivity` receive the composer's todo list and running
- * line; each is called only when its value changed (and once on the first render).
+ * Creates the timeline for the conversation area. `onTodos` and `onActivity` receive the composer's todo list and
+ * running line; each is called only when its value changed (and once on the first render).
  * @param {{
  *   container: HTMLElement,
  *   api: any,
@@ -361,7 +368,9 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     // The browser's own scroll anchoring would adjust the position again after the prepend; the restore below does it.
     refs.scroller.style.overflowAnchor = 'none';
     try {
-      const page = await api.get(`/api/sessions/${encodeURIComponent(sessionId)}/messages?before=${state.oldestIndex}&limit=200`);
+      const page = await api.get(
+        `/api/sessions/${encodeURIComponent(sessionId)}/messages?before=${state.oldestIndex}&limit=200`,
+      );
       if (state.destroyed || token !== state.loadToken) return;
       state.model.prependTranscript(Array.isArray(page?.messages) ? page.messages : []);
       state.oldestIndex = Number.isFinite(page?.start) ? page.start : state.oldestIndex;
@@ -386,7 +395,9 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     state.model.discardOptimistic(clientMessageId);
     scheduleRender();
   };
-  /** A queued message the runtime dropped leaves the timeline at once, as the message_cancelled event would remove it. */
+  /**
+   * A queued message the runtime dropped leaves the timeline at once, as the message_cancelled event would remove it.
+   */
   ui.dropQueued = (clientMessageId) => {
     state.model.cancelQueued(clientMessageId);
     scheduleRender();
@@ -475,7 +486,9 @@ function renderSlots(refs, state, ui, entryCount) {
   if (state.hasMore && !state.loadError) {
     refs.head.append(h('button', {
       class: 'tl-load-earlier',
-      attrs: { type: 'button', disabled: state.loadingOlder ? true : null, 'aria-busy': state.loadingOlder ? 'true' : null },
+      attrs: {
+        type: 'button', disabled: state.loadingOlder ? true : null, 'aria-busy': state.loadingOlder ? 'true' : null,
+      },
       text: state.loadingOlder ? t('cards.loadingEarlier') : t('cards.loadEarlier'),
       on: { click: () => ui.loadOlder?.() },
     }));
@@ -494,7 +507,8 @@ function renderSlots(refs, state, ui, entryCount) {
   }
   if (state.loading && entryCount === 0) {
     refs.tail.append(h('div', { class: 'tl-skeleton', attrs: { 'aria-hidden': 'true' } },
-      h('div', { class: 'skel skel-short' }), h('div', { class: 'skel skel-long' }), h('div', { class: 'skel skel-mid' })));
+      h('div', { class: 'skel skel-short' }), h('div', { class: 'skel skel-long' }),
+        h('div', { class: 'skel skel-mid' })));
     return;
   }
   if (!state.loading && entryCount === 0 && state.sessionId) {
@@ -524,7 +538,10 @@ function stateBlock(text, action, role) {
   return h('div', { class: 'tl-state', attrs: { role: role === 'alert' ? 'alert' : 'status' } },
     icon(role === 'alert' ? 'alert' : 'info'),
     h('p', { class: 'tl-state-text', text }),
-    action ? h('button', { class: 'btn-ghost tl-state-action', attrs: { type: 'button' }, text: action.label, on: { click: action.onClick } }) : null);
+    action
+      ? h('button', { class: 'btn-ghost tl-state-action', attrs: { type: 'button' }, text: action.label,
+        on: { click: action.onClick } })
+      : null);
 }
 
 /** @param {(key: string) => string} t */
@@ -532,12 +549,7 @@ function emptyState(t) {
   return h('div', { class: 'tl-empty' },
     h('div', { class: 'tl-empty-icon' }, icon('spark')),
     h('h2', { class: 'tl-empty-title', text: t('cards.empty.title') }),
-    h('p', { class: 'tl-empty-lead', text: t('cards.empty.lead') }),
-    h('ul', { class: 'tl-tips' },
-      h('li', { text: t('cards.empty.tipSlash') }),
-      h('li', { text: t('cards.empty.tipAt') }),
-      h('li', { text: t('cards.empty.tipAttach') }),
-      h('li', { text: t('cards.empty.tipMode') })));
+    h('p', { class: 'tl-empty-lead', text: t('cards.empty.lead') }));
 }
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -704,7 +716,8 @@ function userEl(ui, entry) {
   article.append(bubble);
 
   if (status === 'sending') {
-    article.append(h('div', { class: 'msg-status', attrs: { role: 'status' } }, h('span', { text: t('cards.user.sending') })));
+    article.append(h('div', { class: 'msg-status', attrs: { role: 'status' } },
+      h('span', { text: t('cards.user.sending') })));
   }
   if (status === 'queued') {
     article.append(h('div', { class: 'msg-status is-queued', attrs: { role: 'status' } },
@@ -730,7 +743,9 @@ function userEl(ui, entry) {
             // The retry keeps the id of the failed message, so the gateway can tell a repeat from a new message.
             actions.sendMessage({
               text: entry.text,
-              attachments: (entry.attachments ?? []).map((file) => ({ path: file.path, name: file.name, kind: file.kind })),
+              attachments: (entry.attachments ?? []).map((file) => ({
+                path: file.path, name: file.name, kind: file.kind,
+              })),
               clientMessageId: entry.clientMessageId,
             });
           },
@@ -747,15 +762,26 @@ function userEl(ui, entry) {
   if (entry.uuid && status === 'sent') {
     article.append(h('div', { class: 'msg-actions', attrs: { role: 'toolbar', 'aria-label': t('cards.actions') } },
       actionButton(t('cards.action.copy'), 'copy', () => copyText(ui, entry.text)),
-      actionButton(t('cards.action.rewind'), 'rewind', () => actions.openRewind(entry.uuid), t('cards.action.rewindTitle')),
+      actionButton(t('cards.action.rewind'), 'rewind', () => actions.openRewind(entry.uuid),
+        t('cards.action.rewindTitle')),
       actionButton(t('cards.action.fork'), 'fork', () => actions.openFork(entry.uuid), t('cards.action.forkTitle'))));
-    article.addEventListener('click', (event) => {
-      const target = event.target;
-      if (target instanceof Element && target.closest('button, a, img, .file-chip')) return;
-      article.classList.toggle('is-actions');
-    });
+    article.addEventListener('click', tapToggleActions);
   }
   return article;
+}
+
+/**
+ * A message's toolbar has no hover on touch screens, so a tap on the message shows it and a second tap hides it. Taps
+ * on controls, links, images, files and code keep their own action. Pointer devices use hover and focus only.
+ * @param {Event} event
+ */
+function tapToggleActions(event) {
+  const article = event.currentTarget;
+  if (!(article instanceof HTMLElement) || !article.querySelector(':scope > .msg-actions')) return;
+  if (globalThis.matchMedia?.('(hover: none)').matches !== true) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest('button, a, img, .file-chip, pre')) return;
+  article.classList.toggle('is-actions');
 }
 
 /**
@@ -808,7 +834,7 @@ function assistantEl(ui, entry, previous) {
   const { t } = ui.env;
   const article = previous && previous.dataset.kind === 'assistant'
     ? previous
-    : h('article', { class: 'msg msg-assistant', dataset: { kind: 'assistant' } });
+    : h('article', { class: 'msg msg-assistant', dataset: { kind: 'assistant' }, on: { click: tapToggleActions } });
   article.classList.toggle('is-streaming', Boolean(entry.streaming));
   article.classList.toggle('is-aborted', Boolean(entry.aborted));
   let body = article.querySelector(':scope > .msg-body');
@@ -856,7 +882,9 @@ function blockEl(ui, block) {
     case 'thinking': {
       // Without summaries (or when the model redacted the reasoning) there is no text to open: a plain label says so.
       if (!block.text) return thinkingLabel(ui, block);
-      const details = h('details', { class: ['thinking', block.streaming && 'is-streaming'], dataset: { kind: 'thinking' } },
+      const details = h('details', {
+        class: ['thinking', block.streaming && 'is-streaming'], dataset: { kind: 'thinking' },
+      },
         h('summary', { class: 'thinking-summary' }, icon('brain'),
           h('span', { class: block.streaming ? 'shimmer' : null, text: t('cards.thinking') })),
         h('div', { class: 'thinking-body', text: block.text }));
@@ -866,7 +894,8 @@ function blockEl(ui, block) {
     case 'tool-draft':
       return h('div', { class: 'draft-tool', dataset: { kind: 'tool-draft' } },
         h('div', { class: 'draft-tool-head' }, icon('tool'),
-          h('span', { class: 'draft-tool-name', text: block.name }), h('span', { class: 'shimmer', text: t('cards.draft.writing') })),
+          h('span', { class: 'draft-tool-name', text: block.name }),
+          h('span', { class: 'shimmer', text: t('cards.draft.writing') })),
         h('pre', { class: 'draft-tool-body', text: truncateMiddle(block.partial, 2000) }));
     default:
       return genericEl(block.label ?? 'block', block.raw, ui);
@@ -904,7 +933,8 @@ function workEl(ui, entry, previous) {
 
   const tools = entry.items.filter((item) => item.kind === 'tool');
   const runningTool = tools.find((item) => item.running);
-  const label = entry.label || (tools.length === 1 ? t('cards.work.step') : t('cards.work.steps', { count: tools.length }));
+  const label = entry.label ||
+    (tools.length === 1 ? t('cards.work.step') : t('cards.work.steps', { count: tools.length }));
   const summary = h('summary', { class: 'work-summary' },
     icon('layers'),
     h('span', { class: 'work-label', text: label }),
@@ -1007,7 +1037,9 @@ function rowEl(ui, row) {
     return h('div', { class: ['work-row', 'is-hook', failed && 'is-error'], dataset: { kind: 'hook', status } },
       icon(failed ? 'alert' : 'plug'),
       h('div', { class: 'work-row-body' },
-        h('div', { class: 'work-row-title', text: t('cards.hook.title', { name: row.hookName, event: row.hookEvent }) }),
+        h('div', {
+          class: 'work-row-title', text: t('cards.hook.title', { name: row.hookName, event: row.hookEvent }),
+        }),
         h('div', { class: 'work-row-hint', text: stateText }),
         row.output ? h('pre', { class: 'work-row-output', text: row.output }) : null));
   }
@@ -1019,9 +1051,14 @@ function rowEl(ui, row) {
       : status === 'completed' ? t('cards.task.completed')
         : status === 'failed' ? t('cards.task.failed') : t('cards.task.stopped');
     const details = [];
-    if (typeof row.toolUses === 'number') details.push(t(pluralKey('cards.task.tools', row.toolUses, getLocale()), { count: row.toolUses }));
+    if (typeof row.toolUses === 'number') {
+      details.push(t(pluralKey('cards.task.tools', row.toolUses, getLocale()), { count: row.toolUses }));
+    }
     if (typeof row.durationMs === 'number') details.push(formatDuration(row.durationMs));
-    return h('div', { class: ['work-row', 'is-task', failed && 'is-error'], dataset: { kind: 'task', status }, attrs: { role: 'status' } },
+    return h('div', {
+      class: ['work-row', 'is-task', failed && 'is-error'], dataset: { kind: 'task', status },
+      attrs: { role: 'status' },
+    },
       icon(done ? (failed ? 'alert' : 'check') : 'clock'),
       h('div', { class: 'work-row-body' },
         h('div', { class: 'work-row-title', text: row.description || row.summary || t('cards.task.untitled') }),
@@ -1044,7 +1081,11 @@ function noticeEl(ui, entry) {
       h('div', { class: 'notice-text', text }))
     : h('div', { class: 'notice-text', text });
   // A refused prompt can be edited and sent again: the rewind dialog opens on that message.
-  const refused = entry.code === 'refusal-no-fallback' && typeof entry.vars?.refused === 'string' ? entry.vars.refused : null;
+  const refused = entry.code === 'refusal-no-fallback' && typeof entry.vars?.refused === 'string'
+    ? entry.vars.refused
+    : null;
+  // A retry says what happens in its line; the raw error of the failed request waits under it, collapsed.
+  const cause = entry.code === 'api-retry' && entry.vars?.error ? String(entry.vars.error) : '';
   return h('div', {
     class: ['notice', `is-${level}`],
     dataset: { kind: 'notice', code: entry.code },
@@ -1054,7 +1095,9 @@ function noticeEl(ui, entry) {
     attrs: { type: 'button' },
     text: t('cards.refusal.editRetry'),
     on: { click: () => actions.openRewind(refused) },
-  }) : null);
+  }) : null, cause ? h('details', { class: 'notice-collapse' },
+    h('summary', { text: t('cards.notice.errorDetail') }),
+    h('div', { class: 'notice-detail', text: cause })) : null);
 }
 
 /**
@@ -1079,8 +1122,7 @@ function noticeText(ui, entry) {
       return t('cards.elicitation.done', { server: vars.server || t('cards.request.unknownServer') });
     case 'api-retry': {
       const seconds = Number.isFinite(vars.delayMs) ? Math.max(1, Math.round(vars.delayMs / 1000)) : 0;
-      const base = t('cards.notice.apiRetry', { attempt: vars.attempt ?? '?', max: vars.max ?? '?', seconds });
-      return vars.error ? `${base} · ${String(vars.error)}` : base;
+      return t('cards.notice.apiRetry', { attempt: vars.attempt ?? '?', max: vars.max ?? '?', seconds });
     }
     case 'memory-recall': {
       const count = Number.isFinite(vars.count) ? vars.count : 0;
@@ -1104,9 +1146,13 @@ function dividerEl(ui, entry) {
   const { t } = ui.env;
   let label;
   if (entry.variant === 'clear') label = t('cards.divider.cleared');
-  else if (Number.isFinite(entry.preTokens)) label = t('cards.divider.compacted', { tokens: formatTokens(entry.preTokens) });
+  else if (Number.isFinite(entry.preTokens))
+      label = t('cards.divider.compacted', { tokens: formatTokens(entry.preTokens) });
   else label = t('cards.divider.compactedPlain');
-  return h('div', { class: ['divider', `is-${entry.variant}`], dataset: { kind: 'divider' }, attrs: { role: 'separator', 'aria-label': label } },
+  return h('div', {
+    class: ['divider', `is-${entry.variant}`], dataset: { kind: 'divider' },
+    attrs: { role: 'separator', 'aria-label': label },
+  },
     h('span', { class: 'divider-label', text: label }));
 }
 
@@ -1132,7 +1178,9 @@ function resultEl(ui, entry) {
     h('div', { class: 'turn-result-line' },
       icon(variant === 'error' ? 'alert' : variant === 'interrupted' ? 'x' : 'check'),
       h('span', { text: sentence })),
-    errors.length > 0 ? h('ul', { class: 'turn-errors' }, errors.map((message) => h('li', { text: String(message) }))) : null,
+    errors.length > 0
+      ? h('ul', { class: 'turn-errors' }, errors.map((message) => h('li', { text: String(message) })))
+      : null,
     denials.length > 0 ? h('div', { class: 'turn-denials', text: t('cards.result.denied', {
       count: denials.length,
       tools: denials.map((denial) => denial.toolName).filter(Boolean).join(', '),

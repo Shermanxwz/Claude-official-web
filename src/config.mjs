@@ -273,15 +273,14 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
   const modelRaw = optionalText(env.CAW_DEFAULT_MODEL);
   const model = modelRaw === null ? null : plainText('CAW_DEFAULT_MODEL', modelRaw, 200);
   const allowBypass = flag('CAW_ALLOW_BYPASS', env.CAW_ALLOW_BYPASS, false);
+  // The one rule for bypassPermissions: the switch exists only for the full profile, so every gate below it holds.
+  if (allowBypass && profile !== 'full') {
+    throw new ConfigError('CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full');
+  }
   const permissionMode = /** @type {import('./contracts.mjs').Config['defaults']['permissionMode']} */ (
     choice('CAW_DEFAULT_PERMISSION_MODE', env.CAW_DEFAULT_PERMISSION_MODE, PERMISSION_MODES, null));
-  if (permissionMode === 'bypassPermissions') {
-    if (!allowBypass) {
-      throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ALLOW_BYPASS=1');
-    }
-    if (profile !== 'full') {
-      throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ACCESS_PROFILE=full');
-    }
+  if (permissionMode === 'bypassPermissions' && !allowBypass) {
+    throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ALLOW_BYPASS=1');
   }
   const effort = /** @type {import('./contracts.mjs').Config['defaults']['effort']} */ (
     choice('CAW_DEFAULT_EFFORT', env.CAW_DEFAULT_EFFORT, EFFORT_LEVELS, null));

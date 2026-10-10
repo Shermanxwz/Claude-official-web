@@ -61,6 +61,11 @@ claude
 Inside Claude Code, run `/login`, complete the browser flow, then run `/exit`. Claude Code stores the login under the
 user's home directory. The gateway never reads it.
 
+You can sign in from the browser instead, after the service is running. Open **Settings → Account** and choose **Sign in
+with Claude** (a subscription) or **Sign in with the Console** (an API account). That needs the `full` access profile,
+which is the default. The gateway starts the same sign-in flow that `/login` uses, and Claude Code stores the login as
+it does for `/login`.
+
 Use the same Claude Code version as the SDK. The SDK bundles the Claude Code binary, and the installer reports that
 binary's path and version at the end of installation. The gateway uses the bundled binary unless `CAW_CLAUDE_BIN` says
 otherwise.
@@ -84,11 +89,13 @@ The installer:
 
 - checks Node.js (22.12 or newer) and npm, and refuses to run as root (use `--allow-root` only if you understand why);
 - checks the existing configuration before it installs anything. It refuses a file that sets both token settings, a
-  plaintext token shorter than 16 characters, a malformed hash, `CAW_REQUIRE_AUTH=0` or `CAW_ENGINE=mock`, and it names the
-  setting to fix;
+  plaintext token shorter than 16 characters, a malformed hash, `CAW_REQUIRE_AUTH=0` or `CAW_ENGINE=mock`, and it names
+  the setting to fix;
 - runs `npm ci --omit=dev` in the project directory;
 - creates `~/.config/claude-official-web/env` (directory mode 700, file mode 600). If the file holds no login token, it
   generates a 32-byte token and stores only its SHA-256 hash, as `CAW_TOKEN_SHA256`;
+- writes the defaults that the file does not set yet: `CAW_HOST`, `CAW_PORT`, `CAW_REQUIRE_AUTH`, `CAW_ENGINE`,
+  `CAW_ACCESS_PROFILE`, `CAW_APP_NAME`, `CAW_WORKSPACE_ROOTS`, `CAW_STATE_DIR` and `CAW_TERMINAL`;
 - applies the configuration overrides you passed in the environment: `CAW_PUBLIC_ORIGIN`, `CAW_PORT`, `CAW_HOST`,
   `CAW_WORKSPACE_ROOTS`, `CAW_TERMINAL`, `CAW_ACCESS_PROFILE`, `CAW_APP_NAME` and `CAW_CLAUDE_BIN`;
 - installs `~/.config/systemd/user/claude-official-web.service`, enables it and starts it. A service that is already
@@ -105,9 +112,9 @@ Login token (shown once; save it now in a password manager):
   <token>
 ```
 
-Save it at that moment. The configuration file keeps only the SHA-256 hash, so the token cannot be read back later. Anyone
-who has the token can use the gateway. Run the installer in your own terminal, not through Claude Code, so that the
-printed token is not written to a session transcript.
+Save it at that moment. The configuration file keeps only the SHA-256 hash, so the token cannot be read back later.
+Anyone who has the token can use the gateway. Run the installer in your own terminal, not through Claude Code, so that
+the printed token is not written to a session transcript.
 
 Options:
 
@@ -118,8 +125,8 @@ Options:
 
 Re-running the installer is safe. It keeps the configuration values you set, keeps the existing token, and updates the
 dependencies and the unit. It restarts a running service, and in the default hash mode that ends every browser session,
-because the session secret exists only in memory. Sign in again afterwards. With a plaintext `CAW_TOKEN`, sessions survive
-the restart.
+because the session secret exists only in memory. Sign in again afterwards. With a plaintext `CAW_TOKEN`, sessions
+survive the restart.
 
 Useful service commands:
 
@@ -138,13 +145,78 @@ cd ~/claude-official-web
 scripts/install-linux.sh --rotate-token
 ```
 
-The installer issues a new token, stores its hash (or the plaintext with `--plain-token`), restarts the service and prints
-the new token once. Every browser session ends with the restart, so sign in again with the new token. Treat every browser
-that might have seen the old token as compromised.
+The installer issues a new token, stores its hash (or the plaintext with `--plain-token`), restarts the service and
+prints the new token once. Every browser session ends with the restart, so sign in again with the new token. Treat every
+browser that might have seen the old token as compromised.
 
 Rotation also replaces the stored token settings, so it repairs a file that sets both `CAW_TOKEN` and `CAW_TOKEN_SHA256`
 or holds a malformed hash. A plaintext installation becomes a hashed one the same way. Run it in your own terminal, as
 described above.
+
+### Optional settings
+
+The configuration file holds every setting that the README's configuration table describes. These are the ones that
+matter on a server:
+
+- `CAW_ALLOW_BYPASS` (default `0`). Keep it at `0` unless you need the `bypassPermissions` mode, which runs without
+  permission prompts. The switch needs `CAW_ACCESS_PROFILE=full`, and the gateway refuses to start with the switch under
+  `read` or `standard`. `CAW_DEFAULT_PERMISSION_MODE=bypassPermissions` needs the switch too. Set it only on a host
+  where you accept that every action runs without a prompt.
+- `CAW_DEFAULT_PERMISSION_MODE` (unset by default). Unset, new sessions take the permission mode from Claude Code's own
+  settings, as they do in the terminal. Set it only to override those settings.
+- `CAW_FALLBACK_MODEL`. The model that a refused answer can be retried on (`--fallback-model`). Choose a model that your
+  account can use.
+- `CAW_DEFAULT_MODEL` and `CAW_DEFAULT_EFFORT`. The defaults for new sessions. Leave them unset to keep Claude Code's
+  own defaults.
+- `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`. A value other than `0` or `false` turns background tasks off for Claude Code,
+  and the gateway then offers no "Run in background" action.
+
+Restart the service after you change any of them.
+
+### Browser tools on a headless server
+
+A server without a display cannot run Claude in Chrome, so use a browser MCP server instead. The gateway starts that
+server on the host. A session uses it only when a user with the `full` profile turns on **Browser tools** in the session
+settings.
+
+1. Install a Chromium for the service user, which the MCP server starts, for example with `npx playwright install
+   chromium`. Alternatively, point the command at an existing Chrome or Chromium with `--executable-path <path>`.
+2. Check that the service can run `npx`. The unit's `PATH` includes the Node.js bin directory that the installer found,
+   so run the installer again after you change the Node.js installation (see step 10).
+3. Pin the version of the MCP server. The example below uses `@playwright/mcp@0.0.82`, the version whose flags this
+   guide was checked against. For another version, run `npx -y @playwright/mcp@<version> --help` and confirm that
+   `--headless`, `--isolated` and `--executable-path` are still listed.
+4. Set the command in the configuration file. Single quotes keep the double quotes of the JSON array:
+
+   ```bash
+   CAW_BROWSER_MCP_COMMAND='["npx","-y","@playwright/mcp@0.0.82","--headless","--isolated"]'
+   ```
+
+   Then run `systemctl --user restart claude-official-web`.
+
+5. Open a session, turn on **Browser tools** in its settings, and check that the MCP panel shows the `browser` server as
+   connected.
+
+`--headless` runs the browser without a display. `--isolated` keeps the browser profile in memory, so no sign-in or
+cookie outlives the session. If Chromium does not start, check the host's sandbox support first. `--no-sandbox` exists,
+but it weakens the browser's isolation, so use it only as a last resort.
+
+Browser tools act with the service user's network access and files, and what a web page says can steer the model. Read
+[SECURITY.md](../SECURITY.md) before you turn them on.
+
+### Claude in Chrome on a desktop host
+
+Claude in Chrome drives a Chrome browser on the same machine as the gateway. It suits a desktop where you run the
+gateway, and it does not work on a headless server.
+
+1. Sign Claude Code in with a claude.ai account, because Claude in Chrome does not work with a Console-only login. In
+   **Settings → Account**, choose **Sign in with Claude**. That needs the `full` profile.
+2. Install the Claude in Chrome extension in the Chrome profile that runs on this machine.
+3. Set `CAW_CHROME=1` in the configuration file, then run `systemctl --user restart claude-official-web`. Each query
+   then starts with `--chrome`.
+4. Open the **Claude in Chrome** tab in the runtime panels. It shows whether Claude in Chrome is allowed, installed and
+   connected, and it has links to install the extension and to reconnect it. Choosing among several Chrome browsers is
+   done with `/chrome` in the terminal tab.
 
 ## 7. Keep the service running after you log out
 
@@ -187,8 +259,8 @@ Cloudflare Access puts an identity check in front of the gateway. The gateway's 
 
 4. Run the tunnel as a service. Cloudflare's documentation describes `cloudflared service install`, which needs
    administrator rights, and running `cloudflared tunnel run claude-web` under systemd.
-5. In the Cloudflare dashboard, create a self-hosted Access application for `claude.example.com` with an Allow policy for
-   the people who should reach it.
+5. In the Cloudflare dashboard, create a self-hosted Access application for `claude.example.com` with an Allow policy
+   for the people who should reach it.
 6. Add the line `CAW_TRUST_PROXY=1` to `~/.config/claude-official-web/env`, then restart the service. Cloudflare sets
    `CF-Connecting-IP` at its edge, and the gateway reads that header first, so each visitor counts separately. This is
    safe because the gateway listens on `127.0.0.1`, so the tunnel is the only network route to it.
@@ -217,8 +289,8 @@ Tailscale serves the gateway over HTTPS to devices on your tailnet only. It does
    ```
 
    Re-running the installer updates `CAW_PUBLIC_ORIGIN` in the configuration file and restarts the service, which ends
-   browser sessions in the default hash mode. Leave `CAW_TRUST_PROXY` at `0` unless you have checked which client-address
-   headers `tailscale serve` sends.
+   browser sessions in the default hash mode. Leave `CAW_TRUST_PROXY` at `0` unless you have checked which
+   client-address headers `tailscale serve` sends.
 
 ### Option C: A TLS reverse proxy that you operate
 
@@ -238,8 +310,8 @@ claude.example.com {
 If you set `CAW_TRUST_PROXY=1`, add `header_up X-Real-IP {http.request.remote.host}` inside the `reverse_proxy` block.
 Caddy does not set `X-Real-IP` itself, and this line replaces any `X-Real-IP` value that a visitor sent.
 
-**nginx** needs these settings for the gateway: `Host` is forwarded unchanged, buffering is off and the timeouts are long
-for the event stream, and the upgrade headers are passed for the terminal WebSocket.
+**nginx** needs these settings for the gateway: `Host` is forwarded unchanged, buffering is off and the timeouts are
+long for the event stream, and the upgrade headers are passed for the terminal WebSocket.
 
 ```nginx
 map $http_upgrade $connection_upgrade {
@@ -277,18 +349,18 @@ The certificate paths shown are the Let's Encrypt defaults. Use your own paths i
 Whichever option you choose, the browser's address bar must match `CAW_PUBLIC_ORIGIN` exactly, including the scheme and
 the absence of a trailing slash. Otherwise every write fails with `ORIGIN_REJECTED`.
 
-The gateway also accepts a request only when its `Host` header is `CAW_PUBLIC_ORIGIN`'s host or a loopback name. The proxy
-must therefore forward `Host` unchanged. Otherwise the gateway answers `421 HOST_REJECTED`. `npm run smoke:gateway` checks
-`/healthz` through the public URL, so it shows this problem.
+The gateway also accepts a request only when its `Host` header is `CAW_PUBLIC_ORIGIN`'s host or a loopback name. The
+proxy must therefore forward `Host` unchanged. Otherwise the gateway answers `421 HOST_REJECTED`. `npm run
+smoke:gateway` checks `/healthz` through the public URL, so it shows this problem.
 
 With a reverse proxy or tunnel on the same host, the gateway sees the proxy as the client. Without `CAW_TRUST_PROXY=1`,
 every visitor shares one client address. The login limit (ten failures in ten minutes) and the stream limit (16 per
 client) then apply to all visitors together, so ten wrong tokens from anyone block sign-in for everyone for ten minutes.
 
 Set `CAW_TRUST_PROXY=1` only when the proxy sets the client address header itself and the gateway is reachable only
-through that proxy. The gateway reads `CF-Connecting-IP`, then `X-Real-IP`, then the last `X-Forwarded-For` entry, and it
-ignores the first `X-Forwarded-For` entry, which the visitor sends. Otherwise a visitor can choose its own address. The
-installer does not set `CAW_TRUST_PROXY`; add the line to the configuration file and restart the service.
+through that proxy. The gateway reads `CF-Connecting-IP`, then `X-Real-IP`, then the last `X-Forwarded-For` entry, and
+it ignores the first `X-Forwarded-For` entry, which the visitor sends. Otherwise a visitor can choose its own address.
+The installer does not set `CAW_TRUST_PROXY`; add the line to the configuration file and restart the service.
 
 ## 9. Verify the deployment
 
@@ -303,8 +375,8 @@ npm run smoke:gateway
 unset CAW_GATEWAY_TOKEN
 ```
 
-Use the token you saved when the installer printed it, or the one from `--rotate-token`. The configuration file holds only
-the hash by default, so it cannot supply the token.
+Use the token you saved when the installer printed it, or the one from `--rotate-token`. The configuration file holds
+only the hash by default, so it cannot supply the token.
 
 The gateway check ends with `GATEWAY_VALIDATED`. It creates no sessions and runs no model turns. It also requests
 `/healthz` through the public URL, so a proxy that rewrites the `Host` header fails here.
@@ -332,8 +404,8 @@ npm run smoke:runtime
 npm run smoke:gateway          # with the variables from step 9
 ```
 
-The installer restarts the service. In the default hash mode every browser session ends at that restart, so sign in again
-afterwards.
+The installer restarts the service. In the default hash mode every browser session ends at that restart, so sign in
+again afterwards.
 
 Keep Node.js, `@anthropic-ai/claude-agent-sdk` and the Claude Code binary aligned. The lock file pins the SDK, and the
 SDK bundles the matching runtime. If you also install a separate `claude` command, update it at the same time. Compare
@@ -347,9 +419,10 @@ service uses the new path.
 Back up these locations regularly, and encrypt the backups. They hold sensitive data:
 
 - `~/.claude`: session transcripts, settings, and the Claude Code login.
-- `~/.local/state/claude-official-web`: gateway state. It holds the session revocations and the list of trusted folders.
-- `~/.config/claude-official-web/env`: the configuration. It holds the hash of the login token, or the token itself if you
-  installed with `--plain-token`.
+- `~/.local/state/claude-official-web`: gateway state. It holds the session revocations, the list of trusted folders and
+  the folders that the gateway uses for its own runtime queries (the sign-in query and the trust check).
+- `~/.config/claude-official-web/env`: the configuration. It holds the hash of the login token, or the token itself if
+  you installed with `--plain-token`.
 
 Do not keep backups of the configuration file in an unencrypted place.
 

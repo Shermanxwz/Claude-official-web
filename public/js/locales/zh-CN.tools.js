@@ -15,7 +15,7 @@ registerMessages('zh-CN', {
   'tools.verb.read': '读取',
   'tools.verb.write': '写入',
   'tools.verb.edit': '编辑',
-  'tools.verb.notebook': 'Notebook',
+  'tools.verb.notebook': '笔记本',
   'tools.verb.run': '运行',
   'tools.verb.output': '输出',
   'tools.verb.monitor': '监控',

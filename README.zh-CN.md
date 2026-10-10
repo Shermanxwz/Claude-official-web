@@ -2,7 +2,8 @@
 
 # claude-official-web
 
-一个可自托管的图形化 Web 宿主，用于运行官方 Claude Agent SDK。它使用与 `claude` 终端相同的 Claude Code 运行时，因此你的 CLAUDE.md、设置、权限规则、钩子、技能、插件、MCP 服务器、子代理和会话文件，在这里的表现与在终端中完全一致。
+一个可自托管的图形化 Web 宿主，用于运行官方 Claude Agent SDK。它使用与 `claude` 终端相同的 Claude Code 运行时，因此你的
+CLAUDE.md、设置、权限规则、钩子、技能、插件、MCP 服务器、子代理和会话文件，在这里的表现与在终端中完全一致。
 
 ## 截图
 
@@ -16,26 +17,52 @@
 
 claude-official-web 由两部分组成：
 
-- **网关**是一个 Node.js 进程。它负责检查你的登录状态、提供界面，并把请求转发给官方 Claude Agent SDK（`@anthropic-ai/claude-agent-sdk` 0.3.295）。
-- **引擎**是 SDK。它会为每个运行中的会话启动官方 Claude Code 运行时（2.1.295）。每一条回复、每一次工具调用、每一个权限决定和每一处文件改动，都由 Claude Code 本身产生。网关只负责传输和展示这些内容。
+- **网关**是一个 Node.js 进程。它检查你的登录状态、提供界面，并把请求转发给官方 Claude Agent SDK
+  （`@anthropic-ai/claude-agent-sdk` 0.3.295）。
+- **引擎**是 SDK。它为每个运行中的会话启动官方 Claude Code 运行时（2.1.295）。每一条回复、每一次工具调用、每一个权限决定和
+  每一处文件改动，都由 Claude Code 本身产生。网关只负责传输和展示这些内容。
 
 界面在浏览器中呈现对话、审批卡片和会话工具。它还可以附加一个终端标签页，但只有在你需要时才开启。
 
-由于引擎就是 Claude Code，会话与终端使用的是同一批文件，保存在 `~/.claude/projects` 中。在浏览器中开始的会话，可以用 `claude --resume <id>` 在终端中继续；反过来也一样。
+由于引擎就是 Claude Code，会话与终端使用的是同一批文件，保存在 `~/.claude/projects` 中。在浏览器中开始的会话，可以用
+`claude --resume <id>` 在终端中继续；反过来也一样。
 
-claude-official-web 是一个独立项目，与 Anthropic 没有关联，也未获得 Anthropic 的认可或赞助。界面不会自称为 Claude Code，也不使用 Claude Code 的品牌标识。产品名称可以配置（`CAW_APP_NAME`，默认值为 `Agent Web`）。
+claude-official-web 是一个独立项目，与 Anthropic 没有关联，也未获得 Anthropic 的认可或赞助。界面不会自称为 Claude Code，
+也不使用 Claude Code 的品牌标识。产品名称可以配置（`CAW_APP_NAME`，默认值为 `Agent Web`）。
 
 ## 功能
 
 这里只是概览。每项功能对应的 SDK 调用或消息，完整对照见 [docs/FEATURES.md](docs/FEATURES.md)。
 
-- **对话：** 流式回复、可折叠并带摘要的思考过程、Markdown 与代码、覆盖所有工具类别的工具卡片（编辑操作会显示差异）、嵌套在父卡片中的子代理、后台任务（包括把正在运行的命令或子代理转到后台，相当于终端里的 Ctrl+B）、不会中止后台任务的中断、排队消息、拒答后换模型重试的提示、上下文压缩和上下文用量。
-- **审批：** 权限卡片（允许一次、始终允许，或拒绝并填写原因）、对 AskUserQuestion 的回答、计划审批、MCP 信息征询（elicitation）、权限模式，以及模型、推理强度（effort）和 Fast 模式的切换。“始终允许”会保存勾选的建议：允许规则和仅限本会话的模式切换默认勾选，目录授权等其他变更只有在你勾选后才会保存。
-- **会话：** 启动、恢复、重命名、添加标签、分叉、回退代码或对话、删除、分页查看历史记录，以及按项目分组的会话列表。
-- **输入：** Claude Code 的斜杠命令（技能、自定义命令和 MCP 提示词，以及无需终端即可使用的内置命令）、`@` 文件引用、图片和文件附件，以及提示词建议。
-- **工作区与文件夹信任：** 带目录浏览器的允许根目录，每个路径都会与这些根目录进行检查。只有在你信任某个文件夹之后，其项目设置、钩子、技能、CLAUDE.md 和 MCP 服务器才会加载。
-- **扩展：** MCP 服务器的状态、开关和重连；插件（带有与 `/reload-plugins` 相同的提示缓存检查）、技能和输出风格的重新加载；输出风格选择；文件夹受信任后，CLAUDE.md、设置、钩子和插件的加载方式与终端中完全相同。
-- **只走官方接口：** Claude Code 的每项功能都通过 SDK 的公开接口实现。网关自己实现的少数部分及其原因，列在 [ARCHITECTURE.md](ARCHITECTURE.md#official-interfaces) 中。
+- **对话：** 流式回复、可折叠并带摘要的思考过程、Markdown 与代码、覆盖所有工具类别的工具卡片（编辑操作会显示差异）、
+  嵌套在父卡片中的子代理、后台任务（包括把正在运行的命令或子代理转到后台，相当于终端里的 Ctrl+B）、不会中止后台任务的中断、
+  可以取消的排队消息、可以清空队列的停止菜单、模型拒答后改用备用模型的提示、上下文压缩和上下文用量。旁路提问（`/btw`）的
+  回答不会写入对话记录。
+- **审批：** 权限卡片（允许一次、始终允许，或拒绝并填写原因）、对 AskUserQuestion 的回答、计划审批、MCP 信息征询
+  （elicitation）、权限模式，以及模型、推理强度（effort）和 Fast 模式的切换。“始终允许”会保存勾选的建议：允许规则和仅限本会话的
+  模式切换默认勾选，目录授权等其他变更只有在你勾选后才会保存。模型拒绝了某个请求时，对话框会提供三种选择：改用备用模型重试、
+  编辑提示词或取消。
+- **会话：** 启动、恢复、重命名、添加标签、分叉、回退代码或对话、删除、分页查看历史记录、把会话导出为文本文件（`/export`），
+  以及按项目分组的会话列表。搜索会匹配所有对话的标题和第一条提示词，以及最近修改的 50 个对话的消息文本（限时 5 秒）。快速切换器
+  （Ctrl+K，在 Mac 上为 ⌘K）可以按标题查找会话，也能运行同样的搜索。
+- **会话设置：** 每个会话可以单独设置智能体、附加目录、备用模型和浏览器工具。备用模型的修改要在重启后才生效，附加目录的修改会
+  重启正在运行的会话。
+- **输入：** Claude Code 的斜杠命令（技能、自定义命令和 MCP 提示词，以及无需终端即可使用的内置命令）、`@` 文件引用、图片和文件
+  附件，以及提示词建议。
+- **工作区与文件夹信任：** 带目录浏览器的工作区根目录。每个路径都会与这些根目录进行检查。只有在你信任某个文件夹之后，其项目设置、
+  钩子、技能、CLAUDE.md 和 MCP 服务器才会加载。
+- **运行时面板：** `/status`、`/permissions`、`/hooks`、`/memory`（用于编辑 Claude Code 加载的 CLAUDE.md 文件的编辑器）、
+  `/skills`、`/sandbox`、`/usage`，以及在 `full` 档位下的设置视图（`/config`）。面板显示的是运行时报告的内容。只有记忆编辑器
+  会修改内容。
+- **扩展：** MCP 服务器的状态、开关、重连和登录（OAuth）；插件（带有与 `/reload-plugins` 相同的提示缓存检查）、技能和输出风格的
+  重新加载；输出风格选择；文件夹受信任后，CLAUDE.md、设置、钩子和插件的加载方式与终端中完全相同。
+- **账户：** 在“设置 → 账户”中，可以通过浏览器完成 Claude Code 的登录，流程与 `/login` 相同。网关从不读取凭据。
+- **浏览器工具（可选）：** 桌面主机上的 Claude in Chrome，或者你配置并可按会话开启的浏览器 MCP 服务器。参见[浏览器](#浏览器)。
+- **界面：** 浅色、深色和跟随系统的主题，三档文字大小，键盘快捷键（Shift+Tab 切换权限模式），触屏设备上至少 44 px 的触控目标，
+  以及一个开发者控制台（`/devtools`），显示每个运行时面板的原始输出和本页收到的事件。
+- **只走官方接口：** 每项 Claude Code 功能都通过 Agent SDK 实现，公开接口优先。SDK 没有对应接口时，网关才会调用运行时自己的
+  界面，并且只在已安装的运行时提供这些界面时才调用。网关自己实现的少数部分及其原因，列在
+  [ARCHITECTURE.md](ARCHITECTURE.md#official-interfaces) 中。
 - **运维：** 令牌登录（默认以哈希形式保存）、健康检查端点、结构化日志、systemd 服务安装器，以及验证套件（`npm run seal`）。
 - **终端备用方案（可选）：** 一个终端标签页，用于运行那些只存在于终端中的命令。
 
@@ -44,7 +71,9 @@ claude-official-web 是一个独立项目，与 Anthropic 没有关联，也未�
 - Linux 或 macOS。生产环境安装器管理的是 systemd 用户服务，因此它在 Linux 上运行。在 macOS 上，请使用 `npm start` 运行网关。
 - Node.js 22.12 或更高版本。
 - Claude 订阅或 Anthropic API 密钥。参见[用量和计费](#用量和计费)。
-- 在服务器上，以运行网关的同一用户身份登录一次 Claude Code。SDK 自带 Claude Code 可执行文件，因此网关无需单独安装。登录方法：以该用户身份运行一次 `claude`（或 `npx @anthropic-ai/claude-code`），然后完成 `/login`。
+- 在服务器上，以运行网关的同一用户身份登录一次 Claude Code。SDK 自带 Claude Code 可执行文件，因此网关无需单独安装。登录方法：
+  以该用户身份运行一次 `claude`（或 `npx @anthropic-ai/claude-code`），然后完成 `/login`。也可以在首次启动之后，在“设置 → 账户”
+  中通过浏览器登录，这需要 `full` 访问档位。
 - 仅终端标签页需要：`build-essential` 和 `python3`，node-pty 编译时需要它们。
 
 ## 快速演示
@@ -68,9 +97,12 @@ npm run demo
    CAW_PUBLIC_ORIGIN=https://claude.example.com scripts/install-linux.sh
    ```
 
-安装器会检查 Node.js、安装生产依赖、创建配置文件、安装并启动 systemd 用户服务，然后等待健康检查通过。重复运行是安全的：它会保留你的配置和登录令牌，并更新依赖和服务单元。它还会重启正在运行的服务以应用配置；在默认的哈希模式下，这会让所有浏览器退出登录。
+安装器会检查 Node.js、安装生产依赖、创建配置文件、安装并启动 systemd 用户服务，然后等待健康检查通过。重复运行是安全的：它会保留你的
+配置和登录令牌，并更新依赖和服务单元。它还会重启正在运行的服务以应用配置；在默认的哈希模式下，这会让所有浏览器退出登录。
 
-**登录令牌只显示一次。** 新安装会生成一个令牌，并只把它的 SHA-256 哈希以 `CAW_TOKEN_SHA256` 的形式保存在配置文件中。安装器打印令牌时，请立即把它保存到密码管理器中。配置文件无法再次显示该令牌。如果你丢失了它，请运行 `scripts/install-linux.sh --rotate-token`。请在你自己的终端中运行安装器，而不要通过 Claude Code 运行，这样打印出的令牌就不会进入会话记录。
+**登录令牌只显示一次。** 新安装会生成一个令牌，并只把它的 SHA-256 哈希以 `CAW_TOKEN_SHA256` 的形式保存在配置文件中。安装器打印
+令牌时，请立即把它保存到密码管理器中。配置文件无法再次显示该令牌。如果你丢失了它，请运行 `scripts/install-linux.sh --rotate-token`。
+请在你自己的终端中运行安装器，而不要通过 Claude Code 运行，这样打印出的令牌就不会进入会话记录。
 
 配置文件位于 `~/.config/claude-official-web/env`（权限为 600）。修改配置后，运行 `systemctl --user restart claude-official-web`。
 
@@ -91,7 +123,8 @@ scripts/install-linux.sh --uninstall --purge   # 同时移除配置和令牌
 - `--show-token` 打印本次运行签发的令牌，或已保存的明文令牌。已保存的哈希无法显示。
 - `--allow-root`（不推荐）和 `--help`。
 
-在安装任何内容之前，安装器会检查现有配置。它会拒绝同时设置两个令牌变量的文件、长度不足 16 个字符的明文令牌、格式错误的哈希、`CAW_REQUIRE_AUTH=0` 或 `CAW_ENGINE=mock`，并指出需要修改的配置项。`--rotate-token` 会跳过令牌检查，因为它会替换已保存的令牌。
+在安装任何内容之前，安装器会检查现有配置。它会拒绝同时设置两个令牌变量的文件、长度不足 16 个字符的明文令牌、格式错误的哈希、
+`CAW_REQUIRE_AUTH=0` 或 `CAW_ENGINE=mock`，并指出需要修改的配置项。`--rotate-token` 会跳过令牌检查，因为它会替换已保存的令牌。
 
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 中的部署指南涵盖完整的服务器部署、更新和备份。
 
@@ -99,52 +132,63 @@ scripts/install-linux.sh --uninstall --purge   # 同时移除配置和令牌
 
 只通过 HTTPS 对外提供网关，切勿直接发布其端口。请从以下方案中选择一种：
 
-- **Cloudflare Tunnel 加 Cloudflare Access（公共域名推荐）。** 隧道转发到 `http://127.0.0.1:4180`。Access 会先要求身份验证，然后才会考虑令牌。
+- **Cloudflare Tunnel 加 Cloudflare Access（公共域名推荐）。** 隧道转发到 `http://127.0.0.1:4180`。Access 会先要求身份验证，
+  然后才会考虑令牌。
 - **Tailscale。** `tailscale serve --bg --https=443 127.0.0.1:4180` 只会把网关发布到你的 tailnet。
 - **你自行运营的 TLS 反向代理**，例如 Caddy 或 nginx。流式传输要求关闭响应缓冲。部署指南中的示例已做此设置。
 
-无论选择哪一种，都要把 `CAW_PUBLIC_ORIGIN` 设置为浏览器地址栏中显示的确切来源：包括协议、主机和端口，不带路径，也不带末尾斜杠。来自其他来源的写操作会被以 `ORIGIN_REJECTED` 拒绝。网关只接受 `Host` 请求头为该主机或回环名称的请求，因此代理必须原样转发 `Host` 请求头，否则网关会返回 `421 HOST_REJECTED`。
+无论选择哪一种，都要把 `CAW_PUBLIC_ORIGIN` 设置为浏览器地址栏中显示的确切来源：包括协议、主机和端口，不带路径，也不带末尾斜杠。
+来自其他来源的写操作会被以 `ORIGIN_REJECTED` 拒绝。网关只接受 `Host` 请求头为该主机或回环名称的请求，因此代理必须原样转发
+`Host` 请求头，否则网关会返回 `421 HOST_REJECTED`。
 
-在同一台主机上的代理或隧道之后，请设置 `CAW_TRUST_PROXY=1`，使每位访问者各自拥有登录和流数量限制。设置之前请先阅读部署指南：只有当代理自行设置客户端地址请求头时，这样做才是安全的。
+在同一台主机上的代理或隧道之后，请设置 `CAW_TRUST_PROXY=1`，使每位访问者各自拥有登录和流数量限制。设置之前请先阅读部署指南：
+只有当代理自行设置客户端地址请求头时，这样做才是安全的。
 
 ## 配置
 
-网关从环境变量读取所有设置。生产服务则从配置文件中读取这些设置。
+网关从环境变量读取所有设置。生产服务则从配置文件中读取这些设置。布尔值设置接受 `0`、`1`、`true` 或 `false`。无效的值会让
+网关在启动时停止，并给出指出变量名的提示，退出状态为 2。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `CAW_HOST` | `127.0.0.1` | 网关监听的地址。请保持在回环地址上，并通过 HTTPS 对外发布。 |
-| `CAW_PORT` | `4180` | 网关监听的端口。 |
+| `CAW_HOST` | `127.0.0.1` | 网关监听的地址：IP 地址或主机名，最多 255 个字符，且不能包含空格。请保持在回环地址上，并通过 HTTPS 对外发布。 |
+| `CAW_PORT` | `4180` | 网关监听的端口，范围为 1 到 65535。 |
 | `CAW_REQUIRE_AUTH` | `1` | `1` 表示要求登录令牌。`0` 会关闭登录，且只有在 `CAW_HOST` 为回环地址时才被接受；安装器会拒绝它。 |
-| `CAW_TOKEN` | 无 | 明文登录令牌，16 到 1024 个字符。与 `CAW_TOKEN_SHA256` 二选一，不能同时设置。`--plain-token` 会写入它。 |
+| `CAW_TOKEN` | 无 | 明文登录令牌，长度为 16 到 1024 个字符。与 `CAW_TOKEN_SHA256` 二选一，不能同时设置。`--plain-token` 会写入它。 |
 | `CAW_TOKEN_SHA256` | 无 | 登录令牌的 SHA-256，为 64 个十六进制字符。安装器默认写入此项。 |
-| `CAW_PUBLIC_ORIGIN` | 未设置 | 用户打开的规范来源，例如 `https://claude.example.com`。在代理或隧道之后使用时请设置。 |
-| `CAW_ACCESS_PROFILE` | `full` | `read`（仅查看）、`standard`（除删除会话、终端和绕过模式外的全部功能）或 `full`。 |
-| `CAW_APP_NAME` | `Agent Web` | 界面中显示的产品名称。 |
-| `CAW_WORKSPACE_ROOTS` | `$HOME` | 以冒号分隔的已存在目录，会话可以在其中启动，目录浏览器也只浏览其中的内容。建议使用项目目录。它限制的是会话，而不是智能体。 |
-| `CAW_STATE_DIR` | `~/.local/state/claude-official-web` | 网关的状态目录，其中保存会话撤销记录和受信任的文件夹。 |
+| `CAW_PUBLIC_ORIGIN` | 未设置 | 用户打开的规范来源，例如 `https://claude.example.com`：包含协议、主机和端口，不带路径、查询参数、片段、凭据或末尾斜杠。在代理或隧道之后使用时请设置。 |
+| `CAW_ACCESS_PROFILE` | `full` | `read`（仅查看）、`standard`（除删除会话、账户登录、终端、浏览器工具、设置视图和绕过模式之外的全部功能）或 `full`。 |
+| `CAW_APP_NAME` | `Agent Web` | 界面中显示的产品名称，最多 60 个字符。 |
+| `CAW_WORKSPACE_ROOTS` | `$HOME` | 以冒号分隔的已存在绝对路径目录，会话可以在其中启动，目录浏览器也只浏览其中的内容。建议使用项目目录。它限制的是会话，而不是智能体。 |
+| `CAW_STATE_DIR` | `$XDG_STATE_HOME/claude-official-web`，或 `~/.local/state/claude-official-web` | 网关的状态目录：会话撤销记录、受信任的文件夹，以及网关自己查询所用的文件夹。必须是绝对路径。 |
 | `CAW_ENGINE` | `sdk` | `sdk` 通过 Agent SDK 运行 Claude Code。`mock` 选择内置的演示引擎；安装器会拒绝它。 |
-| `CAW_CLAUDE_BIN` | 未设置（使用 SDK 自带的可执行文件） | Claude Code 可执行文件的绝对路径，用于对话和终端会话，代替自带版本。设置后不会回退到其他版本。 |
-| `CAW_DEFAULT_MODEL` | 未设置（Claude Code 的默认值） | 新会话使用的模型。 |
-| `CAW_DEFAULT_PERMISSION_MODE` | `default` | 新会话使用的权限模式。`bypassPermissions` 需要 `CAW_ALLOW_BYPASS=1` 和 `full` 档位。 |
+| `CAW_CLAUDE_BIN` | 未设置（使用 SDK 自带的可执行文件） | 已存在的 Claude Code 可执行文件的绝对路径，用于对话、账户登录和终端，代替自带版本。设置后不会回退到其他版本。 |
+| `CAW_DEFAULT_MODEL` | 未设置（Claude Code 的默认值） | 新会话使用的模型，最多 200 个字符。 |
+| `CAW_DEFAULT_PERMISSION_MODE` | 未设置（由 Claude Code 的设置决定） | 新会话使用的权限模式：`default`、`acceptEdits`、`plan`、`auto`、`dontAsk` 或 `bypassPermissions`。未设置时，模式由 Claude Code 自己的设置决定，与在终端中一样。`bypassPermissions` 需要 `CAW_ALLOW_BYPASS=1`。 |
 | `CAW_DEFAULT_EFFORT` | 未设置（Claude Code 的默认值） | 新会话使用的推理强度：`low`、`medium`、`high`、`xhigh` 或 `max`。 |
+| `CAW_FALLBACK_MODEL` | 未设置 | 新会话使用的备用模型（`--fallback-model`），最多 200 个字符。被拒答的回复可以改用它重试。 |
+| `CAW_CHROME` | `0` | `1` 让每次查询都启用 Claude in Chrome（CLI 的 `--chrome` 参数）。它需要 claude.ai 登录，并且网关所在的机器上要有安装了 Claude in Chrome 扩展的 Chrome。 |
+| `CAW_BROWSER_MCP_COMMAND` | 未设置 | 浏览器 MCP 服务器的命令及其参数，是一个 JSON 数组，例如 `["npx","-y","@playwright/mcp@0.0.82","--headless","--isolated"]`。会话可以把它作为 `browser` 服务器开启。数组包含 1 到 32 个字符串，每个最多 1024 个字符；第一个元素是绝对路径或裸命令名。 |
 | `CAW_TERMINAL` | `0` | `1` 启用终端标签页。它需要 `full` 档位和 node-pty，并且等同于 shell 访问权限。 |
-| `CAW_ALLOW_BYPASS` | `0` | `1` 允许使用 `bypassPermissions` 模式，包括作为默认模式。它需要 `full` 档位。 |
-| `CAW_IDLE_TIMEOUT_MS` | `1800000`（30 分钟） | 空闲的运行中会话会在此时间后关闭，并在你发送下一条消息时恢复。 |
-| `CAW_MAX_LIVE_SESSIONS` | `4` | 同时运行的 Claude Code 进程数量上限。 |
-| `CAW_UPLOAD_MAX_BYTES` | `26214400`（25 MiB） | 允许的最大附件大小。 |
-| `CAW_IMAGE_MAX_BYTES` | `5242880`（5 MiB） | 允许的最大图片附件大小。 |
-| `CAW_UPLOAD_RETENTION_DAYS` | `7` | 网关创建的附件批次会在此天数后被删除。 |
-| `CAW_SESSION_TTL_HOURS` | `168`（7 天） | Web 登录会话的有效时长，单位为小时。 |
+| `CAW_ALLOW_BYPASS` | `0` | `1` 允许使用 `bypassPermissions` 模式，包括作为默认模式。它需要 `CAW_ACCESS_PROFILE=full`；在 `read` 或 `standard` 档位下，网关会拒绝启动。 |
+| `CAW_IDLE_TIMEOUT_MS` | `1800000`（30 分钟） | 空闲的运行中会话在此时间后关闭，取值范围为 60000 到 86400000 毫秒；在你发送下一条消息时恢复。 |
+| `CAW_MAX_LIVE_SESSIONS` | `4` | 同时运行的 Claude Code 进程数量上限，范围为 1 到 32。 |
+| `CAW_UPLOAD_MAX_BYTES` | `26214400`（25 MiB） | 允许的最大附件大小，范围为 1 KiB 到 1 GiB。 |
+| `CAW_IMAGE_MAX_BYTES` | `5242880`（5 MiB） | 以图片形式直接发送的最大图片大小，范围为 1 KiB 到 20 MiB。更大的图片（不超过 `CAW_UPLOAD_MAX_BYTES`）以文件路径发送。 |
+| `CAW_UPLOAD_RETENTION_DAYS` | `7` | 网关创建的附件批次会在此天数后被删除，范围为 1 到 365 天。 |
+| `CAW_SESSION_TTL_HOURS` | `168`（7 天） | Web 登录会话的有效时长，单位为小时，范围为 1 到 8760。 |
 | `CAW_TRUST_PROXY` | `0` | `1` 表示按 `CF-Connecting-IP`、`X-Real-IP`、最后一个 `X-Forwarded-For` 条目的顺序获取客户端地址。只有当网关只能通过一个自行设置这些请求头之一的代理访问时才使用。 |
 | `CAW_LOG_LEVEL` | `info` | `debug`、`info`、`warn` 或 `error`。 |
-| `CAW_MOCK_DELAY_MS` | `12` | 模拟输出中相邻词元之间的延迟。仅对模拟引擎有效。 |
+| `CAW_MOCK_DELAY_MS` | `12` | 模拟输出中相邻词元之间的延迟，范围为 0 到 10000 毫秒。仅对模拟引擎有效。 |
+| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | 未设置 | 从网关的环境中读取，并由 Claude Code 继承。非空且不是 `0` 或 `false` 的值会关闭后台任务，此时网关不再提供“在后台运行”操作。 |
 
 ## 安全模型
 
 完整的威胁模型和控制措施清单见 [SECURITY.md](SECURITY.md)。简要来说：
 
-- 只有一个操作者和一个登录令牌。令牌用于登录，之后的会话由 HttpOnly、SameSite=Strict 的 Cookie 维持。安装器只保存令牌的 SHA-256 哈希，因此配置文件无法用于登录。如果你想使用自己选择的令牌，请运行以下命令计算其哈希，然后把输出的 64 个字符填入 `CAW_TOKEN_SHA256`：
+- 只有一个操作者和一个登录令牌。令牌用于登录，之后的会话由 HttpOnly、SameSite=Strict 的 Cookie 维持。安装器只保存令牌的
+  SHA-256 哈希，因此配置文件无法用于登录。如果你想使用自己选择的令牌，请运行以下命令计算其哈希，然后把输出的 64 个字符填入
+  `CAW_TOKEN_SHA256`：
 
   ```bash
   read -r -s -p "Login token: " TOKEN && echo
@@ -152,26 +196,52 @@ scripts/install-linux.sh --uninstall --purge   # 同时移除配置和令牌
   unset TOKEN
   ```
 
-- 每个请求都必须带有允许的主机名：回环名称（`127.0.0.1`、`localhost` 或 `[::1]`）或 `CAW_PUBLIC_ORIGIN` 的主机。其他主机名会得到 `421 HOST_REJECTED`，这可以阻止 DNS 重绑定攻击。
+- 每个请求都必须带有允许的主机名：回环名称（`127.0.0.1`、`localhost` 或 `[::1]`）或 `CAW_PUBLIC_ORIGIN` 的主机。其他主机名
+  会得到 `421 HOST_REJECTED`，这可以阻止 DNS 重绑定攻击。
 - 每一次写操作都必须来自已配置的来源。这可以阻止跨站请求和跨站 WebSocket 劫持。
-- 在默认的哈希模式下，网关重启时会话即告结束，安装器运行之后也是如此。使用明文 `CAW_TOKEN` 时，会话可以跨重启保留。两种模式下，退出登录的效果都会在重启后保持。
-- 登录有速率限制：同一客户端地址在十分钟内失败十次即被限制。事件流最多同时打开 64 个，每个客户端地址最多 16 个。请求正文停止到达 30 秒后，连接会被关闭；对 Claude Code 的控制调用会在 10 秒后超时。
-- 文件夹信任：未受信任的文件夹只使用你的用户设置运行。只有在读过文件夹内容之后，才应信任它。
+- 在默认的哈希模式下，网关重启时会话即告结束，安装器运行之后也是如此。使用明文 `CAW_TOKEN` 时，会话可以跨重启保留。两种模式下，
+  退出登录的效果都会在重启后保持。
+- 登录有速率限制：同一客户端地址在十分钟内失败十次即被限制。事件流最多同时打开 64 个，每个客户端地址最多 16 个。请求正文停止到达
+  30 秒后，连接会被关闭。对 Claude Code 的控制调用大多在 10 秒后超时，少数允许更长时间（用量 15 秒，旁问和登录 120 秒）。
+- 文件夹信任：未受信任的文件夹只使用你的用户设置运行。信任某个文件夹时，网关还会通过运行时的握手，在 Claude Code 中记录对该文件夹
+  的信任，而网关无法撤销这条记录。要移除它，请先停止 Claude Code，然后在 `~/.claude.json` 的 `projects` 下，把该文件夹的
+  `hasTrustDialogAccepted` 设为 `false`，或者删除该文件夹的条目。只有在读过文件夹内容之后，才应信任它。
 - 网关从不读取 Claude 凭据。它会从 Claude Code 的环境变量中移除登录令牌和每一个 `CAW_*` 变量。
 - 模型输出是不可信的。Markdown 会经过净化，工具输出以纯文本形式显示。
-- 权限决定由 Claude Code 自身做出。只批准你已经读过的内容：被批准的命令会以服务用户的全部权限运行。
+- 权限决定由 Claude Code 自身做出。只批准你已经读过的内容：被批准的命令会以服务用户的全部权限运行。浏览器工具拥有同样的权限，
+  参见[浏览器](#浏览器)。
+
+## 浏览器
+
+Claude 可以用两种方式操作浏览器。两者相互独立，你可以只启用其中一种，也可以两种都启用。
+
+- **Claude in Chrome**（`CAW_CHROME=1`）使用与网关位于同一台机器上的 Chrome 浏览器中的 Claude in Chrome 扩展，并沿用该浏览器的
+  登录状态。它需要 Claude Code 完成 claude.ai 登录，因此无法在没有显示器的服务器上使用。运行时面板中的 Claude in Chrome 标签页会
+  显示它是否已获准、已安装和已连接，并提供安装和重新连接的链接。
+- **浏览器 MCP 服务器**（`CAW_BROWSER_MCP_COMMAND`）是一个你在网关所在主机上启动的服务器。配置表中的示例会以无头模式运行
+  Playwright 的浏览器服务器，适合没有显示器的服务器。拥有 `full` 档位的用户在会话设置中开启**浏览器工具**之后，该会话会以
+  `browser` 服务器的形式使用它。只有操作者能设置这条命令，用户无法提供自己的命令。部署指南说明了设置方法。
+
+浏览器工具以服务用户的网络权限和文件权限运行，网页中的内容也可能引导模型的行为。只在需要的会话中开启它们。
 
 ## 终端备用方案
 
-有些 Claude Code 功能只存在于终端中：`/theme`、`/terminal-setup`、Vim 模式、自定义按键绑定、`!` shell 模式、`/resume` 和 `/config` 等全屏选择器，以及 `/login`。可选的终端标签页会在伪终端中运行 Claude Code。它可以附加到某个会话（`claude --resume <id>`），也可以在某个项目中启动一个新的 `claude`。
+有些 Claude Code 功能只存在于终端中：`/theme`、`/terminal-setup`、Vim 模式、自定义按键绑定、`!` shell 模式、`/resume` 和
+`/config` 等全屏对话框、修改钩子和权限规则（面板中只读）、在多个 Chrome 浏览器之间做选择（`/chrome`），以及 `/logout`。登录已经
+移到“设置 → 账户”，因此 `/login` 不再需要终端。可选的终端标签页会在伪终端中运行 Claude Code。它可以附加到某个会话
+（`claude --resume <id>`），也可以在某个项目中启动一个新的 `claude`。
 
-启用方法：设置 `CAW_TERMINAL=1`。它需要 `full` 档位，并且需要构建 node-pty，这要求安装 `build-essential` 和 `python3`。终端等同于服务用户的 shell，因此只能在仅由你一人操作的主机上启用。终端附加到某个会话期间，浏览器无法写入该会话；分离终端后，即可在浏览器中继续操作。
+启用方法：设置 `CAW_TERMINAL=1`。它需要 `full` 档位，并且需要构建 node-pty，这要求安装 `build-essential` 和 `python3`。终端等同于
+服务用户的 shell，因此只能在仅由你一人操作的主机上启用。终端附加到某个会话期间，浏览器不能在该会话中发送消息、回退、分叉、删除或
+使用实时控制，但仍可重命名和添加标签，设置的修改会保留到下次启动。分离终端后，即可在浏览器中继续操作。
 
-设置了 `CAW_CLAUDE_BIN` 时，终端运行的是该路径下的可执行文件，且不会回退。否则，终端运行 SDK 自带的原生二进制文件；只有当它缺失时，才会运行 `PATH` 中第一个可执行的 `claude`。
+设置了 `CAW_CLAUDE_BIN` 时，终端运行的是该路径下的可执行文件，且不会回退。否则，终端运行 SDK 自带的原生二进制文件；只有当它缺失时，
+才会运行 `PATH` 中第一个可执行的 `claude`。
 
 ## 会话与终端
 
-在浏览器中开始的会话与终端会话一样，保存在 `~/.claude/projects` 中。要在终端中继续某个会话，请使用其会话 ID 运行 `claude --resume <id>`。由 SDK 创建的会话可能不会出现在 Claude Code 交互式的 `/resume` 选择器中，因此请直接使用会话 ID。
+在浏览器中开始的会话与终端会话一样，保存在 `~/.claude/projects` 中。要在终端中继续某个会话，请使用其会话 ID 运行
+`claude --resume <id>`。由 SDK 创建的会话可能不会出现在 Claude Code 交互式的 `/resume` 选择器中，因此请直接使用会话 ID。
 
 ## 用量和计费
 
@@ -181,37 +251,43 @@ Anthropic 帮助中心的说明原文如下：
 
 译文：你仍然可以在订阅额度内使用 Claude Agent SDK、`claude -p` 和第三方应用。
 
-来源：[Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)。
+来源：[Use the Claude Agent SDK with your Claude
+plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)。
 
 Agent SDK 文档还补充了以下说明：
 
-> Unless previously approved, Anthropic does not allow third party developers to offer claude.ai login or rate limits for
-> their products, including agents built on the Claude Agent SDK. Use the API key authentication methods described in the
-> Quickstart instead.
+> Unless previously approved, Anthropic does not allow third party developers to offer claude.ai login or rate limits
+> for their products, including agents built on the Claude Agent SDK. Use the API key authentication methods described
+> in the Quickstart instead.
 
-译文：除非事先获得批准，Anthropic 不允许第三方开发者为其产品提供 claude.ai 登录或速率限制，包括基于 Claude Agent SDK 构建的智能体。请改用快速入门中介绍的 API 密钥认证方法。
+译文：除非事先获得批准，Anthropic 不允许第三方开发者为其产品提供 claude.ai 登录或速率限制，包括基于 Claude Agent SDK 构建的智能体。
+请改用快速入门中介绍的 API 密钥认证方法。
 
 来源：[Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview)。
 
 这对你意味着：
 
 - claude-official-web 面向**个人自托管**。你在自己控制的服务器上，使用自己的登录，为自己运行网关。
-- 如果你要让其他人使用，或为团队或客户运行网关，请不要共享 claude.ai 登录。请按照 Agent SDK 快速入门的说明，使用 Anthropic API 密钥。
+- 如果你要让其他人使用，或为团队或客户运行网关，请不要共享 claude.ai 登录。请按照 Agent SDK 快速入门的说明，使用 Anthropic
+  API 密钥。
 - 每一轮对话都会使用你登录的账户，并计入该账户的额度或计费。
+- “设置 → 账户”会显示 Claude Code 使用的是 Claude 订阅（及其套餐），还是 API 账户（及其服务提供方）。这一选择决定了费用的计算方式。
 
 ## 开发
 
 ```bash
 npm ci
 npm run dev            # 模拟引擎，修改后自动重启，无需登录
-npm test               # 单元测试和集成测试
-npm run test:e2e       # 30 个浏览器测试；请先安装 Chromium：npx playwright-core install chromium
+npm test               # 单元测试和集成测试（约 1,700 个）
+npm run test:e2e       # 50 个浏览器测试；请先安装 Chromium：npx playwright-core install chromium
 npm run typecheck      # 对 JSDoc 类型运行 tsc
 npm run check          # 对整个代码树运行静态规则检查
 npm run seal           # 运行上述检查并验证源码清单；写入 .state/seal-receipt.json
 ```
 
-其他脚本包括：`npm run manifest` 和 `npm run manifest:verify`（源码清单）；`npm run smoke:runtime` 和 `npm run smoke:gateway`（真实引擎与已部署网关的验证，参见 [docs/PRODUCTION_SEAL.md](docs/PRODUCTION_SEAL.md)）；`npm run screenshots`（使用 Chromium 渲染 `docs/screenshots` 中的图片）；以及 `npm run maintenance:prune`（删除过期附件）。
+其他脚本包括：`npm run manifest` 和 `npm run manifest:verify`（源码清单）；`npm run smoke:runtime` 和
+`npm run smoke:gateway`（真实引擎与已部署网关的验证，参见 [docs/PRODUCTION_SEAL.md](docs/PRODUCTION_SEAL.md)）；
+`npm run screenshots`（使用 Chromium 渲染 `docs/screenshots` 中的图片）；以及 `npm run maintenance:prune`（删除过期附件）。
 
 目录结构如下：
 
@@ -222,13 +298,17 @@ npm run seal           # 运行上述检查并验证源码清单；写入 .state
 - `deploy/`：systemd 用户单元模板。
 - `docs/`：部署、功能、验证、协议、前端和工程文档。
 
-契约文档见 [ARCHITECTURE.md](ARCHITECTURE.md)、[docs/PROTOCOL.md](docs/PROTOCOL.md)、[docs/FRONTEND.md](docs/FRONTEND.md) 和 [docs/ENGINEERING.md](docs/ENGINEERING.md)。依赖版本精确固定，新增依赖需要经过架构决策。
+契约文档见 [ARCHITECTURE.md](ARCHITECTURE.md)、[docs/PROTOCOL.md](docs/PROTOCOL.md)、[docs/FRONTEND.md](docs/FRONTEND.md) 和
+[docs/ENGINEERING.md](docs/ENGINEERING.md)。依赖版本精确固定，新增依赖需要经过架构决策。
 
 ## 故障排查
 
 | 症状 | 原因 | 处理方法 |
 |---|---|---|
-| `ENGINE_UNAVAILABLE`（HTTP 503），或会话中出现此代码的通知 | 运行网关的用户尚未登录 Claude Code，找不到其可执行文件，或会话期间其登录被拒绝 | 以该用户身份运行 `claude` 并完成 `/login`，然后重新打开会话。如果找不到可执行文件，请设置 `CAW_CLAUDE_BIN`。修改配置后重启服务。 |
+| `ENGINE_UNAVAILABLE`（HTTP 503），或会话中出现此代码的通知 | 运行网关的用户尚未登录 Claude Code，找不到其可执行文件，或会话期间其登录被拒绝 | 以该用户身份运行 `claude` 并完成 `/login`，或在“设置 → 账户”中以 `full` 档位登录。然后重新打开会话。如果找不到可执行文件，请设置 `CAW_CLAUDE_BIN`。修改配置后重启服务。 |
+| “设置 → 账户”提示登录需要完整访问档位 | `CAW_ACCESS_PROFILE` 为 `read` 或 `standard` | 改用 `full`，或在服务器上的终端中运行 `claude` 并执行 `/login`。 |
+| 会话开启浏览器工具时返回 `FEATURE_DISABLED`（HTTP 501） | 未设置 `CAW_BROWSER_MCP_COMMAND` | 在配置文件中设置该命令，重启服务，然后重新开启浏览器工具。 |
+| Claude in Chrome 标签页显示未安装或未连接 | 网关所在机器的 Chrome 中没有该扩展，Chrome 没有运行，或者 Claude Code 没有 claude.ai 登录 | 在该 Chrome 中安装 Claude in Chrome 扩展，确认 Claude Code 已用 claude.ai 账户登录，然后使用标签页中的重新连接链接。 |
 | `HOST_REJECTED`（HTTP 421） | `Host` 请求头既不是回环名称，也不是 `CAW_PUBLIC_ORIGIN` 的主机。通常是没有设置 `CAW_PUBLIC_ORIGIN`，或代理改写了 `Host` | 将 `CAW_PUBLIC_ORIGIN` 设置为浏览器中的访问地址，让代理原样转发 `Host`（nginx 中为 `proxy_set_header Host $host;`），然后重启服务。 |
 | `ORIGIN_REJECTED` | 浏览器的来源与 `CAW_PUBLIC_ORIGIN` 不一致，这在代理或隧道之后很常见 | 将 `CAW_PUBLIC_ORIGIN` 设置为地址栏中的确切来源，然后重启服务。 |
 | `INVALID_TOKEN`（HTTP 401） | 登录令牌与配置的令牌不符 | 输入安装器打印的令牌。如果已经丢失，请在你自己的终端中运行 `scripts/install-linux.sh --rotate-token`。所有会话都会结束。 |

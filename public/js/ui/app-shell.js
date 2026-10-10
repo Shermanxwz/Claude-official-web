@@ -84,7 +84,9 @@ export function createAppShell({ root, api, store, t }) {
 
   const mobileQuery = typeof window.matchMedia === 'function' ? window.matchMedia(MOBILE_QUERY) : null;
 
+  // The toasts hang from an empty anchor placed after the banner stack, so they open under any banner, never over one.
   const toastHost = h('div', { class: 'app-toasts' });
+  const toastAnchor = h('div', { class: 'app-toast-anchor' }, toastHost);
   const toasts = createToasts(toastHost);
 
   const sidebarEl = h('aside', { class: 'app-sidebar', attrs: { 'aria-label': t('shell.sidebar.label') } });
@@ -100,9 +102,9 @@ export function createAppShell({ root, api, store, t }) {
   const welcomeHost = h('section', { class: 'welcome', attrs: { 'aria-live': 'polite' } });
   const terminalSlot = h('div', { class: 'app-terminal-slot' });
   const composerSlot = h('div', { class: 'app-composer-slot' });
-  const main = h('main', { class: 'app-main', attrs: { id: 'main' } },
-    reopenButton, headerSlot, bannerSlot, timelineSlot, terminalSlot, composerSlot);
-  const layout = h('div', { class: 'app', dataset: { sidebar: 'open' } }, sidebarEl, scrim, main, toastHost);
+  const main = h('main', { class: 'app-main', attrs: { id: 'main', tabindex: '-1' } },
+    reopenButton, headerSlot, bannerSlot, toastAnchor, timelineSlot, terminalSlot, composerSlot);
+  const layout = h('div', { class: 'app', dataset: { sidebar: 'open' } }, sidebarEl, scrim, main);
 
   root.replaceChildren(layout);
   let timelineHost = h('div', { class: 'app-timeline' });
@@ -634,7 +636,7 @@ export function createAppShell({ root, api, store, t }) {
     if (count <= 0) return Promise.resolve(true);
     return confirmDialog({
       title: t('shell.background.endTitle'),
-      message: t('shell.background.endMessage', { count }),
+      message: t(count === 1 ? 'shell.background.endMessage.one' : 'shell.background.endMessage.other', { count }),
       danger: true,
       confirmLabel: t('shell.background.endConfirm'),
     });

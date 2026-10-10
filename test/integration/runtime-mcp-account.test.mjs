@@ -135,6 +135,77 @@ describe('MCP servers of a live session', { timeout: 120000 }, () => {
   });
 });
 
+/** Configs of two MCP servers that hold secrets: a URL with a password and query values, a header, an argument, an env. */
+const SECRET_CONFIGS = {
+  github: { type: 'http', url: 'https://user:pw@mcp.test/sse?token=abc&team=ops', headers: { Authorization: 'Bearer abc' } },
+  filesystem: { type: 'stdio', command: 'npx', args: ['fs', '--api-key', 'abc'], env: { ROOT_TOKEN: 'abc' } },
+};
+
+/** The same configs as every answer passes them on: no password, and every secret value replaced. */
+const REDACTED_CONFIGS = {
+  github: {
+    type: 'http',
+    url: 'https://mcp.test/sse?token=[redacted]&team=[redacted]',
+    headers: { Authorization: '[redacted]' },
+  },
+  filesystem: { type: 'stdio', command: 'npx', args: ['fs', '--api-key', '[redacted]'], env: { ROOT_TOKEN: '[redacted]' } },
+};
+
+/**
+ * The config of each named server in a list of servers, by name.
+ * @param {Array<{name: string, config?: unknown}>} servers
+ * @returns {Record<string, unknown>}
+ */
+const configsByName = (servers) => Object.fromEntries(servers.filter((server) => server.name in REDACTED_CONFIGS)
+  .map((server) => [server.name, server.config]));
+
+describe('the secrets of MCP server configs are hidden in every answer', { timeout: 120000 }, () => {
+  /** @type {Awaited<ReturnType<typeof startTestServer>>} */
+  let server;
+  /** @type {ReturnType<typeof client>} */
+  let api;
+  before(async () => {
+    // The mock's servers carry no config. Here two of them get one that holds secrets, and only this test does so.
+    server = await startTestServer({}, {
+      wrapEngine: (engine) => ({
+        ...engine,
+        query: (args) => {
+          const query = engine.query(args);
+          const status = query.mcpServerStatus.bind(query);
+          query.mcpServerStatus = async () => (await status()).map((entry) => (entry.name in SECRET_CONFIGS
+            ? { ...entry, config: SECRET_CONFIGS[entry.name] }
+            : entry));
+          return query;
+        },
+      }),
+    });
+    api = client(server.url);
+    await api.login();
+  });
+  after(async () => {
+    await server.close();
+  });
+
+  it('the capabilities, the mcp view and an MCP action answer carry the configs without their secrets', async () => {
+    const live = await createLive(api, { cwd: server.proj });
+    const capabilities = await api.get(`/api/sessions/${live.sessionId}/capabilities`);
+    assert.equal(capabilities.status, 200, capabilities.text);
+    const view = await api.get(`/api/sessions/${live.sessionId}/runtime/mcp`);
+    assert.equal(view.status, 200, view.text);
+    const action = await api.post(`/api/sessions/${live.sessionId}/mcp`, {
+      server: 'github',
+      action: 'toggle',
+      enabled: true,
+    });
+    assert.equal(action.status, 200, action.text);
+    assert.deepEqual(configsByName(capabilities.json.mcpServers), REDACTED_CONFIGS);
+    assert.deepEqual(configsByName(view.json.data), REDACTED_CONFIGS);
+    assert.deepEqual(configsByName(action.json.mcpServers), REDACTED_CONFIGS);
+    for (const body of [capabilities.text, view.text, action.text]) assert.doesNotMatch(body, /abc|pw@/);
+    assert.equal(statusesIn(action.json).github, 'connected', 'the secrets do not change what the server does');
+  });
+});
+
 describe('an MCP sign-in address the gateway will not open', { timeout: 120000 }, () => {
   /** @type {Awaited<ReturnType<typeof startTestServer>>} */
   let server;

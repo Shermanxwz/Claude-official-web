@@ -1,21 +1,23 @@
 /**
  * Pending request cards: permission prompts, AskUserQuestion questions, ExitPlanMode plans, MCP elicitations and the
- * refusal fallback dialog. Answers are posted to /api/sessions/:id/requests/:requestId (docs/PROTOCOL.md). A card leaves
- * the timeline when the gateway reports request_resolved. Text goes through textContent and Markdown through
+ * refusal fallback dialog. Answers are posted to /api/sessions/:id/requests/:requestId (docs/PROTOCOL.md). A card
+ * leaves the timeline when the gateway reports request_resolved. Text goes through textContent and Markdown through
  * renderMarkdown().
  */
 import { h, clear, icon } from '../dom.js';
 import { errorText } from '../api.js';
 import { getLocale } from '../i18n.js';
-import { relativeTime } from './format.js';
+import { relativeTime, truncateMiddle } from './format.js';
 import { isDefaultChecked, describeSuggestion, checkedIndexes } from './suggestions.js';
 import { displayPath, isRecord } from './tools/summaries.js';
-import { renderTool } from './tools/index.js';
+import { renderToolDetail } from './tools/index.js';
 
 const KINDS = Object.freeze(['permission', 'question', 'plan', 'elicitation', 'dialog']);
 const PREVIEW_LIMIT = 4000;
 const TEXT_LIMIT = 2000;
 const SHORT_LIMIT = 500;
+/** Characters a suggestion's text shows before it is cut in the middle; the full text stays in its title. */
+const SUGGESTION_LIMIT = 80;
 const MAX_QUESTIONS = 4;
 const MAX_OPTIONS = 12;
 const MAX_FIELDS = 25;
@@ -218,7 +220,9 @@ function buildPermission(view, request) {
   const suggestions = Array.isArray(request.suggestions) ? request.suggestions : [];
   // "Always allow" applies the checked suggestions: allow rules and session-only mode switches start checked; directory
   // grants, other mode changes and deny or ask rules start unchecked.
-  const always = suggestions.length > 0 && request.suppressAlwaysAllowRule !== true ? suggestionList(view, suggestions) : null;
+  const always = suggestions.length > 0 && request.suppressAlwaysAllowRule !== true
+    ? suggestionList(view, suggestions)
+    : null;
   if (always) details.push(always.element);
   // The note to Claude is optional: it hides behind "Add a note" and goes with a denial.
   details.push(h('details', { class: 'request-note' },
@@ -274,8 +278,8 @@ function buildPermission(view, request) {
 }
 
 /**
- * The tool call as the tool's own card shows it (a diff for edits, the command for Bash), or key/value text for tools
- * without a dedicated renderer.
+ * The tool call as the tool's own card shows its detail (a diff for edits, the command for Bash), without the card's
+ * row: the preview is part of the request card, not a card inside it. Key/value text for tools without a renderer.
  * @param {RequestView} view
  * @param {Record<string, any>} request
  * @param {Record<string, unknown>} input
@@ -285,7 +289,7 @@ function toolPreview(view, request, input) {
   const name = textOf(request.toolName);
   if (name && (RICH_TOOLS.has(name) || name.startsWith('mcp__'))) {
     try {
-      const card = renderTool({
+      const detail = renderToolDetail({
         id: textOf(request.toolUseId) || undefined,
         name,
         input,
@@ -299,7 +303,7 @@ function toolPreview(view, request, input) {
         renderChildren: () => h('div', { class: 'sub-entries' }),
         open: true,
       });
-      return h('div', { class: 'request-tool' }, card);
+      if (detail) return h('div', { class: 'request-preview' }, detail);
     } catch (error) {
       console.error('permission preview fell back to key/value text', error);
     }
@@ -334,7 +338,11 @@ function suggestionList(view, suggestions) {
     boxes.map((box, index) => h('label', { class: 'request-suggestion' },
       box,
       h('span', { class: 'request-suggestion-body' },
-        h('span', { class: 'request-suggestion-title', text: described[index].title }),
+        h('span', {
+          class: 'request-suggestion-title',
+          text: truncateMiddle(described[index].title, SUGGESTION_LIMIT),
+          attrs: { title: described[index].title },
+        }),
         described[index].meta ? h('span', { class: 'request-suggestion-meta', text: described[index].meta }) : null))));
   return {
     element,
@@ -408,7 +416,8 @@ function buildQuestion(view, request) {
 
 /**
  * @param {unknown} input
- * @returns {{questions: Array<{question: string, header: string, multiSelect: boolean, options: Array<{label: string, description: string}>}>, complete: boolean}}
+ * @returns {{questions: Array<{question: string, header: string, multiSelect: boolean,
+ *   options: Array<{label: string, description: string}>}>, complete: boolean}}
  */
 function parseQuestions(input) {
   const raw = isRecord(input) && Array.isArray(input.questions) ? input.questions : [];
@@ -441,7 +450,8 @@ function parseQuestions(input) {
 /**
  * One question: its options (radio or checkbox) and an "Other" text answer.
  * @param {RequestView} view
- * @param {{question: string, header: string, multiSelect: boolean, options: Array<{label: string, description: string}>}} question
+ * @param {{question: string, header: string, multiSelect: boolean,
+ *   options: Array<{label: string, description: string}>}} question
  * @param {string} name
  */
 function questionGroup(view, question, name) {
@@ -488,7 +498,8 @@ function questionGroup(view, question, name) {
 }
 
 /**
- * @param {Array<{question: {question: string, multiSelect: boolean}, inputs: HTMLInputElement[], other: HTMLInputElement}>} groups
+ * @param {Array<{question: {question: string, multiSelect: boolean},
+ *   inputs: HTMLInputElement[], other: HTMLInputElement}>} groups
  * @returns {Record<string, string | string[]> | null} null while a question has no answer
  */
 function collectAnswers(groups) {
@@ -545,7 +556,10 @@ function buildPlan(view, request) {
     key: '1',
     kind: 'primary',
     label: t('cards.request.plan.approve'),
-    body: () => ({ decision: 'approve', nextMode: PLAN_MODES.includes(modeSelect.value) ? modeSelect.value : 'default' }),
+    body: () => ({
+      decision: 'approve',
+      nextMode: PLAN_MODES.includes(modeSelect.value) ? modeSelect.value : 'default',
+    }),
   }, {
     key: '2',
     kind: 'secondary',
@@ -621,7 +635,8 @@ function buildElicitation(view, request) {
   const { t } = view.ctx;
   const elicitation = isRecord(request.elicitation) ? request.elicitation : {};
   const server = textOf(request.mcpServer?.name) || textOf(elicitation.serverName) || t('cards.request.unknownServer');
-  setTitle(view, textOf(elicitation.title) || textOf(request.title) || t('cards.request.elicitation.title', { server }));
+  setTitle(view, textOf(elicitation.title) || textOf(request.title) ||
+    t('cards.request.elicitation.title', { server }));
   const message = textOf(elicitation.message);
   if (message) view.bodyEl.append(h('p', { class: 'request-text', text: message }));
   const description = textOf(elicitation.description) || textOf(request.description);
@@ -757,9 +772,21 @@ function buildField({ key, prop, required }, uid, index, t) {
       }
     };
   }
+  const requiredMark = () => (required
+    ? h('span', { class: 'request-required', attrs: { 'aria-hidden': 'true' }, text: ' *' })
+    : null);
+  if (control instanceof HTMLInputElement && control.type === 'checkbox') {
+    // The box and its text are one label, so a click on the text ticks the box and both stay on one line.
+    const node = h('div', { class: 'request-field request-field-check' },
+      h('label', { class: 'request-check-label' },
+        control,
+        h('span', { class: 'field-label', text: label }),
+        requiredMark()),
+      hint ? h('span', { class: 'field-hint', text: hint }) : null);
+    return { key, label, required, node, control, read };
+  }
   const node = h('label', { class: 'field request-field' },
-    h('span', { class: 'field-label' }, label,
-      required ? h('span', { class: 'request-required', attrs: { 'aria-hidden': 'true' }, text: ' *' }) : null),
+    h('span', { class: 'field-label' }, label, requiredMark()),
     hint ? h('span', { class: 'field-hint', text: hint }) : null,
     control);
   return { key, label, required, node, control, read };
@@ -858,7 +885,8 @@ function focusIfIdle(view) {
  * @returns {boolean} true when typing a number should not answer a prompt
  */
 function keyboardIsFree(target) {
-  if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]')) {
+  if (target instanceof Element &&
+      target.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]')) {
     return false;
   }
   const active = document.activeElement;
@@ -873,7 +901,8 @@ function firstReadyKeyed() {
 
 /**
  * @param {RequestView} view
- * @param {{kind: 'primary'|'secondary'|'deny'|'ghost', label: string, onClick: () => void, hint?: HTMLElement|null, title?: string|null}} options
+ * @param {{kind: 'primary'|'secondary'|'deny'|'ghost', label: string, onClick: () => void,
+ *   hint?: HTMLElement|null, title?: string|null}} options
  * @returns {HTMLButtonElement}
  */
 function actionButton(view, { kind, label, onClick, hint = null, title = null }) {

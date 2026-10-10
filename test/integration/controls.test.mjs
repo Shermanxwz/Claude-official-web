@@ -10,6 +10,7 @@ import {
   assertError,
   client,
   createLive,
+  eventNamed,
   runTurn,
   sdkMessage,
   sdkMessagesOf,
@@ -454,6 +455,53 @@ describe('controls: rewind', { timeout: 120000 }, () => {
       assert.deepEqual(Object.keys(both.json).sort(), ['conversation', 'files']);
       assert.equal(both.json.files.canRewind, true);
       assert.equal(typeof both.json.conversation.resumeAt, 'string');
+    } finally {
+      events.close();
+    }
+  });
+
+  it('refuses every rewind while a turn runs, and the turn finishes; a rewind works after it', async () => {
+    const { sessionId, events, ids } = await threeTurns();
+    try {
+      // The mock's "slow" answer is paced over seconds, so the rewinds below arrive while the turn runs.
+      const slowId = randomUUID();
+      const sent = await api.post(`/api/sessions/${sessionId}/messages`, { clientMessageId: slowId,
+        text: 'Write something slow' });
+      assert.equal(sent.status, 200);
+      await events.next(sdkMessage(sessionId, 'stream_event'), 5000);
+      assert.equal((await api.get(`/api/sessions/${sessionId}`)).json.live.state, 'running');
+
+      const pathname = `/api/sessions/${sessionId}/rewind`;
+      const mark = events.count();
+      for (const [mode, dryRun] of [['code'], ['conversation'], ['both'], ['code', true], ['conversation', true],
+        ['both', true]]) {
+        const refused = await api.post(pathname, { userMessageId: ids[1], mode, dryRun });
+        assertError(refused, 409, 'CONFLICT');
+        assert.match(refused.json.error.message, /Stop the running turn before rewinding/);
+      }
+      assert.equal(events.all().slice(mark).some(eventNamed('sessions_changed', { reason: 'rewind' })), false,
+        'no rewind was applied');
+
+      // The refused rewinds cut nothing: the running turn completes as a normal success.
+      const finished = await events.next(turnResult(sessionId, slowId), 15000);
+      assert.equal(finished.data.msg.subtype, 'success');
+      assert.equal(finished.data.msg.is_error, false);
+
+      const deadline = Date.now() + 5000;
+      while ((await api.get(`/api/sessions/${sessionId}`)).json.live.state !== 'idle') {
+        assert.ok(Date.now() < deadline, 'the session returned to idle');
+        await new Promise((resolve) => {
+          setTimeout(resolve, 10);
+        });
+      }
+      const rewound = await api.post(pathname, { userMessageId: ids[1], mode: 'conversation' });
+      assert.equal(rewound.status, 200);
+      assert.equal(typeof rewound.json.conversation.resumeAt, 'string');
+      const after = await transcriptOf(api, sessionId);
+      assert.equal(after.some((message) => message.uuid === ids[1] || message.uuid === slowId), false,
+        'the transcript ends before the rewound message');
+      const next = await runTurn(api, events, sessionId, 'A turn after the refused rewinds');
+      assert.equal(next.result.subtype, 'success');
     } finally {
       events.close();
     }

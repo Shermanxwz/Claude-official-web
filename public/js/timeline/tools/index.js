@@ -5,7 +5,7 @@
 
 import { h } from '../../dom.js';
 import { render as renderAgent } from './agent.js';
-import { render as renderBash } from './bash.js';
+import { render as renderBash, renderDetail as renderBashDetail } from './bash.js';
 import { render as renderFile } from './file.js';
 import { render as renderGeneric } from './generic.js';
 import { render as renderMcp } from './mcp.js';
@@ -88,6 +88,37 @@ export function renderTool(card, ctx) {
     console.error('tool renderer failed; showing the generic card', name, error);
     return renderFallback(card, ctx);
   }
+}
+
+/**
+ * Detail renderers for the families whose detail is not simply the body of the opened card (see renderToolDetail).
+ * @type {Map<string, (card: ToolCard, ctx: ToolContext) => HTMLElement | null>}
+ */
+const DETAILS = new Map([['Bash', renderBashDetail]]);
+
+/**
+ * The detail of one tool call without its row: what the card shows when it is open, minus the row's chrome (the
+ * header, the rule and the action toolbar). A permission card shows it above its buttons, so the preview is part of
+ * that card. Null when the family has no detail to show; the caller then falls back to the raw input.
+ * @param {ToolCard} card
+ * @param {ToolContext} ctx
+ * @returns {HTMLElement | null}
+ */
+export function renderToolDetail(card, ctx) {
+  const detail = DETAILS.get(typeof card?.name === 'string' ? card.name : '');
+  if (detail) {
+    try {
+      return detail(card, ctx);
+    } catch (error) {
+      console.error('tool detail failed; showing the raw input', card?.name, error);
+      return null;
+    }
+  }
+  const row = renderTool(card, { ...ctx, open: true, background: undefined });
+  const body = row.querySelector(':scope > .tool-body');
+  if (!body) return null;
+  const parts = [...body.children].filter((node) => !node.classList.contains('tool-actions'));
+  return parts.length > 0 ? h('div', { class: 'tool-detail' }, parts) : null;
 }
 
 /**

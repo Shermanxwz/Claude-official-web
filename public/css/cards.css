@@ -39,16 +39,32 @@
   padding: var(--space-5) var(--space-4) var(--space-3);
 }
 
+/* Rhythm: 12 px between the blocks of a turn; 24 px where a turn starts (its user message) or a divider sits. The
+   gaps are margins of the entries, so an entry's hidden parts (its message toolbar) never add to them. */
 .tl-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
   min-width: 0;
+}
+
+.tl-list > * + * {
+  margin-top: var(--space-3);
+}
+
+.tl-list > * + [data-kind="user"],
+.tl-list > [data-kind="user"] + *,
+.tl-list > * + [data-kind="divider"],
+.tl-list > [data-kind="divider"] + * {
+  margin-top: var(--space-5);
 }
 
 .tl-head,
 .tl-tail {
   min-height: 1px;
+}
+
+.tl-head:not(:empty) {
+  margin-bottom: var(--space-3);
 }
 
 .tl-load-earlier {
@@ -164,22 +180,12 @@
   font-weight: 600;
 }
 
+/* The one line under the title: how to start (DESIGN.md, Empty states). */
 .tl-empty-lead {
   margin: 0;
   color: var(--fg-muted);
-  font-size: var(--fs-md);
-  line-height: 22px;
-}
-
-.tl-tips {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  color: var(--fg-subtle);
   font-size: var(--fs-sm);
+  line-height: 18px;
 }
 
 @keyframes cards-sheen {
@@ -341,6 +347,10 @@
   gap: 4px;
 }
 
+.msg-notes:empty {
+  display: none;
+}
+
 .msg-note {
   color: var(--fg-muted);
   font-size: var(--fs-sm);
@@ -354,20 +364,37 @@
   color: var(--fg-subtle);
 }
 
+/* The message toolbar floats under its message: it shows on hover, on focus or after a tap (touch), and takes no space,
+   so the rhythm between blocks does not include it. */
 .msg-actions {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 2px;
   min-height: 28px;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 140ms var(--ease);
 }
 
-.msg:hover > .msg-actions,
 .msg:focus-within > .msg-actions,
+.msg.is-actions > .msg-actions,
 .msg-actions:focus-within {
   opacity: 1;
+  pointer-events: auto;
+}
+
+/* Hover counts only where a pointer can hover. On touch screens the hover a tap leaves behind would keep the toolbar
+   open, so there a tap alone shows and hides it (tapToggleActions in view.js). */
+@media (hover: hover) {
+  .msg:hover > .msg-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 .msg-user > .msg-actions {
@@ -391,12 +418,6 @@
 .msg-action:hover {
   background: var(--bg-hover);
   color: var(--fg);
-}
-
-@media (hover: none) {
-  .msg-actions {
-    opacity: 1;
-  }
 }
 
 /* ---- Prose: Claude's words -------------------------------------------------------------------------------------- */
@@ -436,8 +457,9 @@
   line-height: 1.3;
 }
 
+/* --fs-xl is the welcome title's size alone (DESIGN.md), so a heading in a message stops at --fs-lg. */
 .md h1 {
-  font-size: var(--fs-xl);
+  font-size: var(--fs-lg);
 }
 
 .md h2 {
@@ -579,7 +601,7 @@
   overflow-x: auto;
   color: var(--fg);
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale, 1));
   line-height: 1.55;
   white-space: pre;
 }
@@ -657,7 +679,7 @@
   overflow: hidden;
   color: var(--fg-muted);
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale, 1));
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -804,7 +826,7 @@
   overflow: auto;
   color: var(--fg);
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale, 1));
   line-height: 1.55;
   white-space: pre-wrap;
 }
@@ -990,6 +1012,18 @@
   font-size: var(--fs-sm);
 }
 
+/* The runtime's reason for asking: an info glyph, then the sentence, on one baseline. */
+.request-reason {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.request-reason > .icon {
+  flex: none;
+  align-self: center;
+}
+
 .request-required {
   color: var(--danger);
 }
@@ -1014,8 +1048,7 @@
   font-weight: 500;
 }
 
-.request-option,
-.request-suggestion {
+.request-option {
   display: flex;
   align-items: flex-start;
   gap: var(--space-2);
@@ -1038,8 +1071,7 @@
   background: var(--bg-hover);
 }
 
-.request-option-body,
-.request-suggestion-body {
+.request-option-body {
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
@@ -1047,13 +1079,59 @@
   min-width: 0;
 }
 
-.request-option-label,
-.request-suggestion-title {
+.request-option-label {
   font-weight: 500;
   overflow-wrap: anywhere;
 }
 
-.request-option-desc,
+.request-option-desc {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  line-height: 16px;
+  overflow-wrap: anywhere;
+}
+
+/* "Also allow in future" is a compact checklist: no box or tint per item, a hairline only between items. The box and the
+   first line of the title share a centre line (14 px box, 20 px line). */
+.request-suggestions {
+  gap: 0;
+}
+
+.request-suggestions-title {
+  margin-bottom: 4px;
+}
+
+.request-suggestion {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 0;
+  color: var(--fg);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.request-suggestion + .request-suggestion {
+  border-top: 1px solid var(--border);
+}
+
+.request-suggestion-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.request-suggestion-title {
+  font-weight: 500;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
 .request-suggestion-meta {
   color: var(--fg-muted);
   font-size: var(--fs-xs);
@@ -1061,15 +1139,39 @@
   overflow-wrap: anywhere;
 }
 
-.request-suggestion {
+.request-suggestion-check {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+}
+
+.request-check {
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* A boolean field: the box and its text are one label, so they stay on one line and align on the same centre. */
+.request-field-check {
+  gap: 4px;
+  min-width: 0;
+}
+
+.request-check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  min-width: 0;
+  color: var(--fg);
+  font-size: var(--fs-sm);
   cursor: pointer;
 }
 
-.request-suggestion-check,
-.request-check {
-  flex: 0 0 auto;
-  margin-top: 3px;
-  accent-color: var(--accent);
+.request-check-label .field-label {
+  margin: 0;
 }
 
 .request-note {
@@ -1262,6 +1364,44 @@
   display: none;
 }
 
+/* A small chevron says the raw error opens; it turns when the detail is open. */
+.notice-collapse > summary::after {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  margin: 0 2px 2px 0;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: '';
+  transform: rotate(45deg);
+  transition: transform 140ms var(--ease);
+}
+
+.notice-collapse[open] > summary::after {
+  margin-bottom: -2px;
+  transform: rotate(-135deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notice-collapse > summary::after {
+    transition: none;
+  }
+}
+
+/* The raw error of a retry, under the notice line: mono, indented under a rule, never a box. */
+.notice-detail {
+  min-width: 0;
+  margin: 0 0 0 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--border);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .divider {
   display: flex;
   align-items: center;
@@ -1385,7 +1525,7 @@
   overflow-x: auto;
   color: var(--fg-muted);
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale, 1));
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -1417,7 +1557,7 @@
   overflow: auto;
   color: var(--fg);
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--fs-scale, 1));
   line-height: 1.55;
   white-space: pre-wrap;
 }
@@ -1539,12 +1679,19 @@
   .msg-cancel,
   .code-copy,
   .notice-action,
+  .notice-collapse > summary,
   .request-btn,
   .request-option,
   .request-suggestion,
+  .request-check-label,
   .request-note-toggle,
   .tl-load-earlier,
   .tl-jump {
     min-height: 44px;
+  }
+
+  /* A suggestion row: the whole line is the target, with the box centred on it. */
+  .request-suggestion {
+    align-items: center;
   }
 }

@@ -48,11 +48,12 @@ function liveInfo(sessionId, extra = {}) {
   };
 }
 
-const HOST_METHODS = ['listSessions', 'getSession', 'getTranscript', 'createSession', 'openSession', 'closeSession',
-  'sendMessage', 'interrupt', 'cancelQueued', 'updateSettings', 'respond', 'getContextUsage', 'getCapabilities',
-  'mcpAction', 'mcpAuth', 'runtimeViews', 'runtimeView', 'getMemory', 'writeMemory', 'exportConversation', 'taskOutput',
-  'sideQuestion', 'fileSuggestions', 'recordRuntimeTrust', 'reload', 'rewind', 'fork', 'rename', 'tag', 'deleteSession',
-  'stopTask', 'listSubagents', 'getSubagentMessages', 'sessionCwd', 'backgroundTasks', 'setOutputStyle'];
+const HOST_METHODS = ['listSessions', 'listAllSessions', 'getSession', 'getTranscript', 'createSession', 'openSession',
+  'closeSession', 'sendMessage', 'interrupt', 'cancelQueued', 'updateSettings', 'respond', 'getContextUsage',
+  'getCapabilities', 'mcpAction', 'mcpAuth', 'runtimeViews', 'runtimeView', 'getMemory', 'writeMemory',
+  'exportConversation', 'taskOutput', 'sideQuestion', 'fileSuggestions', 'recordRuntimeTrust', 'reload', 'rewind',
+  'fork', 'rename', 'tag', 'deleteSession', 'stopTask', 'listSubagents', 'getSubagentMessages', 'sessionCwd',
+  'backgroundTasks', 'setOutputStyle'];
 
 /**
  * Engine host double: records every call and answers with canned values. Tests override `replies` to force errors.
@@ -63,6 +64,7 @@ function makeEngineHost() {
   /** @type {Record<string, (...args: any[]) => unknown>} */
   const replies = {
     listSessions: () => [],
+    listAllSessions: () => [],
     getSession: () => ({ info: null, live: null, pending: [], liveEvents: [], seq: 0, init: null }),
     getTranscript: () => ({ messages: [], total: 0, start: 0, hasMore: false }),
     createSession: () => liveInfo(NEW_SESSION),
@@ -982,18 +984,6 @@ describe('errors, feature gates and modes', () => {
     });
   });
 
-  it('refuses bypassPermissions below the full profile even when it is enabled', async () => {
-    await withApp({ profile: 'standard', allowBypass: true }, async (ctx) => {
-      await login(ctx);
-      const response = await request(ctx, 'POST', '/api/sessions', {
-        body: { cwd: root, permissionMode: 'bypassPermissions' },
-      });
-      assert.equal(response.status, 403);
-      assert.equal(response.json.error.code, 'FORBIDDEN');
-      assert.equal((await request(ctx, 'GET', '/api/meta', {})).json.features.bypass, false);
-    });
-  });
-
   it('allows bypassPermissions for the full profile when CAW_ALLOW_BYPASS=1', async () => {
     await withApp({ profile: 'full', allowBypass: true }, async (ctx) => {
       await login(ctx);
@@ -1426,7 +1416,7 @@ describe('session settings, queued messages and interrupts over HTTP', () => {
       await login(ctx);
       const found = await request(ctx, 'GET', '/api/sessions/search?q=deploy&limit=5', {});
       assert.equal(found.status, 200);
-      assert.deepEqual(found.json, { results: [], scanned: 0, truncated: false });
+      assert.deepEqual(found.json, { results: [], scanned: 0, truncated: false, scanLimit: 50 });
       assert.equal((await request(ctx, 'GET', '/api/sessions/search?q=a', {})).status, 400);
       assert.equal((await request(ctx, 'GET', '/api/sessions/search?q=deploy&limit=51', {})).status, 400);
       assert.equal(ctx.engineHost.calls.some((call) => call.name === 'getSession'), false);

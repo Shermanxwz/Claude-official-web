@@ -135,19 +135,29 @@ test('quick switcher: sessions by title, and messages by their text', { timeout:
     await runTurn(page, 'hello switcher');
     await createSession(page, { title: 'Beta switch' });
 
+    // Each step waits for the state it depends on: the option is listed before it is clicked, the switcher has closed
+    // before the next one is opened, and the message results are rendered before one of them is chosen.
     let dialog = await openSwitcher(page);
     await dialog.getByPlaceholder('Search sessions, panels and commands').fill('alpha');
-    await dialog.locator('[role="option"]', { hasText: 'Alpha switch' }).first().click();
+    const alphaOption = dialog.locator('[role="option"]', { hasText: 'Alpha switch' }).first();
+    await alphaOption.waitFor({ state: 'visible' });
+    await alphaOption.click();
+    await dialog.waitFor({ state: 'detached' });
     await eventually(async () => sessionIdOf(page) === alphaId, { message: 'the switcher did not open the Alpha session' });
 
     dialog = await openSwitcher(page);
     await dialog.getByPlaceholder('Search sessions, panels and commands').fill('hello switcher');
-    await dialog.locator('#switcher-opt-search').click();
+    const messageOption = dialog.locator('#switcher-opt-search');
+    await messageOption.waitFor({ state: 'visible' });
+    await messageOption.click();
     await eventually(async () => (await dialog.locator('.switcher-snippet mark').count()) > 0,
       { message: 'the message search never highlighted a match' });
     const marked = (await dialog.locator('.switcher-snippet mark').allTextContents()).map((text) => text.toLowerCase());
     assert.ok(marked.includes('hello') && marked.includes('switcher'), `marked words: ${marked.join(', ')}`);
-    await dialog.locator('[id^="switcher-result-"]').first().click();
+    const result = dialog.locator('[id^="switcher-result-"]').first();
+    await result.waitFor({ state: 'visible' });
+    await result.click();
+    await dialog.waitFor({ state: 'detached' });
     await eventually(async () => sessionIdOf(page) === alphaId, { message: 'the result did not open its session' });
   });
 });

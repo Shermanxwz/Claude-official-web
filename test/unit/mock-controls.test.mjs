@@ -144,7 +144,8 @@ const lifecycleOf = (/** @type {string} */ uuid, /** @type {string} */ state) =>
   message.type === 'command_lifecycle' && message.command_uuid === uuid && message.state === state;
 
 /**
- * An open query with its init message and the two settings messages that follow it.
+ * An open query: its initialize handshake is answered at once, and nothing is streamed until the first prompt is pushed
+ * (see startedWith). It is closed when the test ends.
  * @param {import('node:test').TestContext} t
  * @param {any} adapter
  * @param {string} cwd
@@ -157,10 +158,22 @@ async function openOn(t, adapter, cwd, options = {}) {
     channel.end();
     query.close();
   });
-  const init = await query.next();
-  const settings = [await query.next(), await query.next()];
-  assert.deepEqual(settings.map((next) => next.value.type), ['autocompact_state', 'active_goal']);
-  return { query, channel, init: init.value };
+  await query.initializationResult();
+  return { query, channel };
+}
+
+/**
+ * Pushes the first prompt of an open query and reads the stream up to the settings that follow system/init. Returns
+ * the init message; the turn the prompt starts is still to be read by the test.
+ * @param {any} query
+ * @param {{push: (message: any) => void}} channel
+ * @param {string} [text]
+ */
+async function startedWith(query, channel, text = 'Tell me something') {
+  channel.push(userPrompt(text));
+  const messages = await pullUntil(query, (message) => message.type === 'active_goal');
+  assert.deepEqual(messages.slice(-2).map((message) => message.type), ['autocompact_state', 'active_goal']);
+  return messages.find((message) => message.type === 'system' && message.subtype === 'init');
 }
 
 /** An open query over a fresh adapter, with the default options. */
@@ -293,8 +306,8 @@ describe('the working folder and its trust', () => {
     const adapter = adapterWith(stateDir);
     const cwd = projectDir(t);
     const other = projectDir(t);
-    const { query, channel, init } = await openOn(t, adapter, cwd);
-    channel.push(userPrompt('Tell me something'));
+    const { query, channel } = await openOn(t, adapter, cwd);
+    const init = await startedWith(query, channel);
     await pullUntil(query, isResult);
     await assert.rejects(query.setCwd('relative/folder'), /cwd must be an absolute path\./);
     await assert.rejects(query.setCwd(join(other, 'missing')), /set_cwd: the directory does not exist\./);
@@ -390,7 +403,8 @@ describe('reading files and the MCP servers', () => {
   });
 
   test('an mcpServers option configures servers from the start, and the init message lists them', async (t) => {
-    const { query, init } = await openQuery(t, { mcpServers: { docs: { type: 'http', url: 'http://localhost:9' } } });
+    const { query, channel } = await openQuery(t, { mcpServers: { docs: { type: 'http', url: 'http://localhost:9' } } });
+    const init = await startedWith(query, channel);
     assert.ok(init.mcp_servers.some((server) => server.name === 'docs' && server.status === 'connected'));
     const docs = (await query.mcpServerStatus()).find((server) => server.name === 'docs');
     assert.equal(docs.tools.length, 0);
@@ -575,14 +589,16 @@ describe('the claude.ai sign-in', () => {
 
 describe('the runtime views', () => {
   test('getStatus names the session, the model and the optional agent and folders', async (t) => {
-    const { query, init } = await openOn(t, adapterWith(tempDir(t)), projectDir(t), {
+    const sessionId = randomUUID();
+    const { query } = await openOn(t, adapterWith(tempDir(t)), projectDir(t), {
+      sessionId,
       agent: 'Explore',
       additionalDirectories: ['/shared/lib'],
       settingSources: ['user'],
     });
     const rows = Object.fromEntries((await query.getStatus()).sections.flatMap((section) => section.rows)
       .map((row) => [row.label, row.value]));
-    assert.equal(rows['Session ID'], init.session_id);
+    assert.equal(rows['Session ID'], sessionId);
     assert.equal(rows.Agent, 'Explore');
     assert.equal(rows['Additional directories'], '/shared/lib');
     assert.equal(rows['Setting sources'], 'User settings only');
@@ -692,8 +708,11 @@ describe('query options the runtime answers from', () => {
     const cwd = projectDir(t);
     const adapter = adapterWith(tempDir(t), { resolvedSettings: { permissions: { defaultMode: 'acceptEdits' } } });
     const started = async (/** @type {Record<string, unknown>} */ options) => {
-      const { query, init } = await openOn(t, adapter, cwd, options);
-      assert.equal((await query.initializationResult()).current_permission_mode, init.permissionMode);
+      const { query, channel } = await openOn(t, adapter, cwd, options);
+      // The handshake reports the mode before the first prompt; system/init reports it once the prompt has arrived.
+      const handshakeMode = (await query.initializationResult()).current_permission_mode;
+      const init = await startedWith(query, channel);
+      assert.equal(handshakeMode, init.permissionMode);
       return init.permissionMode;
     };
     assert.equal(await started({}), 'acceptEdits');

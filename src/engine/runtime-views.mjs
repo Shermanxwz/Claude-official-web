@@ -101,27 +101,221 @@ export function viewArguments(view) {
   return view === 'usage' ? [{ skipBehaviors: true }] : [];
 }
 
+/** Objects whose every value is a secret wherever they appear: environment variables and request headers. */
+const SECRET_CONTAINER_KEYS = new Set(['env', 'headers']);
 /**
- * A deep copy of runtime settings in which every value stored under an `env` key is replaced by "[redacted]".
+ * A key names a secret when its normal form ends with one of these words. The normal form is the key in lower case
+ * without dashes, underscores and dots: `authToken`, `x-api-key`, `GITHUB_TOKEN` and `client_secret` are secrets, while
+ * `maxTokens`, `apiKeyHelper` and `tokenizer` are not.
+ */
+const SECRET_SUFFIXES = ['token', 'secret', 'password', 'passwd', 'apikey', 'authorization', 'cookie', 'credential',
+  'credentials', 'privatekey', 'accesskey', 'secretkey', 'clientsecret', 'sessionkey'];
+const WEB_PROTOCOLS = ['http:', 'https:'];
+/** A command argument of the form `name=value` or `name: value`: the name, the separator and the value. */
+const NAMED_ARGUMENT_RE = /^([^=:]+)([=:]\s*)(.*)$/s;
+
+/**
+ * @param {string} key
+ * @returns {boolean} true when the key names a secret (see SECRET_SUFFIXES)
+ */
+function isSecretKey(key) {
+  const normal = key.toLowerCase().replace(/[-_.]/g, '');
+  return SECRET_SUFFIXES.some((suffix) => normal.endsWith(suffix));
+}
+
+/**
+ * A deep copy of runtime settings in which every secret is replaced by "[redacted]". A secret is every value inside an
+ * `env` or `headers` object, and every value whose key names a secret (see SECRET_SUFFIXES). The keys stay, so a user
+ * still sees what is configured. Other values are copied as they are: the settings view redacts by name only.
  * @param {unknown} value
  * @returns {unknown}
  */
 export function redactSettings(value) {
-  if (Array.isArray(value)) return value.map((item) => redactSettings(item));
-  if (!isPlainObject(value)) return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
-    key,
-    key === 'env' ? redactEnvironment(item) : redactSettings(item),
-  ]));
+  return redactCredentials(redactTree(value, false));
 }
 
 /**
- * @param {unknown} env
+ * The `mcp` view: each server's `config` is redacted (see redactMcpConfig). The rest of each status, the tool lists
+ * included, is passed on as given. An answer that is not a list is redacted as one config, so the rules hold whatever
+ * its shape.
+ * @param {unknown} servers the answer of mcpServerStatus
  * @returns {unknown}
  */
-function redactEnvironment(env) {
-  if (!isPlainObject(env)) return REDACTED;
-  return Object.fromEntries(Object.keys(env).map((name) => [name, REDACTED]));
+export function redactMcpServers(servers) {
+  if (!Array.isArray(servers)) return redactMcpConfig(servers);
+  return servers.map((server) => redactCredentials(isPlainObject(server) && server.config !== undefined
+    ? { ...server, config: redactMcpConfig(server.config) }
+    : server));
+}
+
+/**
+ * An MCP server's config: the settings rules, then every http or https URL in it is redacted and the command arguments
+ * (`args`) are checked for secrets.
+ * @param {unknown} config
+ * @returns {unknown}
+ */
+function redactMcpConfig(config) {
+  const settings = redactSettings(config);
+  if (!isPlainObject(settings)) return redactUrls(settings);
+  return mapEntries(settings, (key, item) => (key === 'args' && Array.isArray(item)
+    ? redactArgs(item)
+    : redactUrls(item)));
+}
+
+/**
+ * Every string that is an http or https URL, at any depth, is redacted by redactUrl. Other values are passed on as they
+ * are.
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function redactUrls(value) {
+  if (typeof value === 'string') return isWebAddress(value) ? redactUrl(value) : value;
+  if (Array.isArray(value)) return value.map((item) => redactUrls(item));
+  if (!isPlainObject(value)) return value;
+  return mapEntries(value, (_key, item) => redactUrls(item));
+}
+
+/**
+ * The command arguments of an MCP server. The value after a flag whose name is a secret (`--token abc`) is replaced,
+ * and so is the value of a `name=value` or `name: value` item whose name is one (`--api-key=abc`, `GITHUB_TOKEN=abc`).
+ * URLs are redacted as URLs are. Any other argument is passed on as it is, so `--tokenizer` and `--token-file` stay.
+ * @param {unknown[]} args
+ * @returns {unknown[]}
+ */
+function redactArgs(args) {
+  let secretNext = false;
+  return args.map((item) => {
+    if (secretNext) {
+      secretNext = false;
+      return REDACTED;
+    }
+    if (typeof item !== 'string') return redactUrls(item);
+    if (isSecretFlag(item)) {
+      secretNext = true;
+      return item;
+    }
+    return redactArgument(item);
+  });
+}
+
+/**
+ * A flag that carries no value of its own (`--token`) and whose name is a secret. Its value is the next argument.
+ * @param {string} item
+ * @returns {boolean}
+ */
+function isSecretFlag(item) {
+  return item.startsWith('-') && !/[=:]/.test(item) && isSecretKey(item);
+}
+
+/**
+ * One argument that is not a flag with its value to hide: a URL, or a `name=value` or `name: value` item whose name is
+ * a secret, or whose value is a URL.
+ * @param {string} text
+ * @returns {string}
+ */
+function redactArgument(text) {
+  if (isWebAddress(text)) return redactUrl(text);
+  const named = NAMED_ARGUMENT_RE.exec(text);
+  if (named === null) return text;
+  const [, name, separator, value] = named;
+  if (isSecretKey(name)) return `${name}${separator}${REDACTED}`;
+  return isWebAddress(value) ? `${name}${separator}${redactUrl(value)}` : text;
+}
+
+/**
+ * @param {string} text
+ * @returns {boolean} true when the text is an absolute http or https URL
+ */
+function isWebAddress(text) {
+  return isWebUrl(text, Number.POSITIVE_INFINITY, WEB_PROTOCOLS);
+}
+
+/**
+ * A web URL without its user name and password, with the value of every query and fragment parameter replaced by
+ * "[redacted]". A URL that holds nothing to hide is returned as it is.
+ * @param {string} text an absolute http or https URL
+ * @returns {string}
+ */
+function redactUrl(text) {
+  const url = new URL(text);
+  if (url.username === '' && url.password === '' && url.search === '' && url.hash === '') return text;
+  url.username = '';
+  url.password = '';
+  if (url.search !== '') url.search = redactParameters(url.search.slice(1));
+  if (url.hash !== '') url.hash = redactParameters(url.hash.slice(1));
+  return url.toString();
+}
+
+/**
+ * The `name=value` items of a query or a fragment, with every value replaced. An item without `=` has no name to keep
+ * and is replaced whole, since it may be the secret itself.
+ * @param {string} parameters the text after `?` or `#`
+ * @returns {string}
+ */
+function redactParameters(parameters) {
+  return parameters.split('&').map((item) => {
+    const equals = item.indexOf('=');
+    return equals === -1 ? REDACTED : `${item.slice(0, equals)}=${REDACTED}`;
+  }).join('&');
+}
+
+/**
+ * The data a runtime view passes on: the settings and the MCP servers are redacted, every other view is passed on as
+ * the runtime answered it.
+ * @param {string} view
+ * @param {unknown} answer
+ * @returns {unknown}
+ */
+export function redactView(view, answer) {
+  if (view === 'settings') return redactSettings(answer);
+  if (view === 'mcp') return redactMcpServers(answer);
+  return redactCredentials(answer);
+}
+
+/** `scheme://user:password@`: the password part of a URL written inside any text (a proxy URL in a status row). */
+const URL_PASSWORD_RE = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@:]+:[^\s/?#@]+@/gi;
+
+/**
+ * A copy in which every string loses the user name and password of the URLs written in it (`http://u:p@proxy:3128`
+ * becomes `http://[redacted]@proxy:3128`). A user name alone (`ssh://git@host`) is not a secret and stays. Views that
+ * are not otherwise redacted pass through this, so a proxy or registry URL with credentials never reaches a browser.
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+export function redactCredentials(value) {
+  if (typeof value === 'string') return value.replace(URL_PASSWORD_RE, `$1${REDACTED}@`);
+  if (Array.isArray(value)) return value.map((item) => redactCredentials(item));
+  if (!isPlainObject(value)) return value;
+  return mapEntries(value, (_key, item) => redactCredentials(item));
+}
+
+/**
+ * @param {unknown} value
+ * @param {boolean} secret the value lies inside an env or headers object, so every value in it is a secret
+ * @returns {unknown}
+ */
+function redactTree(value, secret) {
+  if (secret) {
+    if (!isPlainObject(value)) return REDACTED;
+    return mapEntries(value, (_key, item) => redactTree(item, true));
+  }
+  if (Array.isArray(value)) return value.map((item) => redactTree(item, false));
+  if (!isPlainObject(value)) return value;
+  return mapEntries(value, (key, item) => {
+    if (SECRET_CONTAINER_KEYS.has(key)) return redactTree(item, true);
+    if (isSecretKey(key)) return REDACTED;
+    return redactTree(item, false);
+  });
+}
+
+/**
+ * A copy of a plain object with each value replaced by what `change` returns for its key.
+ * @param {Record<string, unknown>} object
+ * @param {(key: string, item: unknown) => unknown} change
+ * @returns {Record<string, unknown>}
+ */
+function mapEntries(object, change) {
+  return Object.fromEntries(Object.entries(object).map(([key, item]) => [key, change(key, item)]));
 }
 
 /**

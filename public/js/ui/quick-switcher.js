@@ -14,6 +14,8 @@ import { openDialog } from './dialog.js';
 const WORD_BREAK = /[\s\-_./:\\]/;
 const SEARCH_MIN_CHARS = 2;
 const SEARCH_LIMIT = 20;
+/** The scan limit of a gateway that does not report scanLimit (before it did). Newer gateways report theirs. */
+const FALLBACK_SCAN_LIMIT = 50;
 const RECENT_LIMIT = 8;
 
 /**
@@ -175,6 +177,17 @@ export function searchRowVisible(query) {
 }
 
 /**
+ * How many of the most recent sessions a message search read: the answer's scanLimit, or the fallback when the answer
+ * does not carry one.
+ * @param {unknown} answer the body of GET /api/sessions/search
+ * @returns {number}
+ */
+export function scanLimitOf(answer) {
+  const limit = answer !== null && typeof answer === 'object' ? answer.scanLimit : undefined;
+  return typeof limit === 'number' && Number.isInteger(limit) && limit > 0 ? limit : FALLBACK_SCAN_LIMIT;
+}
+
+/**
  * @typedef {Object} SwitcherEntry
  * @property {string} id
  * @property {'sessions'|'panels'|'commands'} group
@@ -301,12 +314,16 @@ export function openQuickSwitcher(deps) {
     attrs: { id: 'switcher-list', role: 'listbox', 'aria-label': t('shell.switcher.results') },
   });
   const status = h('p', { class: 'switcher-status', attrs: { role: 'status' } });
-  const panel = h('div', { class: 'switcher-body' }, input, status, list);
+  const searchNote = h('p', { class: 'switcher-note', attrs: { hidden: true } });
+  const panel = h('div', { class: 'switcher-body' }, input, status, list, searchNote);
 
   /** @type {Array<{kind: 'entry'|'search', entry?: SwitcherEntry & {labelRanges?: Array<[number,number]>}}>} */
   let options = [];
   let active = 0;
-  /** @type {{query: string, state: 'idle'|'loading'|'done'|'error', results: any[], error: string} | null} */
+  /**
+   * @type {{query: string, state: 'idle'|'loading'|'done'|'error', results: any[], truncated: boolean,
+   *   scanLimit: number, error: string} | null}
+   */
   let deep = null;
   let closed = false;
   let searchToken = 0;
@@ -383,6 +400,7 @@ export function openQuickSwitcher(deps) {
     const query = input.value;
     clear(list);
     options = [];
+    searchNote.hidden = true;
     if (deep && deep.query !== query.trim()) deep = null;
     if (deep) {
       renderDeep();
@@ -429,15 +447,22 @@ export function openQuickSwitcher(deps) {
   /** @param {string} query */
   async function runDeepSearch(query) {
     const token = ++searchToken;
-    deep = { query, state: 'loading', results: [], error: '' };
+    deep = { query, state: 'loading', results: [], truncated: false, scanLimit: 0, error: '' };
     renderDeep();
     try {
       const answer = await api.get(`/api/sessions/search?q=${encodeURIComponent(query)}&limit=${SEARCH_LIMIT}`);
       if (closed || token !== searchToken) return;
-      deep = { query, state: 'done', results: Array.isArray(answer?.results) ? answer.results : [], error: '' };
+      deep = {
+        query,
+        state: 'done',
+        results: Array.isArray(answer?.results) ? answer.results : [],
+        truncated: answer?.truncated === true,
+        scanLimit: scanLimitOf(answer),
+        error: '',
+      };
     } catch (err) {
       if (closed || token !== searchToken) return;
-      deep = { query, state: 'error', results: [], error: errorText(err, t) };
+      deep = { query, state: 'error', results: [], truncated: false, scanLimit: 0, error: errorText(err, t) };
     }
     renderDeep();
   }
@@ -445,6 +470,7 @@ export function openQuickSwitcher(deps) {
   function renderDeep() {
     clear(list);
     options = [];
+    searchNote.hidden = true;
     if (!deep) return;
     if (deep.state === 'loading') {
       status.textContent = t('shell.switcher.searching');
@@ -453,6 +479,10 @@ export function openQuickSwitcher(deps) {
     if (deep.state === 'error') {
       status.textContent = deep.error;
       return;
+    }
+    if (deep.truncated) {
+      searchNote.textContent = t('shell.search.truncated', { count: deep.scanLimit });
+      searchNote.hidden = false;
     }
     if (deep.results.length === 0) {
       status.textContent = t('shell.switcher.noMessages');

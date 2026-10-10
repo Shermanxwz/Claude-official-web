@@ -19,8 +19,8 @@ import { engineEnv } from './env.mjs';
 import { createRuntimeTrust } from './trust.mjs';
 import {
   ControlTimeout, MEMORY_MAX_BYTES, TIMEOUT_MESSAGE, availableViews, exportFilename, fileSuggestionsOf, firstLine,
-  interruptReceipt, isEditableMemoryFile, isPlainObject, isWebUrl, listedMemoryFiles, redactSettings, runtimeMethod,
-  sameDirectory, viewArguments, withTimeout, writeMemoryFile,
+  interruptReceipt, isEditableMemoryFile, isPlainObject, isWebUrl, listedMemoryFiles, redactMcpServers, redactView,
+  runtimeMethod, sameDirectory, viewArguments, withTimeout, writeMemoryFile,
 } from './runtime-views.mjs';
 
 /** @typedef {import('../contracts.mjs').EngineHostApi} EngineHostApi */
@@ -85,6 +85,8 @@ const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const ENGINE_UNAVAILABLE_RE = /spawn|ENOENT|not found|Native CLI binary|log ?in|authenticat|api key|credential/i;
 /** The settings lookup that decides the thinking-summary overlay gives up after this long and adds the overlay. */
 const SETTINGS_LOOKUP_MS = 2000;
+/** How long a starting session waits for the initialize handshake before it stops waiting (see #awaitReady). */
+const READY_WAIT_MS = 60_000;
 const RELOAD_TARGETS = ['plugins', 'skills', 'output-styles'];
 const LSP_TOOL_CHANGES = ['adds', 'may-add', 'removes', 'may-remove'];
 const FAST_MODE_STATES = ['off', 'cooldown', 'on'];
@@ -896,7 +898,7 @@ export class EngineHost {
    */
   async listSessions({ cwd, limit, offset } = {}) {
     const page = parsePage({ limit, offset });
-    if (cwd === undefined) return this.#allSessions(page);
+    if (cwd === undefined) return (await this.#allSessions()).slice(page.offset, page.offset + page.limit);
     if (typeof cwd !== 'string' || cwd === '') throw badRequest('The cwd must be a path.');
     if (!(await this.#withinRoots(cwd))) throw outsideRoots();
     const found = await this.#engineList({ dir: cwd, limit: page.limit, offset: page.offset });
@@ -912,10 +914,10 @@ export class EngineHost {
   }
 
   /**
-   * @param {{offset: number, limit: number}} page
+   * Every session inside an allowed workspace and every live one, newest first. The runtime is asked once.
    * @returns {Promise<SessionSummary[]>}
    */
-  async #allSessions(page) {
+  async #allSessions() {
     const found = await this.#engineList({});
     /** @type {Map<string, boolean>} */
     const allowed = new Map();
@@ -931,7 +933,15 @@ export class EngineHost {
       }
     }
     sortByRecency(sessions);
-    return sessions.slice(page.offset, page.offset + page.limit);
+    return sessions;
+  }
+
+  /**
+   * Every session the gateway lists, newest first, from one listing of the runtime (the session search reads it once).
+   * @returns {Promise<SessionSummary[]>}
+   */
+  listAllSessions() {
+    return this.#allSessions();
   }
 
   /**
@@ -1032,7 +1042,8 @@ export class EngineHost {
       models: init.models ?? [],
       agents: init.agents ?? [],
       account: init.account ?? null,
-      mcpServers,
+      // The capabilities reach every profile, so MCP server configs lose their secrets as in the mcp view.
+      mcpServers: /** @type {McpServerStatus[]} */ (redactMcpServers(mcpServers)),
       outputStyle: init.output_style ?? null,
       availableOutputStyles: outputStylesOf(init.available_output_styles),
     };
@@ -1391,7 +1402,26 @@ export class EngineHost {
     this.#remember(id, settings);
     live.pump = this.#pump(live);
     this.#sync(live);
+    void this.#awaitReady(live);
     return live;
+  }
+
+  /**
+   * Claude Code answers the SDK's initialize handshake as soon as its process is up, but sends system/init only with
+   * the first prompt of a streaming session. A new or resumed session is therefore ready, and shown as idle, once the
+   * handshake is answered (`initializationResult()`, which makes no model call); model, mode and version stay as they
+   * are until system/init reports them. A handshake that fails or never comes changes nothing: the pump reports the
+   * failure.
+   * @param {LiveRecord} live
+   */
+  async #awaitReady(live) {
+    try {
+      await withTimeout(() => /** @type {SdkQuery} */ (live.query).initializationResult(), READY_WAIT_MS);
+    } catch (error) {
+      this.#log.debug('initialize handshake not answered', { sessionId: live.sessionId, reason: errorName(error) });
+      return;
+    }
+    if (live.state === 'starting') this.#setState(live, 'idle');
   }
 
   /**
@@ -2399,6 +2429,19 @@ export class EngineHost {
   }
 
   /**
+   * A rewind changes the files or restarts the query, and a restart would drop the turn that is still running. Every
+   * rewind, a dry run included, waits until the running turn has stopped and no request is waiting.
+   * @param {string} sessionId
+   */
+  #assertRewindable(sessionId) {
+    const live = this.#live.get(sessionId);
+    if (live === undefined) return;
+    if (live.state === 'running' || live.state === 'requires_action' || this.#requests.count(sessionId) > 0) {
+      throw new AppError(409, 'CONFLICT', 'Stop the running turn before rewinding this session.');
+    }
+  }
+
+  /**
    * A query can restart only between turns, with no request waiting.
    * @param {LiveRecord} live
    */
@@ -2495,8 +2538,9 @@ export class EngineHost {
         'The MCP server could not be updated.');
     }
     live.capsCache = null;
-    const mcpServers = await this.#control(sessionId, () => live.query.mcpServerStatus(),
+    const status = await this.#control(sessionId, () => live.query.mcpServerStatus(),
       'The MCP server status could not be read.');
+    const mcpServers = /** @type {McpServerStatus[]} */ (redactMcpServers(status));
     return warning === undefined ? { mcpServers } : { mcpServers, warning };
   }
 
@@ -2547,7 +2591,7 @@ export class EngineHost {
     const call = methodOf(live.query, spec.method, 'This runtime does not offer this view.');
     const answer = await this.#control(sessionId, () => call(...viewArguments(view)),
       'The runtime view could not be read.', spec.timeoutMs);
-    return { view, data: view === 'settings' ? redactSettings(answer) : answer, fetchedAt: this.#now() };
+    return { view, data: redactView(view, answer), fetchedAt: this.#now() };
   }
 
   /**
@@ -2911,6 +2955,7 @@ export class EngineHost {
    */
   async #previewRewind(sessionId, messageId, mode) {
     const { info } = await this.#scopeOf(sessionId);
+    this.#assertRewindable(sessionId);
     const resumeAt = mode === 'code' ? undefined : await this.#rewindTarget(sessionId, messageId, info);
     /** @type {{files?: RewindFilesResult, conversation?: {resumeAt: string}}} */
     const result = {};
@@ -2933,6 +2978,7 @@ export class EngineHost {
   async #applyRewind(sessionId, messageId, mode) {
     this.#assertNotLocked(sessionId);
     const { info } = await this.#scopeOf(sessionId);
+    this.#assertRewindable(sessionId);
     const resumeAt = mode === 'code' ? undefined : await this.#rewindTarget(sessionId, messageId, info);
     /** @type {{files?: RewindFilesResult, conversation?: {resumeAt: string}}} */
     const result = {};
