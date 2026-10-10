@@ -123,12 +123,16 @@ scripts/install-linux.sh --uninstall --purge   # 同时移除配置和令牌
 - `--plain-token` 把新签发的令牌以明文（`CAW_TOKEN`）保存，而不是保存哈希。只有当配置文件必须能够显示该令牌时才使用它。
 - `--rotate-token` 签发新的令牌，并以相同方式保存（使用 `--plain-token` 时则以明文保存），然后重启服务。所有浏览器会话都会结束。
 - `--show-token` 打印本次运行签发的令牌，或已保存的明文令牌。已保存的哈希无法显示。
+- `--keep-claude-retention` 不修改 Claude Code 的设置。默认情况下，如果 `~/.claude/settings.json` 中没有设置 `cleanupPeriodDays`，
+  安装器会把它设为 3650，使对话保留约十年，而不是 30 天后删除。
 - `--allow-root`（不推荐）和 `--help`。
 
 在安装任何内容之前，安装器会检查现有配置。它会拒绝同时设置两个令牌变量的文件、长度不足 16 个字符的明文令牌、格式错误的哈希、
 `CAW_REQUIRE_AUTH=0` 或 `CAW_ENGINE=mock`，并指出需要修改的配置项。`--rotate-token` 会跳过令牌检查，因为它会替换已保存的令牌。
 
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 中的部署指南涵盖完整的服务器部署、更新和备份。
+如果希望服务长期稳定运行、尽量少做维护，请阅读其中的[长期运行](docs/DEPLOYMENT.md#long-term-operation)一节，
+它说明哪些部分会自动运行、哪些需要人工处理，以及如何升级运行时。
 
 ## 远程访问
 

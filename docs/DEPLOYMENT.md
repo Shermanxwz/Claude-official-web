@@ -98,9 +98,12 @@ The installer:
   `CAW_ACCESS_PROFILE`, `CAW_APP_NAME`, `CAW_WORKSPACE_ROOTS`, `CAW_STATE_DIR` and `CAW_TERMINAL`;
 - applies the configuration overrides you passed in the environment: `CAW_PUBLIC_ORIGIN`, `CAW_PORT`, `CAW_HOST`,
   `CAW_WORKSPACE_ROOTS`, `CAW_TERMINAL`, `CAW_ACCESS_PROFILE`, `CAW_APP_NAME` and `CAW_CLAUDE_BIN`;
+- sets `cleanupPeriodDays` to 3650 in the Claude Code settings file when that file does not set it, so conversations are
+  kept for about ten years (`--keep-claude-retention` skips this; see [Long-term operation](#long-term-operation));
 - installs `~/.config/systemd/user/claude-official-web.service`, enables it and starts it. A service that is already
   running is restarted so that the new configuration takes effect;
-- waits for the health check and reports the local URL and the Claude Code runtime it found.
+- waits for the health check and reports the local URL and the Claude Code runtime it found;
+- enables lingering for the user when the system allows it, so that the service survives logout (step 7).
 
 ### The login token
 
@@ -245,8 +248,8 @@ By default systemd stops a user's services when that user logs out. Enable linge
 loginctl enable-linger "$USER"
 ```
 
-Your system may ask for administrator authorization for this command. The installer prints the same advice if lingering
-is not enabled.
+The installer tries this command for you. If your system refuses it, the installer prints the same command with `sudo`
+to run once.
 
 ## 8. Expose the gateway over HTTPS
 
@@ -464,6 +467,67 @@ then issues a new token.
 
 Uninstalling never deletes conversations in `~/.claude` or the state directory. Delete those yourself if you no longer
 need them. To stop lingering, run `loginctl disable-linger "$USER"`.
+
+## Long-term operation
+
+The service is built to run for years with little attention. This section says what runs by itself, what eventually
+needs a person and how to notice it, and how to upgrade the runtime.
+
+### What runs by itself
+
+- **Exact pins.** `package.json` pins `@anthropic-ai/claude-agent-sdk` to one version, with no range, and the lock file
+  pins every other dependency. Installing or restarting the service never picks up a newer SDK.
+- **No self-updates.** The gateway sets `DISABLE_AUTOUPDATER=1` for Claude Code unless you set that variable
+  yourself, so the runtime never replaces itself with a version that nobody has checked.
+- **Restarts after crashes.** systemd restarts the service five seconds after each exit, however often it crashes, and
+  no start limit ever stops it. The one exception is a configuration error (exit status 2): another start cannot fix it,
+  so systemd stops, and the log shows the reason.
+- **Start at boot.** With lingering enabled (step 7), the service starts at boot and keeps running after you log out.
+- **Bounded state.** Once an hour the gateway deletes uploads older than `CAW_UPLOAD_RETENTION_DAYS` (7 by
+  default). Every minute it closes sessions that have been idle for `CAW_IDLE_TIMEOUT_MS` (30 minutes by default). A
+  session that is running or waiting for an answer is never closed.
+- **Conversation retention.** When the Claude Code settings file (`~/.claude/settings.json`, or
+  `$CLAUDE_CONFIG_DIR/settings.json` when that is set) does not set `cleanupPeriodDays`, the installer sets it to 3650.
+  Claude Code then keeps transcripts for about ten years instead of deleting them after 30 days. An existing value is
+  never changed, and `--keep-claude-retention` leaves the file alone.
+
+### What eventually needs a person
+
+Each item says what you will see, and what to do about it.
+
+- **The runtime is older than Anthropic accepts.** Sessions cannot start. The timeline shows "This Claude Code
+  version is older than Anthropic now accepts. Upgrade claude web on the server with npm run upgrade:runtime, then
+  restart it." The status badge in the header shows the same text on hover. Run the upgrade below.
+- **The sign-in has expired or was revoked.** The timeline shows "The sign-in has expired or was revoked. Sign in again
+  in Settings → Account." Open Settings → Account in the web UI and sign in again.
+- **Node.js 22 reaches end of life on 2027-04-30.** Install Node.js 24, which CI already tests, and then run
+  `scripts/install-linux.sh` again. The installer writes the new Node.js path into the unit and installs the
+  dependencies for it. Then check the service as in step 9.
+- **Journal size.** The service logs to the journal. By default journald keeps up to 10% of the file system (at most
+  4 GB) for the whole journal, not only for this service. To keep less, set it in `/etc/systemd/journald.conf`, for
+  example `SystemMaxUse=500M` under `[Journal]`, then run `sudo systemctl restart systemd-journald`. Read the service
+  log with `journalctl --user -u claude-official-web -n 100 --no-pager`.
+- **TLS certificates.** Caddy obtains and renews its certificates by itself. With nginx and Let's Encrypt, the certbot
+  timer renews them. Check that the timer is active, and that nginx reloads after each renewal. A deploy hook that runs
+  `systemctl reload nginx` does this.
+
+### Upgrading the runtime
+
+1. Run `npm run upgrade:runtime` in the repository. It installs the newest Claude Agent SDK, which bundles Claude Code,
+   and checks the runtime contract, the source manifest and the seal. To choose a version, pass it:
+   `npm run upgrade:runtime -- <version>`. If a check fails, the message names it.
+2. Restart the service with `systemctl --user restart claude-official-web`. In the default hash mode every browser
+   session ends at the restart, so sign in again afterwards.
+3. Commit the three files the upgrade changed (`package.json`, `package-lock.json`, `SOURCE_MANIFEST.sha256`) and push
+   them, so that the next `git pull` (section 10) does not conflict and other installs can update the same way.
+4. Optionally run `npm run smoke:runtime`. It runs a real turn with the installed runtime and checks that Claude Code is
+   still signed in for this user.
+
+The weekly CI canary (`.github/workflows/ci.yml`) runs the same contract, the type check and the tests against the
+newest SDK without changing the pin. A green canary means the upgrade is expected to pass; GitHub emails you when it
+fails.
+
+Section 10 explains how to compare the versions after an update.
 
 ## Troubleshooting
 

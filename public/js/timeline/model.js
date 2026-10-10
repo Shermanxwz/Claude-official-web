@@ -742,14 +742,16 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
 
   /**
    * A notice the gateway raises outside the SDK stream (for example ENGINE_UNAVAILABLE). It lands in the open turn, or
-   * starts one. The same notice right after itself is not added twice.
-   * @param {{code: string, level: string, text: string}} notice
+   * starts one. The same notice right after itself is not added twice. `reason` is the runtime's startup_failure_reason
+   * ('' when the gateway sent none); `text` is the runtime's first line.
+   * @param {{code: string, level: string, text: string, reason: string}} notice
    */
-  const addInlineNotice = ({ code, level, text }) => {
+  const addInlineNotice = ({ code, level, text, reason }) => {
     const flow = liveFlow();
     const last = flow.entries[flow.entries.length - 1];
-    if (last && last.kind === 'notice' && last.code === code && last.text === text) return;
-    addNotice(flow, level, code, {}, text, null);
+    if (last && last.kind === 'notice' && last.code === code && last.text === text
+      && (last.vars?.reason ?? '') === reason) return;
+    addNotice(flow, level, code, { reason }, text, null);
   };
 
   /**
@@ -2199,7 +2201,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     /**
      * Adds an inline error notice for a gateway notice the timeline shows (ENGINE_UNAVAILABLE). Kept in the log, so it
      * survives a replay.
-     * @param {{code: string, level?: string, text?: string}} notice
+     * @param {{code: string, level?: string, text?: string, reason?: string}} notice
      */
     applyNotice(notice) {
       if (!isObject(notice) || typeof notice.code !== 'string') return;
@@ -2208,6 +2210,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
         code: notice.code,
         level: typeof notice.level === 'string' ? notice.level : 'error',
         text: String(notice.text ?? ''),
+        reason: typeof notice.reason === 'string' ? notice.reason : '',
       };
       log.push(operation);
       apply(operation);

@@ -2513,8 +2513,8 @@ describe('EngineHost log hygiene', () => {
   });
 });
 
-const CREDENTIALS_NOTICE = 'Claude Code credentials were rejected. Log in again on the server: run `claude` and use '
-  + '/login.';
+const CREDENTIALS_NOTICE = 'Claude Code credentials were rejected. Sign in again in Settings → Account, or run '
+  + '`claude` on the server and use /login.';
 const TIMEOUT_NOTICE = 'The Claude Code runtime did not respond in time.';
 const CONTROL_TIMEOUT = 10_000;
 
@@ -2595,6 +2595,118 @@ describe('EngineHost credential failures', () => {
     await flush();
     assert.equal(ofType(h.events, 'notice').length, 2);
     assert.equal(h.host.liveInfo(S1).error.code, 'ENGINE_UNAVAILABLE');
+  });
+});
+
+const STARTUP_TEXT = 'Claude Code 2.1.0 is below the minimum version';
+
+/**
+ * The zeroed error result that Claude Code writes before it exits on a known startup failure (SDKResultError).
+ * @param {string} sessionId
+ * @param {Record<string, unknown>} [overrides]
+ */
+function startupFailureResult(sessionId, overrides = {}) {
+  return {
+    type: 'result',
+    subtype: 'error_during_execution',
+    uuid: randomUUID(),
+    session_id: sessionId,
+    is_error: true,
+    duration_ms: 0,
+    duration_api_ms: 0,
+    num_turns: 0,
+    total_cost_usd: 0,
+    usage: {},
+    modelUsage: {},
+    permission_denials: [],
+    stop_reason: null,
+    errors: [STARTUP_TEXT],
+    startup_failure_reason: 'cli_version_too_old',
+    ...overrides,
+  };
+}
+
+/** @param {Array<{type: string, data: any}>} events @param {string} sessionId */
+function lastLiveError(events, sessionId) {
+  const lives = ofType(events, 'session_state').filter((event) => event.data.live?.sessionId === sessionId);
+  return lives.at(-1)?.data.live.error ?? null;
+}
+
+describe('EngineHost startup failures', () => {
+  const EXPECTED = { code: 'ENGINE_UNAVAILABLE', message: STARTUP_TEXT, reason: 'cli_version_too_old' };
+
+  test('a result that names the startup failure sets the error with its reason and publishes one notice', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    query.emit(startupFailureResult(sessionId));
+    await flush();
+    assert.deepEqual(h.host.liveInfo(sessionId).error, EXPECTED);
+    const notices = ofType(h.events, 'notice');
+    assert.equal(notices.length, 1);
+    assert.deepEqual(notices[0].data, { sessionId, level: 'error', ...EXPECTED });
+    const warnings = h.logs.filter((entry) => entry.msg === 'claude code refused to start');
+    assert.deepEqual(warnings.map((entry) => entry.fields), [{ sessionId, reason: 'cli_version_too_old' }]);
+    assert.equal(JSON.stringify(h.logs).includes(STARTUP_TEXT), false, 'the runtime text is not logged');
+  });
+
+  test('the query that ends afterwards keeps the startup failure, even when its own failure is vaguer', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    query.emit(startupFailureResult(sessionId));
+    await flush();
+    query.fail(new Error('spawn claude ENOENT'));
+    await flush();
+    assert.deepEqual(lastLiveError(h.events, sessionId), EXPECTED);
+    assert.equal(ofType(h.events, 'notice').length, 1);
+    assert.equal(h.logs.some((entry) => entry.msg === 'session stopped with an error'), false);
+  });
+
+  test('a clean end of the query after the startup failure keeps it too', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    query.emit(startupFailureResult(sessionId));
+    await flush();
+    query.finish();
+    await flush();
+    assert.deepEqual(lastLiveError(h.events, sessionId), EXPECTED);
+    assert.equal(ofType(h.events, 'notice').length, 1);
+  });
+
+  test('a second result that names a startup failure publishes no second notice', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    query.emit(startupFailureResult(sessionId));
+    query.emit(startupFailureResult(sessionId, { startup_failure_reason: 'org_verify_failed' }));
+    await flush();
+    assert.deepEqual(h.host.liveInfo(sessionId).error, EXPECTED);
+    assert.equal(ofType(h.events, 'notice').length, 1);
+  });
+
+  test('a result without the field changes nothing new', async () => {
+    const h = harness();
+    const { sessionId, query } = await startLive(h);
+    const plain = startupFailureResult(sessionId);
+    delete plain.startup_failure_reason;
+    query.emit(plain);
+    await flush();
+    assert.equal(h.host.liveInfo(sessionId).error, null);
+    assert.equal(ofType(h.events, 'notice').length, 0);
+    assert.equal(h.logs.some((entry) => entry.msg === 'claude code refused to start'), false);
+  });
+
+  test('the message is the first line of the runtime text, or a generic sentence when there is none', async () => {
+    const h = harness();
+    const first = await startLive(h);
+    first.query.emit(startupFailureResult(first.sessionId, { errors: ['Line one.\nSECRET-DETAIL'] }));
+    await flush();
+    assert.equal(h.host.liveInfo(first.sessionId).error.message, 'Line one.');
+    assert.equal(JSON.stringify([...ofType(h.events, 'notice'), h.host.liveInfo(first.sessionId).error])
+      .includes('SECRET-DETAIL'), false, 'the notice and the error carry the first line only');
+
+    const second = await startLive(h, { cwd: CWD }, {});
+    second.query.emit(startupFailureResult(second.sessionId, { errors: [] }));
+    await flush();
+    assert.equal(h.host.liveInfo(second.sessionId).error.message, 'Claude Code could not start.');
   });
 });
 

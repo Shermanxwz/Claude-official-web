@@ -150,6 +150,9 @@ The installer also accepts these options:
   the service. Every browser session ends.
 - `--show-token` prints a token issued by this run, or the plaintext token that is already stored. A stored hash cannot
   be shown.
+- `--keep-claude-retention` leaves the Claude Code settings alone. By default, when `cleanupPeriodDays` is not set in
+  `~/.claude/settings.json`, the installer sets it to 3650, so conversations are kept for about ten years instead of 30
+  days.
 - `--allow-root` (not recommended) and `--help`.
 
 Before it installs anything, the installer checks the existing configuration. It refuses a file that sets both token
@@ -157,6 +160,8 @@ settings, a plaintext token shorter than 16 characters, a malformed hash, `CAW_R
 it names the setting to fix. `--rotate-token` skips the token checks, because it replaces the stored token.
 
 The deployment guide in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers the whole server setup, updates and backups.
+To keep the service running for years with little attention, read its
+[Long-term operation](docs/DEPLOYMENT.md#long-term-operation) section.
 
 ## Remote access
 

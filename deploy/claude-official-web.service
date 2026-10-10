@@ -4,8 +4,9 @@
 Description=Claude Official Web (self-hosted Web host for the Claude Agent SDK)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# No start rate limit. The service must come back after any crash, however many there are; a limit would leave it
+# stopped for good until someone runs systemctl. RestartSec in [Service] keeps a crash loop from spinning.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -15,7 +16,7 @@ Environment=NODE_ENV=production
 Environment="PATH=__NODE_BIN_DIR__:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=__ENV_FILE__
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 # Exit status 2 is a configuration error (see src/config.mjs). Restarting cannot fix it, so systemd stops instead.
 RestartPreventExitStatus=2
 KillMode=control-group

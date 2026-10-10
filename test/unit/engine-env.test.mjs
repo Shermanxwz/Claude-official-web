@@ -1,10 +1,40 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { engineEnv } from '../../src/engine/env.mjs';
+import { RUNTIME_DEFAULTS, engineEnv, withRuntimeDefaults } from '../../src/engine/env.mjs';
 
 const CLIENT_APP = 'claude-official-web/1.0.0';
 
+describe('runtime defaults', () => {
+  test('are the two settings the gateway depends on, and cannot be changed at run time', () => {
+    assert.deepEqual({ ...RUNTIME_DEFAULTS }, {
+      DISABLE_AUTOUPDATER: '1',
+      CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1',
+    });
+    assert.equal(Object.isFrozen(RUNTIME_DEFAULTS), true);
+  });
+
+  test('withRuntimeDefaults adds each default the source does not set and leaves the others alone', () => {
+    const env = withRuntimeDefaults({ KEPT: 'yes' }, { DISABLE_AUTOUPDATER: undefined });
+    assert.deepEqual(env, { KEPT: 'yes', DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' });
+  });
+});
+
 describe('engineEnv', () => {
+  test('gives the runtime both defaults when the host environment does not set them', () => {
+    const env = engineEnv({ HOME: '/home/claude' }, { clientApp: CLIENT_APP });
+    assert.equal(env.DISABLE_AUTOUPDATER, '1');
+    assert.equal(env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS, '1');
+  });
+
+  test('keeps the value the host sets for a default, including an empty one, so an operator can opt out', () => {
+    const env = engineEnv(
+      { DISABLE_AUTOUPDATER: '0', CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '' },
+      { clientApp: CLIENT_APP },
+    );
+    assert.equal(env.DISABLE_AUTOUPDATER, '0');
+    assert.equal(env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS, '');
+  });
+
   test('removes every CAW_ variable and keeps the other strings', () => {
     const env = engineEnv(
       {

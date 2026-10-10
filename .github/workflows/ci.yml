@@ -4,8 +4,10 @@ on:
   push:
   pull_request:
   schedule:
-    # Weekly, so that a Chromium or dependency change that breaks the browser suite is noticed without a commit.
+    # Weekly, so that a Chromium or dependency change that breaks the browser suite is noticed without a commit. The
+    # canary job runs on this schedule too, against the newest Claude Agent SDK.
     - cron: '17 5 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,9 +18,14 @@ concurrency:
 
 jobs:
   seal:
-    name: seal (Node 22, ubuntu-latest)
+    name: seal (Node ${{ matrix.node }}, ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is the oldest supported version (engines in package.json); 24 is where the server moves next.
+        node: ['22', '24']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,7 +33,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
@@ -44,6 +51,9 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
+      - name: Runtime contract
+        run: npm run contract
+
       - name: Unit and integration tests
         run: npm test
 
@@ -54,7 +64,57 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-artifacts
+          name: e2e-artifacts-node-${{ matrix.node }}
           path: test/e2e/artifacts
           if-no-files-found: ignore
           retention-days: 7
+
+  canary:
+    # Runs only on the weekly schedule or by hand. The newest Claude Agent SDK is installed without saving it to the
+    # lockfile, so a failure means the next upgrade needs work. GitHub emails the owner about failed scheduled runs.
+    name: canary (latest Claude Agent SDK, Node 22)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install the latest Claude Agent SDK without saving it
+        id: sdk
+        run: npm install --no-save @anthropic-ai/claude-agent-sdk@latest
+
+      # Only a summary: a missing executable is reported by the contract check below, so this step never blocks it.
+      - name: Record the installed SDK and Claude Code versions
+        continue-on-error: true
+        run: |
+          sdk="$(node -p "require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")"
+          claude_code="$(node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude --version)"
+          {
+            echo "## Canary runtime"
+            echo ""
+            echo "- Claude Agent SDK: ${sdk}"
+            echo "- Claude Code: ${claude_code}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --candidate: the newest SDK is expected to differ from the pin, so only a missing piece of the runtime surface
+      # or a bad checksum fails. The checks below still run after a failure, so one run shows all a new SDK breaks.
+      - name: Runtime contract
+        run: npm run contract -- --candidate
+
+      - name: Type check
+        if: always() && steps.sdk.outcome == 'success'
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        if: always() && steps.sdk.outcome == 'success'
+        run: npm test

@@ -5,7 +5,7 @@
  */
 
 import { h, clear, icon } from '../dom.js';
-import { ApiError, connectEvents, createUuid, errorText } from '../api.js';
+import { ApiError, connectEvents, createUuid, errorText, startupFailureText } from '../api.js';
 import { getLocale, onLocaleChange } from '../i18n.js';
 import { createHeader } from './header.js';
 import { createComposer } from './composer.js';
@@ -870,10 +870,12 @@ export function createAppShell({ root, api, store, t }) {
   /** @param {any} data */
   function onNotice(data) {
     const level = data.level === 'warning' || data.level === 'error' ? data.level : 'info';
-    // Notice codes are protocol error codes (docs/PROTOCOL.md), so a known code shows its localized error text.
+    // Notice codes are protocol error codes (docs/PROTOCOL.md), so a known code shows its localized error text. A
+    // startup failure that carries a reason shows the sentence for that reason, as the timeline does.
     const key = `common.error.${typeof data.code === 'string' ? data.code : ''}`;
     const localized = t(key);
-    toast(localized !== key ? localized : String(data.message ?? ''), level);
+    const startup = startupFailureText(data.reason, data.message, t);
+    toast(startup ?? (localized !== key ? localized : String(data.message ?? '')), level);
   }
 
   /**

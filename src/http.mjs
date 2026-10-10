@@ -296,6 +296,29 @@ function packageRootOf(name) {
 }
 
 /**
+ * Logs one error per vendored browser library that cannot be served, so that a broken install shows at startup and not
+ * as a page that silently fails to load. Returns the URLs that are missing.
+ * @param {Logger} log
+ * @param {{rootOf?: (name: string) => string, exists?: (file: string) => boolean}} [options] injected by the tests
+ * @returns {string[]}
+ */
+export function checkVendorFiles(log, { rootOf = packageRootOf, exists = fs.existsSync } = {}) {
+  const missing = [];
+  for (const [url, [name, file]] of VENDOR_FILES) {
+    let present = false;
+    try {
+      present = exists(path.join(rootOf(name), file));
+    } catch {
+      // A package that cannot be located is missing like any other file.
+    }
+    if (present) continue;
+    missing.push(url);
+    log.error('vendored browser library is missing; run npm ci to reinstall it', { url, package: name, file });
+  }
+  return missing;
+}
+
+/**
  * Maps a request path to a file that may be served, or null.
  * @param {string} pathname decoded request path
  * @param {string} publicDir

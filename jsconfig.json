@@ -17,6 +17,6 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": ["src/**/*.mjs", "scripts/**/*.mjs"],
+  "include": ["src/**/*.mjs", "scripts/**/*.mjs", "deploy/**/*.mjs"],
   "exclude": ["node_modules", "public", "test"]
 }

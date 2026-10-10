@@ -103,8 +103,10 @@ const CACHE_IMPACT_MAX = 50;
 const CACHE_IMPACT_NAME_MAX = 200;
 const OUTPUT_STYLE_MAX = 100;
 const BACKGROUND_DISABLED_MESSAGE = 'Background tasks are disabled for this runtime.';
-const CREDENTIALS_MESSAGE = 'Claude Code credentials were rejected. Log in again on the server: run `claude` and use '
-  + '/login.';
+const CREDENTIALS_MESSAGE = 'Claude Code credentials were rejected. Sign in again in Settings → Account, or run '
+  + '`claude` on the server and use /login.';
+/** The message of a startup failure whose result carries no error text (see startupFailureOf). */
+const STARTUP_FAILURE_MESSAGE = 'Claude Code could not start.';
 /** Errors of the authentication class: the runtime's credentials were rejected. Billing and rate limits are not. */
 const AUTH_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required'];
 const AGENT_MAX = 200;
@@ -140,7 +142,7 @@ const TRUST_NOTICE_MESSAGE = 'Claude Code did not record this folder as trusted,
  * @property {number} lastActivity
  * @property {EventRing} events
  * @property {SDKSystemMessage|null} init
- * @property {{code: string, message: string}|null} error
+ * @property {{code: string, message: string, reason?: string}|null} error
  * @property {string|null} claudeCodeVersion
  * @property {{at: number, value: Capabilities}|null} capsCache
  * @property {SlashCommand[]|null} commands
@@ -149,6 +151,8 @@ const TRUST_NOTICE_MESSAGE = 'Claude Code did not record this folder as trusted,
  * @property {string|null} published   last published LiveInfo, without lastActivity
  * @property {boolean} trusted      project settings, hooks and MCP servers of cwd are loaded by this query
  * @property {boolean} credentialsRejected   the runtime rejected its credentials; the notice was published
+ * @property {string|null} startupFailure   the reason Claude Code named for refusing to start (startup_failure_reason);
+ *   set once, with the error and the one notice of the query, and nothing later replaces them
  * @property {boolean|null} fastMode   fast mode requested for the session; null = the settings decide
  * @property {import('../contracts.mjs').FastModeState|null} fastModeState   last state the runtime reported
  * @property {string|null} fastModeDisabledReason   reason from the same report, null when nothing blocks it
@@ -498,7 +502,8 @@ function interruptRuntime(query, cancelQueued) {
 }
 
 /**
- * The flag-settings layer takes keys that the public typing does not declare (the main-thread agent).
+ * Applies flag settings to a live query. The flag layer is typed by Settings, which declares the main-thread agent key
+ * (sdk.d.ts, Settings.agent); the cast only narrows the gateway's plain record to that type.
  * @param {SdkQuery} query
  * @param {Record<string, unknown>} flags
  * @returns {Promise<void>}
@@ -681,6 +686,19 @@ function settleWithin(promise, ms) {
 function isCredentialFailure(msg) {
   if (msg.type === 'system' && msg.subtype === 'api_retry') return AUTH_ERRORS.includes(msg.error);
   return msg.type === 'assistant' && AUTH_ERRORS.includes(msg.error);
+}
+
+/**
+ * The startup failure a result message reports: the reason Claude Code named (startup_failure_reason) and its first
+ * error text, or null when the message is not such a result. Other results and older producers yield null.
+ * @param {SDKMessage} msg
+ * @returns {{reason: string, text: unknown}|null}
+ */
+function startupFailureOf(msg) {
+  if (msg.type !== 'result' || !('startup_failure_reason' in msg)) return null;
+  const { startup_failure_reason: reason, errors } = msg;
+  if (typeof reason !== 'string') return null;
+  return { reason, text: Array.isArray(errors) ? errors[0] : undefined };
 }
 
 /**
@@ -1413,6 +1431,7 @@ export class EngineHost {
       published: null,
       trusted: trusted === true,
       credentialsRejected: false,
+      startupFailure: null,
       fastMode: resolved.fastMode,
       fastModeState: null,
       fastModeDisabledReason: null,
@@ -1827,6 +1846,8 @@ export class EngineHost {
     live.events.push(seq, msg);
     this.#sync(live);
     if (isCredentialFailure(msg)) this.#rejectCredentials(live);
+    const startup = startupFailureOf(msg);
+    if (startup !== null) this.#rejectStartup(live, startup);
   }
 
   /**
@@ -1843,6 +1864,26 @@ export class EngineHost {
       type: 'notice',
       sessionId: live.sessionId,
       data: { sessionId: live.sessionId, level: 'error', code: 'ENGINE_UNAVAILABLE', message: CREDENTIALS_MESSAGE },
+    });
+    this.#sync(live);
+  }
+
+  /**
+   * Claude Code refused to start and named the reason. The session carries the reason with the first line of the
+   * runtime's own error text, and one notice is published per query. The reason is logged; the text never is.
+   * @param {LiveRecord} live
+   * @param {{reason: string, text: unknown}} startup
+   */
+  #rejectStartup(live, { reason, text }) {
+    if (live.startupFailure !== null) return;
+    live.startupFailure = reason;
+    const message = firstLine(text, STARTUP_FAILURE_MESSAGE);
+    live.error = { code: 'ENGINE_UNAVAILABLE', message, reason };
+    this.#log.warn('claude code refused to start', { sessionId: live.sessionId, reason });
+    this.#publish({
+      type: 'notice',
+      sessionId: live.sessionId,
+      data: { sessionId: live.sessionId, level: 'error', code: 'ENGINE_UNAVAILABLE', message, reason },
     });
     this.#sync(live);
   }
@@ -2144,6 +2185,8 @@ export class EngineHost {
    * @param {unknown} failure
    */
   #reportFailure(live, failure) {
+    // A startup failure the runtime named stays as it is: the error that the end of the query brings is vaguer.
+    if (live.startupFailure !== null) return;
     const { code, message } = describeEngineFailure(failure);
     live.error = { code, message };
     this.#log.warn('session stopped with an error', { sessionId: live.sessionId, code });

@@ -24,6 +24,7 @@ const STEPS = [
   { name: 'manifest:verify', script: 'manifest:verify' },
   { name: 'check', script: 'check' },
   { name: 'typecheck', script: 'typecheck' },
+  { name: 'contract', script: 'contract' },
   { name: 'test', script: 'test' },
   { name: 'test:e2e', script: 'test:e2e', browser: true },
 ];

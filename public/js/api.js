@@ -73,6 +73,35 @@ export function errorText(err, translate) {
   return translate('common.error.INTERNAL');
 }
 
+/**
+ * Startup failure reasons: the Agent SDK's startup_failure_reason, sent on ENGINE_UNAVAILABLE notices and in
+ * LiveInfo.error. Each has a sentence under cards.startup.<reason>. A newer runtime may add reasons; those are not
+ * listed here and get the generic refusal.
+ */
+export const STARTUP_FAILURE_REASONS = Object.freeze([
+  'bypass_root', 'cli_version_too_old', 'cwd_unavailable', 'gateway_access_denied', 'gateway_signin_required',
+  'managed_settings_invalid', 'org_config_refused', 'org_config_required_unavailable', 'org_pin_api_key_conflict',
+  'org_pin_mismatch', 'org_verify_failed', 'provider_not_allowed', 'proxy_invalid',
+  'remote_settings_required_unavailable', 'session_held_by_background', 'shell_tool_missing', 'temp_dir_unusable',
+  'worktree_resume_refused', 'worktree_unverified',
+]);
+
+/**
+ * Localized sentence for an engine that refused to start, from the runtime's startup_failure_reason. A listed reason
+ * gets its own sentence; any other reason gets the generic refusal with the runtime's first line. Returns null when
+ * there is no reason, or an unknown one with no first line to show, so the caller shows its own generic text.
+ * @param {unknown} reason
+ * @param {unknown} message the runtime's own first line
+ * @param {(key: string, vars?: Record<string, string | number>) => string} translate
+ * @returns {string | null}
+ */
+export function startupFailureText(reason, message, translate) {
+  if (typeof reason !== 'string' || reason === '') return null;
+  const detail = typeof message === 'string' ? message.trim() : '';
+  if (STARTUP_FAILURE_REASONS.includes(reason)) return translate(`cards.startup.${reason}`, { message: detail });
+  return detail ? translate('cards.startup.unknown', { message: detail }) : null;
+}
+
 /** RFC 4122 version-4 UUID; works in insecure contexts (plain HTTP on a LAN address) too. */
 export function createUuid() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();

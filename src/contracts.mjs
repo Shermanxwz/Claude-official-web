@@ -164,7 +164,8 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {number} pendingCount
  * @property {number} lastActivity
  * @property {string|null} claudeCodeVersion
- * @property {{code: string, message: string}|null} error
+ * @property {{code: string, message: string, reason?: string}|null} error   `reason` is the startup_failure_reason of a
+ *   startup failure Claude Code named (docs/PROTOCOL.md); absent otherwise
  * @property {boolean} trusted              project settings, hooks, skills and MCP servers of cwd are loaded
  * @property {boolean|null} fastMode        fast mode the gateway requested (flag settings layer);
  *   null = settings decide

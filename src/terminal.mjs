@@ -12,6 +12,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { WebSocket, WebSocketServer } from 'ws';
 import { AppError, isUuid } from './contracts.mjs';
+import { withRuntimeDefaults } from './engine/env.mjs';
 
 /** @typedef {import('./contracts.mjs').Config} Config */
 /** @typedef {import('./contracts.mjs').Logger} Logger */
@@ -92,7 +93,12 @@ export async function createTerminal({ config, log, engineHost, publish, ptyModu
   // Resolved once, here, so the path logged below is the path every session runs.
   const claudeBin = resolveClaudeBinary(config);
   if (claudeBin) log.info('terminal claude binary resolved', { path: claudeBin });
-  else log.warn('terminal claude binary not found');
+  else {
+    const reason = config.claudeBin
+      ? 'CAW_CLAUDE_BIN does not point at an executable file'
+      : 'the SDK package for this platform is not installed; run npm ci';
+    log.warn('terminal claude binary not found', { reason });
+  }
   const deps = { config, log, engineHost, publish, pty, claudeBin };
   let closing = false;
 
@@ -172,18 +178,18 @@ export async function createTerminal({ config, log, engineHost, publish, ptyModu
 }
 
 /**
- * Claude Code executable for terminal sessions, in the order the SDK uses for the engine, so both run the same binary:
- * `config.claudeBin` when set (never falling back to another binary), else the native binary the SDK ships for this
- * platform (the musl package first on musl hosts), else the first executable `claude` on PATH (absolute entries only).
+ * Claude Code executable for terminal sessions, the same one the engine runs: `config.claudeBin` when set (never
+ * falling back to another binary), else the native binary the SDK ships for this platform (the musl package first on
+ * musl hosts). A `claude` on PATH is never used, so the terminal cannot run a Claude Code version the gateway was not
+ * verified with; without a shipped binary the terminal is unavailable.
  * @param {Config} config
  * @param {{
- *   env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform, arch?: string, preferMusl?: boolean,
+ *   platform?: NodeJS.Platform, arch?: string, preferMusl?: boolean,
  *   bundled?: (pkg: string, binName: string) => string|null,
  * }} [options] `bundled` looks up a package's binary and defaults to this checkout's node_modules.
  * @returns {string|null}
  */
 export function resolveClaudeBinary(config, {
-  env = process.env,
   platform = process.platform,
   arch = process.arch,
   preferMusl = platform === 'linux' && isMuslHost(),
@@ -195,7 +201,7 @@ export function resolveClaudeBinary(config, {
     const shipped = bundled(pkg, binName);
     if (shipped) return shipped;
   }
-  return findOnPath(binName, env.PATH ?? env.Path ?? '');
+  return null;
 }
 
 /**
@@ -309,7 +315,10 @@ class TerminalConnection {
         : new AppError(400, 'BAD_REQUEST', 'cwd must be an existing directory inside a workspace root');
     }
     const bin = this.deps.claudeBin;
-    if (!bin) throw new AppError(503, 'ENGINE_UNAVAILABLE', 'The Claude Code executable was not found');
+    if (!bin) {
+      throw new AppError(503, 'ENGINE_UNAVAILABLE',
+        'Claude Code is not installed for this gateway. Run npm ci in its folder, or set CAW_CLAUDE_BIN.');
+    }
     if (target.kind === 'session') {
       this.releaseLock = await engineHost.lockForTerminal(target.sessionId);
       if (this.closing) return;
@@ -705,21 +714,6 @@ function isInsideRoot(real, root) {
 }
 
 /**
- * @param {string} binName
- * @param {string} pathValue
- * @returns {string|null}
- */
-function findOnPath(binName, pathValue) {
-  for (const dir of pathValue.split(path.delimiter)) {
-    // Relative entries would resolve against the working directory, so they are never searched.
-    if (dir === '' || !path.isAbsolute(dir)) continue;
-    const candidate = path.join(dir, binName);
-    if (isExecutableFile(candidate)) return candidate;
-  }
-  return null;
-}
-
-/**
  * Packages that ship the native binary, in lookup order. This mirrors the SDK's own choice (sdk.mjs), so the terminal
  * and the engine run the same file.
  * @param {string} platform
@@ -758,8 +752,7 @@ function isMuslHost() {
 function resolveSdkBinary(pkg, binName) {
   try {
     const file = requireFromHere.resolve(`${pkg}/${binName}`);
-    // Existence is enough, as in the SDK: a shipped binary that cannot start fails at spawn rather than silently
-    // running a different claude from PATH.
+    // Existence is enough, as in the SDK: a shipped binary that cannot start fails at spawn.
     return fs.statSync(file).isFile() ? file : null;
   } catch {
     return null;
@@ -781,7 +774,7 @@ function isExecutableFile(file) {
 
 /**
  * Child environment: the gateway environment without any CAW_* variable (the Web token and gateway settings never
- * reach Claude Code), with the terminal capabilities declared.
+ * reach Claude Code), with the runtime defaults of the engine (see engine/env.mjs) and the terminal capabilities.
  * @param {NodeJS.ProcessEnv} source
  * @returns {Record<string, string>}
  */
@@ -791,6 +784,7 @@ function buildChildEnv(source) {
   for (const [key, value] of Object.entries(source)) {
     if (typeof value === 'string' && !/^caw_/i.test(key)) env[key] = value;
   }
+  withRuntimeDefaults(env, source);
   env.TERM = PTY_NAME;
   env.COLORTERM = 'truecolor';
   return env;

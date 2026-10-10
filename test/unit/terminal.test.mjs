@@ -307,12 +307,12 @@ describe('Claude Code binary resolution', () => {
   /** A bundled lookup that finds only the listed packages, each at the given path. */
   const shippedIn = (paths) => (pkg) => paths[pkg] ?? null;
 
-  test('config.claudeBin wins over the shipped binary and PATH, and never falls back when not executable', async () => {
+  test('config.claudeBin wins over the shipped binary, and never falls back when not executable', async () => {
     const dir = await fsp.mkdtemp(path.join(fixture.base, 'config-'));
-    const onPath = await writeExecutable(dir, 'claude');
+    const configured = await writeExecutable(dir, 'configured-claude');
     const shipped = await writeExecutable(dir, 'shipped-claude');
-    const options = { ...linux, env: { PATH: dir }, bundled: shippedIn({ [GLIBC]: shipped }) };
-    assert.equal(resolveClaudeBinary({ claudeBin: onPath }, options), onPath);
+    const options = { ...linux, bundled: shippedIn({ [GLIBC]: shipped }) };
+    assert.equal(resolveClaudeBinary({ claudeBin: configured }, options), configured);
     assert.equal(
       resolveClaudeBinary({ claudeBin: fixture.file }, options),
       null,
@@ -321,21 +321,28 @@ describe('Claude Code binary resolution', () => {
     assert.equal(resolveClaudeBinary({ claudeBin: path.join(dir, 'absent') }, options), null);
   });
 
-  test('prefers the binary the SDK ships over a claude on PATH, as the engine does', async () => {
+  test('uses the binary the SDK ships, the same one the engine runs', async () => {
     const dir = await fsp.mkdtemp(path.join(fixture.base, 'order-'));
-    await writeExecutable(dir, 'claude');
     const shipped = await writeExecutable(dir, 'shipped-claude');
-    const options = { ...linux, env: { PATH: dir }, bundled: shippedIn({ [GLIBC]: shipped }) };
+    const options = { ...linux, bundled: shippedIn({ [GLIBC]: shipped }) };
     assert.equal(resolveClaudeBinary({ claudeBin: null }, options), shipped);
   });
 
-  test('the default lookup uses the SDK package installed in this checkout ahead of PATH', async () => {
-    const dir = await fsp.mkdtemp(path.join(fixture.base, 'default-'));
+  test('never runs a claude found on PATH, even when the SDK ships none', async () => {
+    const dir = await fsp.mkdtemp(path.join(fixture.base, 'path-'));
     await writeExecutable(dir, 'claude');
-    const resolved = resolveClaudeBinary(
-      { claudeBin: null },
-      { platform: 'linux', arch: 'x64', preferMusl: false, env: { PATH: dir } },
-    );
+    const savedPath = process.env.PATH;
+    process.env.PATH = dir;
+    try {
+      assert.equal(resolveClaudeBinary({ claudeBin: null }, { ...linux, bundled: () => null }), null);
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+    }
+  });
+
+  test('the default lookup finds the SDK package installed in this checkout', () => {
+    const resolved = resolveClaudeBinary({ claudeBin: null }, { platform: 'linux', arch: 'x64', preferMusl: false });
     assert.equal(resolved, require.resolve(`${GLIBC}/claude`));
   });
 
@@ -347,43 +354,18 @@ describe('Claude Code binary resolution', () => {
       calls.push(pkg);
       return pkg === MUSL ? muslFile : null;
     };
-    const env = { PATH: '' };
-    assert.equal(resolveClaudeBinary({ claudeBin: null }, { ...linux, env, bundled: onlyMusl }), muslFile);
+    assert.equal(resolveClaudeBinary({ claudeBin: null }, { ...linux, bundled: onlyMusl }), muslFile);
     assert.deepEqual(calls, [GLIBC, MUSL]);
     calls.length = 0;
-    const musl = { ...linux, preferMusl: true, env, bundled: onlyMusl };
+    const musl = { ...linux, preferMusl: true, bundled: onlyMusl };
     assert.equal(resolveClaudeBinary({ claudeBin: null }, musl), muslFile);
     assert.deepEqual(calls, [MUSL]);
     const both = (pkg) => (pkg === MUSL ? muslFile : glibcFile);
-    assert.equal(resolveClaudeBinary({ claudeBin: null }, { ...linux, env, bundled: both }), glibcFile);
+    assert.equal(resolveClaudeBinary({ claudeBin: null }, { ...linux, bundled: both }), glibcFile);
   });
 
-  test('uses the first executable claude on PATH when the SDK ships none, skipping non-executables', async () => {
-    const first = await fsp.mkdtemp(path.join(fixture.base, 'first-'));
-    const second = await fsp.mkdtemp(path.join(fixture.base, 'second-'));
-    await fsp.writeFile(path.join(first, 'claude'), '', { mode: 0o644 });
-    const expected = await writeExecutable(second, 'claude');
-    const env = { PATH: [first, second].join(path.delimiter) };
-    assert.equal(resolveClaudeBinary({ claudeBin: null }, { ...linux, env, bundled: () => null }), expected);
-  });
-
-  test('ignores relative PATH entries even when they point at an executable', async () => {
-    const dir = await fsp.mkdtemp(path.join(fixture.base, 'relative-'));
-    await writeExecutable(dir, 'claude');
-    const relative = path.relative(process.cwd(), dir);
-    assert.equal(path.isAbsolute(relative), false);
-    const options = { ...linux, env: { PATH: relative }, bundled: () => null };
-    assert.equal(resolveClaudeBinary({ claudeBin: null }, options), null);
-  });
-
-  test('falls back to the binary shipped with the SDK when PATH is empty', () => {
-    const resolved = resolveClaudeBinary({ claudeBin: null }, { ...linux, env: { PATH: '' } });
-    assert.equal(resolved, require.resolve(`${GLIBC}/claude`));
-  });
-
-  test('returns null when neither the SDK nor PATH provides a binary for the platform', () => {
-    const options = { platform: 'plan9', arch: 'x64', env: { PATH: '' } };
-    assert.equal(resolveClaudeBinary({ claudeBin: null }, options), null);
+  test('returns null when the SDK ships no binary for the platform', () => {
+    assert.equal(resolveClaudeBinary({ claudeBin: null }, { platform: 'plan9', arch: 'x64' }), null);
   });
 
   test('looks for claude.exe on Windows and asks the SDK for the win32 package', async () => {
@@ -392,9 +374,9 @@ describe('Claude Code binary resolution', () => {
     const asked = [];
     const lookup = (pkg, binName) => {
       asked.push([pkg, binName]);
-      return null;
+      return exe;
     };
-    const options = { platform: 'win32', arch: 'x64', env: { PATH: dir }, bundled: lookup };
+    const options = { platform: 'win32', arch: 'x64', bundled: lookup };
     assert.equal(resolveClaudeBinary({ claudeBin: null }, options), exe);
     assert.deepEqual(asked, [['@anthropic-ai/claude-agent-sdk-win32-x64', 'claude.exe']]);
   });
@@ -405,7 +387,7 @@ describe('Claude Code binary resolution', () => {
       asked.push([pkg, binName]);
       return null;
     };
-    const options = { platform: 'android', arch: 'arm64', env: { PATH: '' }, bundled: lookup };
+    const options = { platform: 'android', arch: 'arm64', bundled: lookup };
     assert.equal(resolveClaudeBinary({ claudeBin: null }, options), null);
     assert.deepEqual(asked, [['@anthropic-ai/claude-agent-sdk-linux-arm64-android', 'claude']]);
   });
@@ -431,6 +413,24 @@ describe('spawn environment and command line', () => {
         assert.equal(h.procs[0].options.name, 'xterm-256color');
         assert.equal(h.procs[0].options.cols, 100);
         assert.equal(h.procs[0].options.rows, 30);
+      });
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      Object.assign(process.env, saved);
+    }
+  });
+
+  test('gives the terminal the runtime defaults of the engine unless the host sets them', async () => {
+    const saved = { ...process.env };
+    delete process.env.DISABLE_AUTOUPDATER;
+    process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS = '';
+    try {
+      await withHarness({}, async (h) => {
+        await connectOpen(h, `?cwd=${enc(fixture.project)}`);
+        await waitUntil(() => h.procs.length === 1, 'spawn');
+        const env = h.procs[0].options.env;
+        assert.equal(env.DISABLE_AUTOUPDATER, '1');
+        assert.equal(env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS, '', 'an operator opt-out is passed through');
       });
     } finally {
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
@@ -705,6 +705,7 @@ describe('logging and publication', () => {
     await withHarness({ config: { claudeBin: missing } }, async (h) => {
       const warnings = h.log.entries.filter((entry) => entry.msg === 'terminal claude binary not found');
       assert.deepEqual(warnings.map((entry) => entry.level), ['warn']);
+      assert.match(warnings[0].fields.reason, /CAW_CLAUDE_BIN/);
       assert.equal(h.log.entries.some((entry) => entry.msg === 'terminal claude binary resolved'), false);
     });
   });

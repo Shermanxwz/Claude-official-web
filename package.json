@@ -1,6 +1,6 @@
 {
   "name": "claude-official-web",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Self-hosted graphical Web host for the official Claude Agent SDK and Claude Code runtime",
   "private": true,
   "type": "module",
@@ -17,6 +17,7 @@
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.mjs",
     "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.mjs",
     "typecheck": "tsc -p jsconfig.json",
+    "contract": "node scripts/runtime-contract.mjs",
     "check": "node scripts/check.mjs",
     "manifest": "node scripts/source-manifest.mjs",
     "manifest:verify": "node scripts/source-manifest.mjs --verify",
@@ -24,7 +25,8 @@
     "smoke:runtime": "node scripts/runtime-smoke.mjs",
     "smoke:gateway": "node scripts/gateway-smoke.mjs",
     "screenshots": "node scripts/screenshots.mjs",
-    "maintenance:prune": "node scripts/prune-state.mjs"
+    "maintenance:prune": "node scripts/prune-state.mjs",
+    "upgrade:runtime": "node scripts/upgrade-runtime.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.295",

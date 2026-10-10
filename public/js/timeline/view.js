@@ -3,7 +3,7 @@
  * Everything inside the conversation area belongs here; the shell owns the header, sidebar, composer and dialogs.
  */
 import { h, clear, icon } from '../dom.js';
-import { errorText } from '../api.js';
+import { errorText, startupFailureText } from '../api.js';
 import { createModel, replayedEvents } from './model.js';
 import { renderTool } from './tools/index.js';
 import { describeActivity, toolTarget } from './tools/summaries.js';
@@ -349,7 +349,9 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
         // An engine that cannot run shows inline in the session's timeline too, not only as the shell's toast.
         if (data.code !== 'ENGINE_UNAVAILABLE') return;
         if (eventSession !== null && eventSession !== state.sessionId) return;
-        state.model.applyNotice({ code: 'ENGINE_UNAVAILABLE', level: 'error', text: '' });
+        state.model.applyNotice({
+          code: 'ENGINE_UNAVAILABLE', level: 'error', text: String(data.message ?? ''), reason: data.reason,
+        });
         break;
       }
       case 'session_state': {
@@ -1242,7 +1244,7 @@ function noticeText(ui, entry) {
       return t(pluralKey('cards.notice.memory', count, getLocale()), { count });
     }
     case 'ENGINE_UNAVAILABLE':
-      return t('common.error.ENGINE_UNAVAILABLE');
+      return startupFailureText(vars.reason, entry.text, t) ?? t('common.error.ENGINE_UNAVAILABLE');
     case 'assistant-error':
       return t('cards.notice.assistantError', { error: String(vars.error ?? '') });
     case 'compact-failed':

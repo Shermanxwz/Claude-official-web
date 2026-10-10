@@ -30,6 +30,7 @@ PLAIN_TOKEN=0
 ROTATE_TOKEN=0
 UNINSTALL=0
 PURGE=0
+KEEP_CLAUDE_RETENTION=0
 NODE_BIN=""
 NODE_BIN_DIR=""
 TOKEN_STATE=""
@@ -68,6 +69,8 @@ Options:
   --rotate-token  issue a new login token and restart the service. Every browser must sign in again.
   --uninstall     stop, disable and remove the unit. The configuration file and its token are kept.
   --purge         with --uninstall, also remove the configuration file and its token
+  --keep-claude-retention  leave the Claude Code settings alone. By default the installer sets cleanupPeriodDays to
+                           3650 when the settings file does not set it, so conversations are not deleted after 30 days.
 
 A newly issued token is printed once. Save it immediately: the default configuration stores only its hash.
 
@@ -312,6 +315,20 @@ configure() {
   esac
 }
 
+# Sets cleanupPeriodDays in the Claude Code settings, so that conversations are kept for about ten years instead of
+# being deleted after 30 days. deploy/retention.mjs keeps any value the file already sets, and leaves a file it cannot
+# change safely alone and prints the manual step. Never fails the install.
+configure_retention() {
+  local settings
+  if [[ "$KEEP_CLAUDE_RETENTION" -eq 1 ]]; then
+    say "Conversation retention: left unchanged (--keep-claude-retention)."
+    return 0
+  fi
+  settings="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/settings.json"
+  "$NODE_BIN" "${ROOT}/deploy/retention.mjs" "$settings" \
+    || warn "conversation retention was not configured; see the message above"
+}
+
 install_dependencies() {
   say "Installing production dependencies in ${ROOT} (npm ci --omit=dev) ..."
   (cd "$ROOT" && npm ci --omit=dev)
@@ -447,15 +464,21 @@ check_claude_code() {
   say "The gateway never reads or copies credentials; the login belongs to Claude Code."
 }
 
+# Lingering keeps the service running after the user logs out and starts it at boot. Enables it when the system
+# lets this user do so, else prints the command to run with sudo. Never fails the install.
 check_linger() {
   local linger
   linger="$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null || true)"
-  if [[ "$linger" != "yes" ]]; then
-    say ""
-    say "The service stops when this user logs out unless lingering is enabled. Run once:"
-    say "  loginctl enable-linger $(id -un)"
-    say "(as root if your system asks for authorization)"
+  if [[ "$linger" == "yes" ]]; then
+    return 0
   fi
+  say ""
+  if loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
+    say "Lingering is now enabled for $(id -un): the service keeps running after logout and starts at boot."
+    return 0
+  fi
+  say "The service stops when this user logs out unless lingering is enabled. Run once:"
+  say "  sudo loginctl enable-linger $(id -un)"
 }
 
 # Prints a newly issued token once, with instructions to store it.
@@ -540,6 +563,7 @@ while (($# > 0)); do
     --rotate-token) ROTATE_TOKEN=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
+    --keep-claude-retention) KEEP_CLAUDE_RETENTION=1 ;;
     -h | --help)
       usage
       exit 0
@@ -550,8 +574,9 @@ while (($# > 0)); do
 done
 
 if [[ "$PURGE" -eq 1 && "$UNINSTALL" -eq 0 ]]; then die "--purge requires --uninstall"; fi
-if [[ "$UNINSTALL" -eq 1 && ("$SHOW_TOKEN" -eq 1 || "$PLAIN_TOKEN" -eq 1 || "$ROTATE_TOKEN" -eq 1) ]]; then
-  die "--show-token, --plain-token and --rotate-token apply only to an installation"
+if [[ "$UNINSTALL" -eq 1 && ("$SHOW_TOKEN" -eq 1 || "$PLAIN_TOKEN" -eq 1 || "$ROTATE_TOKEN" -eq 1 \
+  || "$KEEP_CLAUDE_RETENTION" -eq 1) ]]; then
+  die "--show-token, --plain-token, --rotate-token and --keep-claude-retention apply only to an installation"
 fi
 if [[ "$(uname -s)" != "Linux" ]]; then
   die "this installer manages systemd user services and runs only on Linux. Elsewhere, run npm start (see docs/DEPLOYMENT.md)."
@@ -588,6 +613,7 @@ validate_overrides
 validate_existing_config
 install_dependencies
 configure
+configure_retention
 install_unit
 start_service
 probe_address

@@ -76,6 +76,8 @@ connectEvents({ watch, after, onEvent(type, data), onStatus(status /* 'connectin
 `401 UNAUTHENTICATED` anywhere → `store.set({auth: {authenticated:false}})` (shows login). SSE reconnect uses
 exponential backoff 1 s → 30 s, resets on `hello`. On `resync` or bootId change the app reloads the snapshot of the
 current session and the session list.
+Startup failures: `startupFailureText` picks `cards.startup.<reason>` for a listed `startup_failure_reason` (the
+timeline notice, header tooltip and shell toast use it); other reasons show `cards.startup.unknown`.
 
 ## Store (`public/js/store.js`)
 

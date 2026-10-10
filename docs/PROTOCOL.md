@@ -173,7 +173,7 @@ type LiveInfo = { sessionId: string, cwd: string, state: LiveState, model: strin
   fallbackModel: string|null,              // fallback model the query was started with (`--fallback-model`)
   browserTools: boolean,                   // the operator's browser MCP server is attached (see Browser tools)
   lockedBy: 'terminal'|null, pendingCount: number, lastActivity: number,
-  claudeCodeVersion: string|null, error: { code: string, message: string } | null, trusted: boolean,
+  claudeCodeVersion: string|null, error: { code: string, message: string, reason?: string } | null, trusted: boolean,
   fastMode: boolean|null,                  // fast mode the gateway requested for this session; null = follow settings
   fastModeState: 'off'|'on'|'cooldown'|null,     // what the runtime last reported (init or result); null = unknown
   fastModeDisabledReason: string|null,     // FastModeDisabledReason from the same report; null when nothing blocks it
@@ -316,6 +316,17 @@ type ContextMeter = {
   are not counted) and drops to 0 when the query ends. The idle sweep never closes a session whose count is above 0,
   and making room for a new live session only evicts idle sessions without pending requests and without background
   tasks (otherwise `429 TOO_MANY_SESSIONS`), so background work is never killed by housekeeping.
+- Runtime environment: every query and every terminal start with `DISABLE_AUTOUPDATER=1` and
+  `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1`, unless the host environment already sets the name (an empty value counts as
+  set). The first stops the runtime from updating itself away from the SDK the gateway is verified with; the second
+  makes a startup failure end with a `result` that names it (next bullet). The defaults are `RUNTIME_DEFAULTS` in
+  `src/engine/env.mjs`.
+- Startup failures: when Claude Code cannot start, its `result` carries `startup_failure_reason`, one of the SDK's
+  `SDKStartupFailureReason` values (for example `gateway_signin_required` or `bypass_root`). The gateway then sets
+  `LiveInfo.error` to `{code: 'ENGINE_UNAVAILABLE', message, reason}`, where `message` is the first line of the result's
+  first error text (`Claude Code could not start.` when there is none), and publishes one `error` notice with the same
+  code, message and `reason`. Later startup results of the same query add no notice. The gateway passes `reason` through
+  unchanged, so a client shows `message` for a value it does not know.
 
 ### `GET /api/sessions?cwd=<abs>&limit=100&offset=0`
 → `{ sessions: SessionSummary[] }` sorted by `lastModified` desc (`limit` 1–500, `offset` 0–1000000). Without `cwd`: all
@@ -449,7 +460,9 @@ uses `LiveInfo.context` instead. `full` counts each category, the conversation i
 the terminal's `/context` does (the context panel asks for it; its timeout is 30 s). Control calls to the runtime time
 out after 10 s unless stated otherwise (`502 ENGINE_ERROR`; capabilities fall back to `stale: true`).
 When the runtime reports rejected credentials (`system/api_retry` or an assistant `error` of an authentication class)
-the gateway publishes a `notice` with code `ENGINE_UNAVAILABLE` and sets `LiveInfo.error`.
+the gateway publishes a `notice` with code `ENGINE_UNAVAILABLE` and sets `LiveInfo.error`; the message asks the person
+to sign in again. A startup failure that Claude Code names is published the same way, with its `reason` (see the
+startup failures bullet under How live queries are started and kept).
 
 ### `GET /api/sessions/:id/capabilities`
 ```ts
@@ -759,7 +772,7 @@ Global events are delivered to every client; `sdk` events only for the watched s
 | `message_cancelled` | `{ sessionId, clientMessageId }` | global — a queued message the runtime dropped |
 | `account_changed` | `{ account: AccountInfo|null }` | global — after a sign-in through the GUI |
 | `unattended_changed` | `UnattendedState` | global — the unattended switch changed (see Unattended mode) |
-| `notice` | `{ sessionId?, level: 'info'|'warning'|'error', code, message }` | global |
+| `notice` | `{ sessionId?, level: 'info'|'warning'|'error', code, message, reason? }` | global |
 | `terminal_state` | `{ sessionId, attached: boolean }` | global |
 
 Per-client queues are bounded (1 MiB); a client that falls behind is disconnected and must reconnect (it then gets
@@ -778,3 +791,8 @@ A refused connection gets one `error` frame and is then closed. At most four ter
 A setup failure sends its own code, such as `PATH_NOT_ALLOWED` (a session folder outside the roots), `SESSION_LOCKED`
 or `ENGINE_UNAVAILABLE` (no Claude Code executable); the close code is 1011 for a 5xx code and 1008 otherwise.
 Anything unexpected is `INTERNAL` (close 1011).
+
+The terminal runs the Claude Code executable that the SDK bundles for this platform, and never a `claude` found on PATH.
+When `CAW_CLAUDE_BIN` is set (an absolute path to an existing file, checked at startup), it runs that file and nothing
+else: if the file is not executable the terminal is unavailable. It gets the same runtime environment defaults as the
+engine (see How live queries are started and kept).

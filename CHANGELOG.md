@@ -3,6 +3,41 @@
 All notable changes to this project are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning.
 
+## [1.5.0] - 2026-10-10
+
+Long-term operation: an install stays on the runtime it was checked with, says what to do when something outside it
+changes, and upgrades with one checked command.
+
+### Added
+
+- Structured startup failures. Claude Code's `startup_failure_reason` (declared by the SDK) is passed through as
+  `LiveInfo.error.reason` and on the `ENGINE_UNAVAILABLE` notice, and the interface says what happened and how to fix
+  it, in English and Chinese: a runtime older than Anthropic now accepts (`npm run upgrade:runtime`), an expired or
+  revoked sign-in (Settings → Account), organization settings, a moved project folder and the other declared reasons.
+  The gateway sets `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1`, so every known startup failure arrives this way.
+- `npm run contract` checks the runtime surface the gateway relies on (106 entries: the declared methods and options
+  in `sdk.d.ts`, the undeclared ones in `sdk.mjs` and in the bundled executable, CLI flags, stream messages and the
+  refusal dialog payload) and the executable's checksum. It runs in the seal and in CI; `--candidate` checks an SDK
+  installed without saving it.
+- `npm run upgrade:runtime [-- <version>]`: one checked SDK upgrade (exact pin, source manifest, contract, seal), with
+  the rollback commands when a step fails, and `--dry-run`.
+- CI: the seal on Node.js 22 and 24, the runtime contract, manual runs, and a weekly canary that runs the contract, the
+  type check and the tests against the newest SDK without changing the pin. GitHub emails the owner when it fails.
+- Installer: sets Claude Code's `cleanupPeriodDays` to 3650 when the user settings do not set it (Claude Code otherwise
+  deletes conversations not used for 30 days); `--keep-claude-retention` leaves the file alone. Lingering is enabled by
+  the installer when the system allows it.
+- `docs/DEPLOYMENT.md` "Long-term operation": what runs by itself, what eventually needs a person, and the upgrade.
+
+### Changed
+
+- The runtime never updates itself: the gateway sets `DISABLE_AUTOUPDATER=1` for Claude Code unless the host sets it.
+- The terminal runs only the SDK's bundled Claude Code (or `CAW_CLAUDE_BIN`), never a `claude` found on PATH, so it
+  always runs the same version as the gateway.
+- systemd: no start limit and 5 s between restarts, so the service always comes back after a crash; a configuration
+  error still stops it.
+- The rejected-credentials message points to Settings → Account.
+- At startup the gateway logs an error for each browser library file it cannot find.
+
 ## [1.4.0] - 2026-10-10
 
 Live context length, Claude Code's own automatic compaction and a live compaction animation, all from the official SDK

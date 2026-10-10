@@ -1,4 +1,4 @@
-import { errorText } from '../api.js';
+import { errorText, startupFailureText } from '../api.js';
 import { getLocale } from '../i18n.js';
 import { clear, h, icon } from '../dom.js';
 import { effortLevelsFor, effortModelFor, fastModeView, modelSelectPlan } from './composer-logic.js';
@@ -291,7 +291,8 @@ export function createHeader({ container, api, store, t, actions }) {
       badge.dataset.state = badgeKey;
       badgeText.textContent = t(`header.state.${badgeKey}`);
       spinner.hidden = badgeKey !== 'running';
-      if (live?.error?.message) badge.title = live.error.message;
+      const failure = startupFailureText(live?.error?.reason, live?.error?.message, t) ?? live?.error?.message;
+      if (failure) badge.title = failure;
       else badge.removeAttribute('title');
     }
 

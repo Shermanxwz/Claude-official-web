@@ -14,6 +14,7 @@ import { createAuth } from './auth.mjs';
 import { ConfigError, loadConfig } from './config.mjs';
 import { EventHub } from './events.mjs';
 import { engineEnv } from './engine/env.mjs';
+import { checkVendorFiles } from './http.mjs';
 import { createLogger } from './log.mjs';
 import { isLoopbackHost } from './security.mjs';
 
@@ -91,6 +92,8 @@ export async function startServer({ env = process.env, engine, listenHost, liste
   const config = loadConfig(env);
   await fs.promises.mkdir(config.stateDir, { recursive: true, mode: 0o700 });
   const log = createLogger({ level: config.logLevel });
+  // A missing vendored library would otherwise show up only as a page that does not load; the gateway still starts.
+  checkVendorFiles(log);
   const bootId = crypto.randomUUID();
   const events = new EventHub({ bootId, version: config.version, log });
   const publish = (/** @type {import('./contracts.mjs').GatewayEvent} */ event) => events.publish(event);

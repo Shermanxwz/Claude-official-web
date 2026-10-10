@@ -9,7 +9,8 @@ import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { AppError } from '../../src/contracts.mjs';
 import {
-  BODY_IDLE_TIMEOUT_MS, createRouter, parseUrl, readJson, sendError, sendJson, serveStatic, withBodyIdleLimit,
+  BODY_IDLE_TIMEOUT_MS, checkVendorFiles, createRouter, parseUrl, readJson, sendError, sendJson, serveStatic,
+  withBodyIdleLimit,
 } from '../../src/http.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -645,5 +646,54 @@ describe('serveStatic', () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+describe('checkVendorFiles', () => {
+  /**
+   * @returns {{
+   *   entries: Array<{msg: string, fields: Record<string, unknown>}>,
+   *   error: (msg: string, fields: Record<string, unknown>) => void,
+   * }}
+   */
+  function recordingLog() {
+    /** @type {Array<{msg: string, fields: Record<string, unknown>}>} */
+    const entries = [];
+    return { entries, error: (msg, fields) => entries.push({ msg, fields }) };
+  }
+
+  it('logs nothing when every vendored library is installed', () => {
+    const recorder = recordingLog();
+    assert.deepEqual(checkVendorFiles(recorder), []);
+    assert.deepEqual(recorder.entries, []);
+  });
+
+  it('logs one error per missing file and returns the URLs that cannot be served', () => {
+    const recorder = recordingLog();
+    const missing = checkVendorFiles(recorder, { exists: (file) => !file.includes('xterm') });
+    assert.deepEqual(missing, ['/vendor/xterm/xterm.mjs', '/vendor/xterm/xterm.css', '/vendor/xterm/addon-fit.mjs']);
+    assert.deepEqual(recorder.entries.map((entry) => entry.fields.url), missing);
+    assert.ok(recorder.entries.every((entry) => entry.msg.startsWith('vendored browser library is missing')));
+    assert.deepEqual(recorder.entries[0].fields, {
+      url: '/vendor/xterm/xterm.mjs', package: '@xterm/xterm', file: 'lib/xterm.mjs',
+    });
+  });
+
+  it('counts a package that cannot be located as missing, and checks the file inside the located root', () => {
+    const recorder = recordingLog();
+    const probed = [];
+    const missing = checkVendorFiles(recorder, {
+      rootOf: (name) => {
+        if (name === 'marked') throw new Error('Cannot locate the installed package marked');
+        return `/roots/${name}`;
+      },
+      exists: (file) => {
+        probed.push(file);
+        return true;
+      },
+    });
+    assert.deepEqual(missing, ['/vendor/marked.esm.js']);
+    assert.equal(recorder.entries.length, 1);
+    assert.equal(probed.includes('/roots/dompurify/dist/purify.es.mjs'), true);
   });
 });

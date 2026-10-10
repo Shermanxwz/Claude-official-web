@@ -1025,6 +1025,29 @@ test('an ENGINE_UNAVAILABLE notice adds one inline error notice, once, and a rep
   assert.deepEqual(kinds(model), ['user', 'user', 'notice'], 'the notice survives a replay of the older page');
 });
 
+test('an ENGINE_UNAVAILABLE notice keeps its startup reason and first line, through a replay too', () => {
+  const model = createModel();
+  model.loadTranscript([tx('user', 101, { role: 'user', content: 'hello' })]);
+  const notice = {
+    code: 'ENGINE_UNAVAILABLE', level: 'error', text: 'claude: version 2.0.1 too old', reason: 'cli_version_too_old',
+  };
+  model.applyNotice(notice);
+  model.applyNotice(notice);
+  let notices = find(model, 'notice');
+  assert.equal(notices.length, 1, 'the same notice right after itself is not repeated');
+  assert.equal(notices[0].vars.reason, 'cli_version_too_old');
+  assert.equal(notices[0].text, 'claude: version 2.0.1 too old');
+
+  model.applyNotice({ ...notice, reason: 'bypass_root' });
+  assert.deepEqual(find(model, 'notice').map((entry) => entry.vars.reason), ['cli_version_too_old', 'bypass_root'],
+    'a notice with another reason is not a repeat');
+
+  model.prependTranscript([tx('user', 100, { role: 'user', content: 'older' })]);
+  notices = find(model, 'notice');
+  assert.deepEqual(notices.map((entry) => entry.vars.reason), ['cli_version_too_old', 'bypass_root'],
+    'the reasons survive a replay of the older page');
+});
+
 test('an inline notice with no open turn starts one, and a notice after a finished turn joins the next one', () => {
   const model = createModel();
   model.applyNotice({ code: 'ENGINE_UNAVAILABLE', level: 'error', text: '' });
