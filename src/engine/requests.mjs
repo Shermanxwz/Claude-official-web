@@ -5,7 +5,7 @@
  * aborts the request, or the session closes. Bodies are validated per kind (docs/PROTOCOL.md) before they settle.
  */
 
-import { AppError, DIALOG_KINDS, REFUSAL_DIALOG_RESULTS } from '../contracts.mjs';
+import { AppError, DIALOG_KINDS, REFUSAL_DIALOG_RESULTS, UNATTENDED_QUESTION_MESSAGE } from '../contracts.mjs';
 
 /** @typedef {import('../contracts.mjs').PendingRequest} PendingRequest */
 /** @typedef {import('../contracts.mjs').RefusalFallbackDialog} RefusalFallbackDialog */
@@ -15,7 +15,8 @@ import { AppError, DIALOG_KINDS, REFUSAL_DIALOG_RESULTS } from '../contracts.mjs
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').PermissionUpdate[]} PermissionUpdateList */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').ElicitationResult} ElicitationResult */
 /** @typedef {Record<string, any>} RequestBody  a validated, normalized body for one request kind */
-/** @typedef {{cancelled: true} | {body: RequestBody}} RequestOutcome */
+/** @typedef {{cancelled: true} | {body: RequestBody, auto?: true}} RequestOutcome
+ *   `auto` marks an answer the gateway gave itself in unattended mode (docs/PROTOCOL.md "Unattended mode") */
 /** @typedef {'allowed'|'denied'|'answered'|'cancelled'} ResolutionOutcome */
 
 const MESSAGE_MAX = 2000;
@@ -26,6 +27,8 @@ const QUESTION_DECLINED_MESSAGE = 'The user declined to answer.';
 const PLAN_REJECTED_MESSAGE = 'The user rejected the plan. Revise it.';
 const PERMISSION_KEYS = ['decision', 'message', 'updatedInput', 'suggestionIndexes', 'interrupt'];
 const PLAN_NEXT_MODES = ['default', 'acceptEdits', 'auto'];
+/** A plan approval may also name bypassPermissions, but only on a gateway that allows bypass mode. */
+const PLAN_NEXT_MODES_BYPASS = [...PLAN_NEXT_MODES, 'bypassPermissions'];
 
 /**
  * @typedef {Object} RegistryEntry
@@ -201,9 +204,10 @@ function normalizeQuestion(body) {
 
 /**
  * @param {Record<string, unknown>} body
+ * @param {boolean} allowBypass whether this server offers the bypassPermissions mode at all
  * @returns {{body: RequestBody, outcome: ResolutionOutcome}}
  */
-function normalizePlan(body) {
+function normalizePlan(body, allowBypass) {
   assertKeys(body, ['decision', 'message', 'nextMode']);
   const decision = body.decision;
   if (decision !== 'approve' && decision !== 'reject') throw badRequest('decision must be "approve" or "reject".');
@@ -212,8 +216,9 @@ function normalizePlan(body) {
   const message = optionalString(body, 'message', TEXT_MAX);
   if (message !== undefined) normalized.message = message;
   if (body.nextMode !== undefined) {
-    if (!PLAN_NEXT_MODES.includes(/** @type {string} */ (body.nextMode))) {
-      throw badRequest('nextMode must be "default", "acceptEdits" or "auto".');
+    const modes = allowBypass ? PLAN_NEXT_MODES_BYPASS : PLAN_NEXT_MODES;
+    if (!modes.includes(/** @type {string} */ (body.nextMode))) {
+      throw badRequest(`nextMode must be ${modes.map((mode) => `"${mode}"`).join(', ')}.`);
     }
     normalized.nextMode = body.nextMode;
   }
@@ -279,7 +284,7 @@ function normalizeRequestBody(request, body, allowBypass) {
     case 'question':
       return normalizeQuestion(body);
     case 'plan':
-      return normalizePlan(body);
+      return normalizePlan(body, allowBypass);
     case 'elicitation':
       return normalizeElicitation(body);
     case 'dialog':
@@ -370,6 +375,22 @@ export class RequestRegistry {
   }
 
   /**
+   * Answers a pending request with the gateway's own answer (automaticAnswerOf). The answer goes through the same
+   * validation as a person's answer and is published as resolved with `auto: true`. A request that is no longer
+   * pending is left alone.
+   * @param {string} sessionId
+   * @param {string} id
+   * @returns {void}
+   */
+  answerAutomatically(sessionId, id) {
+    const entry = this.#sessions.get(sessionId)?.get(id);
+    if (!entry) return;
+    const answer = automaticAnswerOf(entry.request);
+    const { body, outcome } = normalizeRequestBody(entry.request, answer, this.#allowBypass);
+    this.#settle(sessionId, id, { body, auto: true }, outcome);
+  }
+
+  /**
    * @param {string} sessionId
    * @returns {PendingRequest[]} pending requests of the session, oldest first
    */
@@ -427,7 +448,12 @@ export class RequestRegistry {
     if (bySession.size === 0) this.#sessions.delete(sessionId);
     entry.detach();
     entry.resolve(result);
-    this.#publish({ type: 'request_resolved', sessionId, data: { sessionId, requestId: id, outcome } });
+    const auto = 'body' in result && result.auto === true;
+    this.#publish({
+      type: 'request_resolved',
+      sessionId,
+      data: { sessionId, requestId: id, outcome, ...(auto ? { auto: true } : {}) },
+    });
   }
 }
 
@@ -480,14 +506,39 @@ function permissionResult(request, body) {
 }
 
 /**
+ * The gateway's answer to a question it could not put to a person is a deny that tells the model to choose for itself.
  * @param {PendingRequest} request
  * @param {RequestBody} body
+ * @param {boolean} auto the gateway answered (unattended mode)
  * @returns {PermissionResult}
  */
-function questionResult(request, body) {
-  if (body.decline === true) return deny(QUESTION_DECLINED_MESSAGE);
+function questionResult(request, body, auto) {
+  if (body.decline === true) return deny(auto ? UNATTENDED_QUESTION_MESSAGE : QUESTION_DECLINED_MESSAGE);
   const response = body.response ? { response: body.response } : {};
   return { behavior: 'allow', updatedInput: { ...request.input, answers: body.answers, ...response } };
+}
+
+/**
+ * The answer the gateway gives a request itself while unattended mode is on (docs/PROTOCOL.md "Unattended mode"): one a
+ * person could give. It is validated like any answer before it settles.
+ * @param {PendingRequest} request
+ * @returns {Record<string, unknown>}
+ */
+export function automaticAnswerOf(request) {
+  switch (request.kind) {
+    case 'permission':
+      return { decision: 'allow' };
+    case 'question':
+      return { decline: true };
+    case 'plan':
+      return { decision: 'approve', nextMode: 'bypassPermissions' };
+    case 'elicitation':
+      return { action: 'decline' };
+    case 'dialog':
+      return { result: 'cancelled' };
+    default:
+      throw new TypeError(`Unknown request kind: ${String(request.kind)}`);
+  }
 }
 
 /**
@@ -504,7 +555,7 @@ export function toPermissionResult(request, outcome) {
     case 'permission':
       return permissionResult(request, body);
     case 'question':
-      return questionResult(request, body);
+      return questionResult(request, body, outcome.auto === true);
     case 'plan':
       return body.decision === 'approve'
         ? { behavior: 'allow', updatedInput: request.input ?? {} }

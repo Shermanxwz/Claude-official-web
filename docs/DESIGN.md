@@ -100,7 +100,9 @@ Never use Anthropic's or Claude Code's brand colors.
   Right side: session controls as pills — model, permission mode, effort (native selects styled as 32 px pills with a
   chevron, `appearance: none`), the Fast toggle, the agent chip when set, a context ring (18 px circle showing the
   percentage; the exact number in its tooltip), the state badge (`Working` accent, `Needs you` attention, `Idle`
-  muted), overflow menu.
+  muted), overflow menu. While unattended mode is on, an attention-toned "Unattended" pill sits before the state badge
+  (32 px; icon only below 768 px; 44 px on touch screens), the permission select is disabled with the reason in its
+  tooltip, and the composer's mode label reads "Unattended — no approvals".
 - **Messages.** The user's message: right-aligned, `--bg-sunken`, radius 14 px, `--fs-prose`, at most 80 % wide.
   Claude's prose: no container, `--fs-prose`. Turn footer: a muted sentence such as "Done in 0.9 s, 3 turns" with a
   check, or "Interrupted", or the error in `--danger` — no middle-dot meta strings.
@@ -133,6 +135,9 @@ Never use Anthropic's or Claude Code's brand colors.
   radius 14 px, footer actions right-aligned (primary last). Opening focuses the first enabled control of the body,
   else the primary action; a pending action's button gets focus back when it settles; closing returns focus to the
   control that opened it.
+- **Requests answered automatically.** A request counts as waiting only after 300 ms unanswered. One that unattended
+  mode answers sooner leaves a single muted line in the action log ("Allowed automatically (unattended)"), with no
+  card, buttons, badge, count or notification.
 - **Toasts.** Under the header and any banners, right-aligned on desktop, full width inside the 16 px gutter on
   phones; never over the composer, the docked request card or header controls.
 - **Message actions.** Copy, edit and rewind show on hover, or after a tap on touch screens (a second tap hides them).

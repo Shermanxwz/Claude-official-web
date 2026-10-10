@@ -6,6 +6,7 @@ import {
   promptHistory, runtimeHasCommand, stepHistory,
 } from './composer-logic.js';
 import { createRunningLine, createTodoBar } from './activity.js';
+import { modeCycleAllowed } from '../unattended.js';
 import { createSideQuestion } from './side-question.js';
 import { hasOpenDialog } from './dialog.js';
 import { openMenu } from './menu.js';
@@ -362,7 +363,7 @@ export function createComposer({ container, api, store, t, actions }) {
 
     input.disabled = Boolean(reason);
     attachBtn.disabled = Boolean(reason) || meta.features?.uploads === false;
-    modeBtn.disabled = Boolean(reason);
+    modeBtn.disabled = Boolean(reason) || !modeCycleAllowed(s.unattended);
     sendBtn.disabled = !canSend;
     stopGroup.hidden = !busy || readOnly;
     stopBtn.hidden = !busy || readOnly;
@@ -387,13 +388,16 @@ export function createComposer({ container, api, store, t, actions }) {
 
   /** The footer's mode line: the mode in words, or the flash line for two seconds after Shift+Tab. */
   function paintMode() {
-    const live = view.id ? store.get().live?.[view.id] : null;
+    const s = store.get();
+    const live = view.id ? s.live?.[view.id] : null;
     const mode = live?.permissionMode ?? null;
-    const word = flashText ?? t(modeWordKey(mode));
+    // While unattended mode is on, the footer names that instead of the session's mode.
+    const options = { unattended: !modeCycleAllowed(s.unattended) };
+    const word = flashText ?? t(modeWordKey(mode, options));
     if (modeText.textContent !== word) modeText.textContent = word;
-    const short = flashText ?? t(modeShortKey(mode));
+    const short = flashText ?? t(modeShortKey(mode, options));
     if (modeShort.textContent !== short) modeShort.textContent = short;
-    const tooltip = `${t('composer.mode.title')}: ${t(modeWordKey(mode))}`;
+    const tooltip = `${t('composer.mode.title')}: ${t(modeWordKey(mode, options))}`;
     if (modeBtn.title !== tooltip) modeBtn.title = tooltip;
     footerEl.classList.toggle('is-flash', flashText !== null);
   }
@@ -440,7 +444,7 @@ export function createComposer({ container, api, store, t, actions }) {
 
   /** Shift+Tab: the shell moves to the next permission mode and says which one it is now. */
   function cycleMode() {
-    if (!view.id || disabledReason()) return;
+    if (!view.id || disabledReason() || !modeCycleAllowed(store.get().unattended)) return;
     let next;
     try {
       next = Promise.resolve(actions.cyclePermissionMode?.());
@@ -461,7 +465,7 @@ export function createComposer({ container, api, store, t, actions }) {
   }
 
   function openModeMenu() {
-    if (!view.id || disabledReason()) return;
+    if (!view.id || disabledReason() || !modeCycleAllowed(store.get().unattended)) return;
     const meta = store.get().meta ?? {};
     const live = store.get().live?.[view.id];
     const current = live?.permissionMode ?? null;

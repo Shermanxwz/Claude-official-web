@@ -148,6 +148,9 @@ const TRUST_NOTICE_MESSAGE = 'Claude Code did not record this folder as trusted,
  * @property {string[]} additionalDirectories   extra working directories, without the cwd
  * @property {string|null} fallbackModel    fallback model the query started with
  * @property {boolean} browserTools         the operator's browser MCP server is attached
+ * @property {boolean} unattended           the unattended switch is applied to this query (docs/PROTOCOL.md)
+ * @property {PermissionMode|null} modeBeforeUnattended   the mode the query runs in when the switch is off; while
+ *   the switch is on, the mode the session chose. null means not known: the query returns to default
  */
 
 /** @param {string} message */
@@ -849,20 +852,26 @@ export class EngineHost {
   #trustNoticed = new Set();
   /** @type {Set<string>} sessions with a side question in flight */
   #sideQuestions = new Set();
+  /** @type {() => boolean} the unattended switch: its effective value, read synchronously */
+  #unattended;
+  /** @type {Promise<void>} the switch changes applied to the live queries, one after the other */
+  #unattendedTail = Promise.resolve();
 
   /**
    * Folder trust decides which setting sources a query loads. Without `isTrustedCwd` every folder is untrusted.
    * `resolveDir` resolves an additional folder to a real folder inside the workspace roots and throws when it cannot.
+   * `unattended` reports whether the unattended switch is on (default: off).
    * @param {{engine: EngineAdapter, config: Config, log: Logger, publish: Publish, getSeq: () => number,
    *   isAllowedCwd: (p: string) => Promise<boolean>, isTrustedCwd?: (p: string) => Promise<boolean>,
-   *   resolveDir?: (p: string) => Promise<string>, homeDir?: string, now?: () => number}} options
+   *   resolveDir?: (p: string) => Promise<string>, homeDir?: string, now?: () => number,
+   *   unattended?: () => boolean}} options
    */
   constructor({
     engine, config, log, publish, getSeq, isAllowedCwd, isTrustedCwd = async () => false,
     resolveDir = async () => {
       throw outsideRoots();
     },
-    homeDir = os.homedir(), now = Date.now,
+    homeDir = os.homedir(), now = Date.now, unattended = () => false,
   }) {
     this.#engine = engine;
     this.#config = config;
@@ -874,6 +883,7 @@ export class EngineHost {
     this.#resolveDir = resolveDir;
     this.#homeDir = homeDir;
     this.#now = now;
+    this.#unattended = unattended;
     this.#trust = createRuntimeTrust({ engine, config, log, env: () => this.#queryEnv() });
     this.#requests = new RequestRegistry({
       publish: (event) => {
@@ -1353,6 +1363,10 @@ export class EngineHost {
     if (trusted === true) await this.#syncRuntimeTrust(cwd, id);
     this.#assertStartable(id);
     this.#makeRoom();
+    // While the unattended switch is on, every query starts in bypassPermissions. The mode the session chose stays the
+    // one it returns to when the switch turns off.
+    const unattended = this.#unattended();
+    const startMode = unattended ? /** @type {PermissionMode} */ ('bypassPermissions') : resolved.permissionMode;
     /** @type {LiveRecord} */
     const live = {
       sessionId: id,
@@ -1364,7 +1378,9 @@ export class EngineHost {
       model: resolved.model,
       // An explicitly chosen mode is what the runtime starts in; without one, Claude Code's settings decide and
       // system/init reports the result.
-      permissionMode: resolved.permissionMode,
+      permissionMode: startMode,
+      unattended,
+      modeBeforeUnattended: unattended ? resolved.permissionMode : null,
       effort: resolved.effort,
       title: title ?? null,
       lastActivity: this.#now(),
@@ -1388,7 +1404,7 @@ export class EngineHost {
       fallbackModel: resolved.fallbackModel,
       browserTools: resolved.browserTools,
     };
-    const options = this.#queryOptions(live, { mode, resumeSessionAt, summaries, startMode: resolved.permissionMode });
+    const options = this.#queryOptions(live, { mode, resumeSessionAt, summaries, startMode });
     try {
       live.query = this.#engine.query({ prompt: live.input, options });
     } catch (error) {
@@ -2024,8 +2040,9 @@ export class EngineHost {
       const result = toPermissionResult(request, outcome);
       if (kind === 'plan' && 'body' in outcome && outcome.body.decision === 'approve' && outcome.body.nextMode) {
         const nextMode = /** @type {PermissionMode} */ (outcome.body.nextMode);
+        const auto = outcome.auto === true;
         setImmediate(() => {
-          void this.#applyPlanMode(live, nextMode);
+          void this.#applyPlanMode(live, nextMode, auto);
         });
       }
       return result;
@@ -2100,8 +2117,13 @@ export class EngineHost {
    * @param {AbortSignal} signal
    */
   async #awaitRequest(live, request, signal) {
-    this.#setState(live, 'requires_action');
-    const outcome = await this.#requests.create(request, signal);
+    // While unattended mode is on, the gateway answers the request at once (after it is published), so the session
+    // never waits for a person and is never shown as requiring action.
+    const automatic = this.#unattended();
+    if (!automatic) this.#setState(live, 'requires_action');
+    const pending = this.#requests.create(request, signal);
+    if (automatic) this.#requests.answerAutomatically(live.sessionId, request.id);
+    const outcome = await pending;
     if (this.#requests.count(live.sessionId) === 0) this.#setState(live, 'running');
     return outcome;
   }
@@ -2121,12 +2143,20 @@ export class EngineHost {
   }
 
   /**
-   * Applies the mode a plan approval asked for. It runs after the approval has been answered to the SDK.
+   * Applies the mode a plan approval asked for, after the approval has been answered to the SDK. While the switch holds
+   * the query in bypass, a person's choice is kept for when the switch turns off; an automatic approval (which asks for
+   * bypass) is applied only while the switch is still on.
    * @param {LiveRecord} live
    * @param {PermissionMode} nextMode
+   * @param {boolean} auto the gateway gave the approval (unattended mode)
    */
-  async #applyPlanMode(live, nextMode) {
+  async #applyPlanMode(live, nextMode, auto) {
     if (this.#live.get(live.sessionId) !== live || live.closing || !live.query) return;
+    if (live.unattended && !auto) {
+      this.#chooseWhileUnattended(live, nextMode);
+      return;
+    }
+    if (!live.unattended && auto) return;
     try {
       await withTimeout(() => live.query.setPermissionMode(nextMode));
       live.permissionMode = nextMode;
@@ -2137,6 +2167,114 @@ export class EngineHost {
         reason: errorName(error),
       });
     }
+  }
+
+  /**
+   * Applies the unattended switch to every live query, after the switch has changed (docs/PROTOCOL.md "Unattended
+   * mode"). Turning it on sets each query to bypassPermissions and answers the requests already waiting; turning it off
+   * returns each query to the mode it had. Calls run one after the other, and the state is read when each one runs, so
+   * switching twice quickly ends in the value saved last. Queries run in parallel; a failure is logged and does not
+   * stop the others.
+   * @returns {Promise<void>}
+   */
+  applyUnattended() {
+    const run = this.#unattendedTail.then(() => this.#applyUnattendedNow());
+    this.#unattendedTail = run.catch(() => {});
+    return run;
+  }
+
+  /** @returns {Promise<void>} */
+  async #applyUnattendedNow() {
+    const on = this.#unattended();
+    const lives = [...this.#live.values()].filter((live) => !live.closing && live.query);
+    await Promise.all(lives.map((live) => this.#applyUnattendedTo(live, on)));
+  }
+
+  /**
+   * @param {LiveRecord} live
+   * @param {boolean} on the switch's value when the change was made
+   * @returns {Promise<void>} never rejects
+   */
+  async #applyUnattendedTo(live, on) {
+    try {
+      await (on ? this.#switchOn(live) : this.#switchOff(live));
+    } catch (error) {
+      this.#log.warn('could not apply the unattended mode to a session', {
+        sessionId: live.sessionId,
+        reason: errorName(error),
+      });
+    }
+  }
+
+  /**
+   * Holds one query in bypassPermissions, remembering the mode it runs now as the one it returns to, and answers the
+   * requests it already has. A query the switch already holds keeps the mode it returns to.
+   * @param {LiveRecord} live
+   * @returns {Promise<void>}
+   */
+  async #switchOn(live) {
+    if (!live.unattended) {
+      live.unattended = true;
+      live.modeBeforeUnattended = live.permissionMode;
+      await this.#setRuntimeMode(live, 'bypassPermissions');
+    }
+    this.#answerPendingAutomatically(live.sessionId);
+  }
+
+  /**
+   * Returns one query to the mode it had before the switch held it. If the runtime refuses that, the query is closed
+   * rather than left in bypass mode with the switch off.
+   * @param {LiveRecord} live
+   * @returns {Promise<void>}
+   */
+  async #switchOff(live) {
+    if (!live.unattended) return;
+    live.unattended = false;
+    const target = live.modeBeforeUnattended ?? 'default';
+    live.modeBeforeUnattended = null;
+    const restored = await this.#setRuntimeMode(live, target);
+    if (!restored && !live.closing) await this.#detach(live, { publish: true });
+  }
+
+  /**
+   * Sets the permission mode of a live query. A failure is logged with the error name only.
+   * @param {LiveRecord} live
+   * @param {PermissionMode} mode
+   * @returns {Promise<boolean>} whether the runtime took the mode
+   */
+  async #setRuntimeMode(live, mode) {
+    try {
+      await withTimeout(() => /** @type {SdkQuery} */ (live.query).setPermissionMode(mode));
+      live.permissionMode = mode;
+      return true;
+    } catch (error) {
+      this.#log.warn('could not change the permission mode of a session', {
+        sessionId: live.sessionId,
+        reason: errorName(error),
+      });
+      return false;
+    } finally {
+      this.#sync(live);
+    }
+  }
+
+  /**
+   * Answers every request of a session that is still waiting, with the gateway's own answers.
+   * @param {string} sessionId
+   */
+  #answerPendingAutomatically(sessionId) {
+    for (const request of this.#requests.list(sessionId)) this.#requests.answerAutomatically(sessionId, request.id);
+  }
+
+  /**
+   * A mode a person chooses while the switch holds a query in bypass is kept for when the switch turns off. The query
+   * keeps running in bypass.
+   * @param {LiveRecord} live
+   * @param {PermissionMode} mode
+   */
+  #chooseWhileUnattended(live, mode) {
+    live.modeBeforeUnattended = mode;
+    this.#remember(live.sessionId, { permissionMode: mode });
   }
 
   /** @param {string} clientMessageId @returns {boolean} */
@@ -2395,11 +2533,16 @@ export class EngineHost {
     }
     if (parsed.permissionMode !== undefined) {
       const mode = parsed.permissionMode;
-      await this.#control(sessionId, () => live.query.setPermissionMode(mode),
-        'The permission mode could not be changed.');
-      live.permissionMode = mode;
-      this.#remember(sessionId, { permissionMode: mode });
-      this.#sync(live);
+      if (live.unattended) {
+        // The query keeps running in bypassPermissions; the mode is the one it returns to when the switch turns off.
+        this.#chooseWhileUnattended(live, mode);
+      } else {
+        await this.#control(sessionId, () => live.query.setPermissionMode(mode),
+          'The permission mode could not be changed.');
+        live.permissionMode = mode;
+        this.#remember(sessionId, { permissionMode: mode });
+        this.#sync(live);
+      }
     }
     if (parsed.effort !== undefined) {
       const effort = parsed.effort;
@@ -3043,10 +3186,12 @@ export class EngineHost {
     if (previous) {
       cwd = previous.cwd;
       const remembered = this.#pending.get(sessionId) ?? {};
+      // The mode the session chose, not the one the unattended switch holds the query in (see LiveRecord).
+      const chosen = previous.unattended ? previous.modeBeforeUnattended : previous.permissionMode;
       settings = {
         model: previous.model,
         // A null mode is not passed, so the settings the session remembers, or Claude Code's own, decide.
-        ...(previous.permissionMode !== null ? { permissionMode: previous.permissionMode } : {}),
+        ...(chosen !== null ? { permissionMode: chosen } : {}),
         effort: previous.effort,
         fastMode: previous.fastMode,
         agent: previous.agent,

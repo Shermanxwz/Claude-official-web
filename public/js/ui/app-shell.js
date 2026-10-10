@@ -22,6 +22,9 @@ import { openQuickSwitcher, shortcutLabel } from './quick-switcher.js';
 import { createTimeline } from '../timeline/view.js';
 import { openForkDialog, openRewindDialog } from '../timeline/rewind.js';
 import { createTerminalPanel } from '../terminal.js';
+import {
+  createAttentionTracker, modeCycleAllowed, newerUnattended, normalizeUnattended, waitingBySession, waitingCount,
+} from '../unattended.js';
 
 const MOBILE_QUERY = '(max-width: 767.98px)';
 const SESSIONS_DEBOUNCE_MS = 300;
@@ -42,6 +45,16 @@ const RECENT_PROJECTS = 3;
 function parseHash(hash) {
   const match = /^#\/s\/([0-9a-fA-F-]{36})\/?$/.exec(hash ?? '');
   return match ? match[1] : null;
+}
+
+/**
+ * @param {Record<string, number>} a
+ * @param {Record<string, number>} b
+ * @returns {boolean} true when both hold the same counts
+ */
+function sameCounts(a, b) {
+  const keys = Object.keys(a ?? {});
+  return keys.length === Object.keys(b ?? {}).length && keys.every((key) => a[key] === b[key]);
 }
 
 /**
@@ -72,6 +85,19 @@ export function createAppShell({ root, api, store, t }) {
   let sessionsTimer = null;
   /** @type {ReturnType<typeof connectEvents> | null} */
   let events = null;
+  /**
+   * A request counts as waiting for the user only after it has stayed unanswered for ATTENTION_DELAY_MS. When it does,
+   * the page publishes the count and, if the page is hidden, notifies once. A request answered sooner raises nothing.
+   */
+  const attention = createAttentionTracker({
+    onSettle: (request) => {
+      // A request that left the list meanwhile (its session closed) raises nothing.
+      const list = store.get().pending[request.sessionId];
+      if (!Array.isArray(list) || !list.some((item) => item.id === request.id)) return;
+      publishAttention();
+      notifyRequest(request);
+    },
+  });
   /** Session ids whose untrusted-folder banner was dismissed during this page view. */
   const trustDismissed = new Set();
   let trustBusy = false;
@@ -284,7 +310,11 @@ export function createAppShell({ root, api, store, t }) {
     if (!live || !(live.pendingCount > 0)) return;
     const detail = await api.get(`/api/sessions/${encodeURIComponent(sessionId)}`);
     if (destroyed || token !== loadToken) return;
-    store.set({ pending: { ...store.get().pending, [sessionId]: Array.isArray(detail.pending) ? detail.pending : [] } });
+    const pending = Array.isArray(detail.pending) ? detail.pending : [];
+    // The snapshot's requests have waited already: they count at once and raise no signal.
+    attention.settleNow(pending);
+    store.set({ pending: { ...store.get().pending, [sessionId]: pending } });
+    publishAttention();
   }
 
   /**
@@ -464,7 +494,8 @@ export function createAppShell({ root, api, store, t }) {
    */
   async function cyclePermissionMode() {
     const sessionId = currentSessionId();
-    if (!sessionId) return null;
+    // Unattended mode answers every request itself, so the mode has nothing to choose.
+    if (!sessionId || !modeCycleAllowed(store.get().unattended)) return null;
     const state = store.get();
     const current = state.live[sessionId]?.permissionMode ?? state.meta?.defaults?.permissionMode ?? null;
     const next = nextPermissionMode(current, { bypass: state.meta?.features?.bypass === true });
@@ -712,7 +743,7 @@ export function createAppShell({ root, api, store, t }) {
     eventLog.record(type, data);
     switch (type) {
       case 'hello':
-        if (lastBootId && data.bootId !== lastBootId) reloadAll();
+        if (lastBootId && data.bootId !== lastBootId) reloadAll({ newBoot: true });
         else lastBootId = data.bootId ?? lastBootId;
         break;
       case 'resync':
@@ -741,6 +772,9 @@ export function createAppShell({ root, api, store, t }) {
         break;
       case 'account_changed':
         store.set({ account: { account: data?.account ?? null, signInPending: false } });
+        break;
+      case 'unattended_changed':
+        store.set({ unattended: newerUnattended(store.get().unattended, normalizeUnattended(data)) });
         break;
       default:
         break;
@@ -780,6 +814,7 @@ export function createAppShell({ root, api, store, t }) {
         : session));
     }
     store.set(patch);
+    publishAttention();
   }
 
   /** @param {any} data */
@@ -791,6 +826,12 @@ export function createAppShell({ root, api, store, t }) {
     if (!list.some((item) => item.id === request.id)) {
       store.set({ pending: { ...pending, [request.sessionId]: [...list, request] } });
     }
+    // The request is known now but counts for the user only once it has waited (see the attention tracker).
+    attention.arrived(request);
+  }
+
+  /** @param {Record<string, any>} request the request that has waited for the user */
+  function notifyRequest(request) {
     let body = t(`shell.notify.${request.kind}`);
     if (request.kind === 'permission' && request.toolName) {
       body = t('shell.notify.permission', { tool: request.toolName });
@@ -801,10 +842,29 @@ export function createAppShell({ root, api, store, t }) {
   /** @param {any} data */
   function onRequestResolved(data) {
     if (!data.sessionId) return;
+    attention.resolved(data.requestId);
     const pending = store.get().pending;
     const list = pending[data.sessionId];
-    if (!list) return;
-    store.set({ pending: { ...pending, [data.sessionId]: list.filter((item) => item.id !== data.requestId) } });
+    if (list) {
+      store.set({ pending: { ...pending, [data.sessionId]: list.filter((item) => item.id !== data.requestId) } });
+    }
+    publishAttention();
+  }
+
+  /**
+   * Publishes the requests that have waited for the user, per session (store.attention). A request that left the list
+   * stops counting, and a closed session's requests are forgotten.
+   */
+  function publishAttention() {
+    if (destroyed) return;
+    const { pending, attention: current } = store.get();
+    const keep = new Set();
+    for (const list of Object.values(pending)) {
+      if (Array.isArray(list)) for (const request of list) keep.add(request.id);
+    }
+    attention.prune(keep);
+    const next = waitingBySession(pending, (requestId) => attention.isSettled(requestId));
+    if (!sameCounts(current, next)) store.set({ attention: next });
   }
 
   /** @param {any} data */
@@ -926,8 +986,10 @@ export function createAppShell({ root, api, store, t }) {
     }
   }
 
+  /** The requests waiting for the user across all sessions (the document title's count). */
   function pendingTotal() {
-    return Object.values(store.get().live).reduce((sum, live) => sum + (live?.pendingCount ?? 0), 0);
+    const state = store.get();
+    return Object.keys(state.live).reduce((sum, sessionId) => sum + waitingCount(state, sessionId), 0);
   }
 
   function updateDocumentTitle() {
@@ -1057,14 +1119,18 @@ export function createAppShell({ root, api, store, t }) {
     }
   }
 
-  async function reloadAll() {
+  /**
+   * Reloads the meta, the session list and the open transcript.
+   * @param {{ newBoot?: boolean }} [options] newBoot: the gateway restarted, so its unattended state is taken as it is
+   */
+  async function reloadAll({ newBoot = false } = {}) {
     if (reloading || destroyed) return;
     reloading = true;
     try {
       const meta = await api.get('/api/meta');
       if (destroyed) return;
       lastBootId = meta.bootId ?? lastBootId;
-      store.set({ meta });
+      store.set({ meta, unattended: unattendedFromMeta(meta, newBoot) });
       await refreshSessionList({ api, store });
       const sessionId = currentSessionId();
       if (sessionId && parts.timeline) {
@@ -1089,7 +1155,7 @@ export function createAppShell({ root, api, store, t }) {
       const meta = await api.get('/api/meta');
       if (destroyed || token !== bootToken) return;
       lastBootId = meta.bootId ?? null;
-      store.set({ meta });
+      store.set({ meta, unattended: unattendedFromMeta(meta, true) });
       loadAccount();
       if (!events) {
         events = connectEvents({
@@ -1111,6 +1177,17 @@ export function createAppShell({ root, api, store, t }) {
       bootError = errorText(err, t);
       renderWelcome();
     }
+  }
+
+  /**
+   * The unattended state a meta answer carries. Within one gateway run the newer state wins, so an answer to an older
+   * request cannot undo a change; a restarted gateway starts afresh.
+   * @param {any} meta
+   * @param {boolean} fresh
+   */
+  function unattendedFromMeta(meta, fresh) {
+    const incoming = normalizeUnattended(meta?.features?.unattended);
+    return fresh ? incoming : newerUnattended(store.get().unattended, incoming);
   }
 
   function applySidebarState() {
@@ -1166,8 +1243,8 @@ export function createAppShell({ root, api, store, t }) {
   const unsubscribeStore = store.subscribe((state, prev) => {
     if (destroyed) return;
     if (state.prefs !== prev.prefs) applySidebarState();
-    if (state.live !== prev.live || state.pending !== prev.pending || state.meta !== prev.meta
-      || state.auth !== prev.auth) {
+    if (state.live !== prev.live || state.pending !== prev.pending || state.attention !== prev.attention
+      || state.meta !== prev.meta || state.auth !== prev.auth) {
       updateDocumentTitle();
     }
     if (state.connection !== prev.connection) updateConnection(state.connection);
@@ -1203,6 +1280,7 @@ export function createAppShell({ root, api, store, t }) {
       destroyed = true;
       events?.close();
       events = null;
+      attention.reset();
       if (sessionsTimer !== null) clearTimeout(sessionsTimer);
       if (offlineTimer !== null) clearTimeout(offlineTimer);
       unsubscribeStore();

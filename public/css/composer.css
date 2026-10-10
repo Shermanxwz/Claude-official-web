@@ -185,6 +185,26 @@
   cursor: pointer;
 }
 
+/* Unattended mode is on: a pill in the attention tone, as tall as the other header controls. */
+.hdr-unattended {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--attention-soft);
+  color: var(--attention);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 .hdr-icon-btn {
   display: inline-flex;
   align-items: center;
@@ -315,6 +335,17 @@
   .hdr-controls,
   .hdr-tasks,
   .hdr-cwd {
+    display: none;
+  }
+
+  /* The pill keeps its icon on phones; the composer's footer names the mode in words. */
+  .hdr-unattended {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .hdr-unattended-text {
     display: none;
   }
 }
@@ -1364,6 +1395,7 @@
   .ctx-meter,
   .hdr-select,
   .hdr-fast,
+  .hdr-unattended,
   .palette-option,
   .todo-toggle,
   .chip-remove,
@@ -1375,7 +1407,8 @@
   .composer-icon-btn,
   .composer-send,
   .composer-stop,
-  .hdr-icon-btn {
+  .hdr-icon-btn,
+  .hdr-unattended {
     min-width: 44px;
   }
 

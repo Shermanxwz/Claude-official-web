@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EngineHost } from '../../src/engine/host.mjs';
 import { AsyncQueue } from '../../src/engine/queue.mjs';
-import { AppError, DIALOG_KINDS, isUuid } from '../../src/contracts.mjs';
+import { AppError, DIALOG_KINDS, UNATTENDED_QUESTION_MESSAGE, isUuid } from '../../src/contracts.mjs';
 
 /** The gateway's state folder for every host of this file: trust probes run inside it, never in the repository. */
 const STATE_DIR = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'caw-host-state-'));
@@ -338,12 +338,14 @@ const INSIDE_ROOTS = async (p) => p === CWD || p.startsWith(`${CWD}/`);
  * A host wired to the fake engine, a recording publisher, a recording logger and a manual clock.
  * `trusted` is the isTrustedCwd option; `null` leaves the option out so the host's default applies. `allowed` answers
  * the workspace roots check. `settingsOnDisk` is what the fake engine reports for the user's settings files.
+ * `unattended` is the switch the host reads: a test turns it on or off by setting its `on` flag, then calls
+ * applyUnattended.
  * @param {{config?: Record<string, unknown>, clock?: number,
  *   trusted?: ((p: string) => Promise<boolean>)|null, allowed?: (p: string) => Promise<boolean>,
- *   settingsOnDisk?: Record<string, unknown>}} [options]
+ *   settingsOnDisk?: Record<string, unknown>, unattended?: {on: boolean}}} [options]
  */
 function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED, allowed = INSIDE_ROOTS,
-  settingsOnDisk = {}, resolveDir, homeDir = HOME } = {}) {
+  settingsOnDisk = {}, resolveDir, homeDir = HOME, unattended = { on: false } } = {}) {
   const events = [];
   const logs = [];
   const engine = createEngine();
@@ -365,11 +367,12 @@ function harness({ config = {}, clock = 1_000_000, trusted = TRUSTED, allowed = 
     isAllowedCwd: allowed,
     now: () => time.now,
     homeDir,
+    unattended: () => unattended.on,
   };
   if (trusted !== null) options.isTrustedCwd = trusted;
   if (resolveDir !== undefined) options.resolveDir = resolveDir;
   const host = new EngineHost(options);
-  return { host, engine, events, logs, time, sequence: () => seq };
+  return { host, engine, events, logs, time, sequence: () => seq, unattended };
 }
 
 /** @param {Record<string, unknown>} [overrides] */
@@ -4093,4 +4096,241 @@ describe('EngineHost file suggestions, runtime trust and the bypass guard', () =
     await h.host.closeSession(sessionId);
     assert.deepEqual(await answer, { behavior: 'cancelled' });
   });
+});
+
+describe('EngineHost unattended mode (docs/PROTOCOL.md "Unattended mode")', () => {
+  /**
+   * Turns the switch on or off the way the gateway does: the saved value changes, then every live query is applied.
+   * @param {ReturnType<typeof harness>} h
+   * @param {boolean} on
+   */
+  async function switchTo(h, on) {
+    h.unattended.on = on;
+    await h.host.applyUnattended();
+  }
+
+  /** @param {FakeQuery} query */
+  function modeCalls(query) {
+    return query.calls.filter((call) => call[0] === 'setPermissionMode');
+  }
+
+  test('a query started while the switch is on runs in bypassPermissions, and the mode the session chose comes back',
+    async () => {
+      const h = harness({ config: { allowBypass: true } });
+      h.unattended.on = true;
+      const { sessionId, query } = await startLive(h, { cwd: CWD, permissionMode: 'acceptEdits' },
+        { permissionMode: 'bypassPermissions' });
+      assert.equal(query.options.permissionMode, 'bypassPermissions');
+      assert.equal(h.host.liveInfo(sessionId).permissionMode, 'bypassPermissions');
+      await switchTo(h, false);
+      assert.deepEqual(modeCalls(query), [['setPermissionMode', 'acceptEdits']]);
+      assert.equal(h.host.liveInfo(sessionId).permissionMode, 'acceptEdits');
+      assert.equal(ofType(h.events, 'notice').length, 0, 'bypass is allowed, so the refusal notice never shows');
+    });
+
+  test('turning the switch on sets bypassPermissions on every live query, and each keeps its own mode for later',
+    async () => {
+      const h = harness({ config: { allowBypass: true } });
+      const chosen = await startLive(h, { cwd: CWD, permissionMode: 'acceptEdits' }, { permissionMode: 'acceptEdits' });
+      const plain = await startLive(h, { cwd: CWD }, { permissionMode: 'default' });
+      await switchTo(h, true);
+      assert.deepEqual(modeCalls(chosen.query), [['setPermissionMode', 'bypassPermissions']]);
+      assert.deepEqual(modeCalls(plain.query), [['setPermissionMode', 'bypassPermissions']]);
+      assert.equal(h.host.liveInfo(chosen.sessionId).permissionMode, 'bypassPermissions');
+      assert.equal(h.host.liveInfo(plain.sessionId).permissionMode, 'bypassPermissions');
+      await switchTo(h, false);
+      assert.deepEqual(modeCalls(chosen.query).at(-1), ['setPermissionMode', 'acceptEdits']);
+      assert.deepEqual(modeCalls(plain.query).at(-1), ['setPermissionMode', 'default']);
+      assert.equal(h.host.liveInfo(chosen.sessionId).permissionMode, 'acceptEdits');
+      assert.equal(h.host.liveInfo(plain.sessionId).permissionMode, 'default');
+    });
+
+  test('a query whose mode was not known returns to default when the switch turns off', async () => {
+    const h = harness({ config: { allowBypass: true, defaults: { permissionMode: null } } });
+    const { sessionId, query } = await startLive(h, { cwd: CWD }, { permissionMode: undefined });
+    await switchTo(h, true);
+    await switchTo(h, false);
+    assert.deepEqual(modeCalls(query), [['setPermissionMode', 'bypassPermissions'], ['setPermissionMode', 'default']]);
+    assert.equal(h.host.liveInfo(sessionId).permissionMode, 'default');
+  });
+
+  test('a mode a person chooses while the switch is on is kept, and applied when the switch turns off', async () => {
+    const h = harness({ config: { allowBypass: true } });
+    h.unattended.on = true;
+    const { sessionId, query } = await startLive(h, { cwd: CWD }, { permissionMode: 'bypassPermissions' });
+    const { live } = await h.host.updateSettings(sessionId, { permissionMode: 'acceptEdits' });
+    assert.equal(live.permissionMode, 'bypassPermissions');
+    assert.deepEqual(modeCalls(query), []);
+    await switchTo(h, false);
+    assert.deepEqual(modeCalls(query), [['setPermissionMode', 'acceptEdits']]);
+    assert.equal(h.host.liveInfo(sessionId).permissionMode, 'acceptEdits');
+  });
+
+  test('a restart while the switch holds a query starts it in bypassPermissions, and the chosen mode comes back',
+    async () => {
+      const extra = path.join(CWD, 'extra');
+      const h = harness({ config: { allowBypass: true }, resolveDir: folderOf });
+      h.unattended.on = true;
+      const { sessionId, query } = await startLive(h, { cwd: CWD, permissionMode: 'acceptEdits' },
+        { permissionMode: 'bypassPermissions' });
+      await h.host.updateSettings(sessionId, { additionalDirectories: [extra] });
+      assert.equal(query.closed, true);
+      const restarted = h.engine.queries[1];
+      assert.equal(restarted.options.permissionMode, 'bypassPermissions');
+      await switchTo(h, false);
+      assert.deepEqual(modeCalls(restarted), [['setPermissionMode', 'acceptEdits']]);
+      assert.equal(h.host.liveInfo(sessionId).permissionMode, 'acceptEdits');
+    });
+
+  test('a mode chosen while the switch is on survives a restart', async () => {
+    const extra = path.join(CWD, 'extra');
+    const h = harness({ config: { allowBypass: true }, resolveDir: folderOf });
+    h.unattended.on = true;
+    const { sessionId } = await startLive(h, { cwd: CWD }, { permissionMode: 'bypassPermissions' });
+    await h.host.updateSettings(sessionId, { permissionMode: 'acceptEdits' });
+    await h.host.updateSettings(sessionId, { additionalDirectories: [extra] });
+    const restarted = h.engine.queries[1];
+    await switchTo(h, false);
+    assert.deepEqual(modeCalls(restarted), [['setPermissionMode', 'acceptEdits']]);
+  });
+
+  test('a switch-off the runtime refuses closes that session, rather than leaving it in bypass', async () => {
+    const h = harness({ config: { allowBypass: true } });
+    h.unattended.on = true;
+    const { sessionId, query } = await startLive(h, { cwd: CWD }, { permissionMode: 'bypassPermissions' });
+    query.failures.set('setPermissionMode', new Error('refused by /home/claude/.claude/settings.json'));
+    await switchTo(h, false);
+    assert.equal(query.closed, true);
+    assert.equal(h.host.liveInfo(sessionId), null);
+    assert.deepEqual(ofType(h.events, 'session_state').at(-1).data, { sessionId, live: null });
+    const warning = h.logs.find((entry) => entry.msg === 'could not change the permission mode of a session');
+    assert.equal(warning.level, 'warn');
+    assert.equal(JSON.stringify(warning).includes('settings.json'), false);
+  });
+
+  test('a mode change the runtime refuses when the switch turns on is logged, and the other sessions still switch',
+    async () => {
+      const h = harness({ config: { allowBypass: true } });
+      const refusing = await startLive(h, { cwd: CWD }, { permissionMode: 'acceptEdits' });
+      const willing = await startLive(h, { cwd: CWD }, { permissionMode: 'default' });
+      refusing.query.failures.set('setPermissionMode', new Error('refused by /home/claude/.claude/settings.json'));
+      await switchTo(h, true);
+      assert.equal(h.host.liveInfo(refusing.sessionId).permissionMode, 'acceptEdits');
+      assert.notEqual(h.host.liveInfo(refusing.sessionId), null);
+      assert.equal(h.host.liveInfo(willing.sessionId).permissionMode, 'bypassPermissions');
+      const warning = h.logs.find((entry) => entry.msg === 'could not change the permission mode of a session');
+      assert.equal(warning.level, 'warn');
+      assert.equal(warning.fields.sessionId, refusing.sessionId);
+      assert.equal(JSON.stringify(warning).includes('settings.json'), false);
+    });
+
+  test('turning the switch on answers the requests already waiting, with auto: true, and nothing stays requires_action',
+    async () => {
+      const h = harness({ config: { allowBypass: true } });
+      const { sessionId, query } = await startLive(h);
+      const bash = callTool(query, 'Bash', { command: 'ls' }, { requestId: 'w-bash' }).pending;
+      const question = callTool(query, 'AskUserQuestion', { questions: [] }, { requestId: 'w-question' }).pending;
+      const plan = callTool(query, 'ExitPlanMode', { plan: 'p' }, { requestId: 'w-plan' }).pending;
+      const mcp = callElicitation(query, { serverName: 'docs', message: 'Name?' }, { requestId: 'w-mcp' }).pending;
+      await flush();
+      assert.equal(h.host.liveInfo(sessionId).state, 'requires_action');
+      assert.equal(h.host.liveInfo(sessionId).pendingCount, 4);
+      await switchTo(h, true);
+      assert.deepEqual(await bash, { behavior: 'allow', updatedInput: { command: 'ls' } });
+      assert.deepEqual(await question, { behavior: 'deny', message: UNATTENDED_QUESTION_MESSAGE });
+      assert.deepEqual(await plan, { behavior: 'allow', updatedInput: { plan: 'p' } });
+      assert.deepEqual(await mcp, { action: 'decline' });
+      assert.equal(h.host.liveInfo(sessionId).pendingCount, 0);
+      assert.equal(h.host.liveInfo(sessionId).state, 'running');
+      assert.deepEqual(ofType(h.events, 'request_resolved').slice(-4).map((event) => [
+        event.data.requestId, event.data.outcome, event.data.auto,
+      ]), [['w-bash', 'allowed', true], ['w-question', 'denied', true], ['w-plan', 'allowed', true],
+        ['w-mcp', 'denied', true]]);
+    });
+
+  test('a permission prompt raised while the switch is on is answered at once and never shows requires_action',
+    async () => {
+      const h = harness({ config: { allowBypass: true } });
+      h.unattended.on = true;
+      const { sessionId, query } = await startLive(h, { cwd: CWD }, { permissionMode: 'bypassPermissions' });
+      const { pending } = callTool(query, 'Bash', { command: 'ls' }, { requestId: 'a-1' });
+      assert.deepEqual(await pending, { behavior: 'allow', updatedInput: { command: 'ls' } });
+      assert.equal(lastOutcome(h), 'allowed');
+      assert.equal(ofType(h.events, 'request_resolved').at(-1).data.auto, true);
+      const states = ofType(h.events, 'session_state').map((event) => event.data.live?.state);
+      assert.equal(states.includes('requires_action'), false);
+      assert.equal(h.host.liveInfo(sessionId).state, 'running');
+    });
+
+  test('each automatic answer is published with auto: true, and a person\'s answer of any kind never carries it',
+    async () => {
+      const h = harness({ config: { allowBypass: true } });
+      h.unattended.on = true;
+      const { sessionId, query } = await startLive(h, { cwd: CWD }, { permissionMode: 'bypassPermissions' });
+      const dialog = query.options.onUserDialog({
+        dialogKind: 'refusal_fallback_prompt', payload: { originalModel: 'opus', fallbackModel: 'sonnet' },
+      }, { signal: new AbortController().signal, requestId: 'd-auto' });
+      const elicit = callElicitation(query, { serverName: 'docs', message: 'Name?' }, { requestId: 'e-auto' }).pending;
+      const question = callTool(query, 'AskUserQuestion', { questions: [] }, { requestId: 'q-auto' }).pending;
+      const plan = callTool(query, 'ExitPlanMode', { plan: 'p' }, { requestId: 'p-auto' }).pending;
+      const permission = callTool(query, 'Bash', { command: 'ls' }, { requestId: 'b-auto' }).pending;
+      await flush();
+      assert.deepEqual(await dialog, { behavior: 'completed', result: 'cancelled' });
+      assert.deepEqual(await elicit, { action: 'decline' });
+      assert.deepEqual(await question, { behavior: 'deny', message: UNATTENDED_QUESTION_MESSAGE });
+      assert.deepEqual(await plan, { behavior: 'allow', updatedInput: { plan: 'p' } });
+      assert.deepEqual(await permission, { behavior: 'allow', updatedInput: { command: 'ls' } });
+      assert.deepEqual(ofType(h.events, 'request_resolved').map((event) => [
+        event.data.requestId, event.data.outcome, event.data.auto,
+      ]), [['d-auto', 'answered', true], ['e-auto', 'denied', true], ['q-auto', 'denied', true],
+        ['p-auto', 'allowed', true], ['b-auto', 'allowed', true]]);
+      await switchTo(h, false);
+      const manual = callTool(query, 'Bash', { command: 'pwd' }, { requestId: 'm-1' }).pending;
+      await h.host.respond(sessionId, 'm-1', { decision: 'allow' });
+      await manual;
+      assert.deepEqual(ofType(h.events, 'request_resolved').at(-1).data, {
+        sessionId, requestId: 'm-1', outcome: 'allowed',
+      });
+    });
+
+  test('a session opened from history while the switch is on starts in bypassPermissions', async () => {
+    const h = harness({ config: { allowBypass: true } });
+    addSession(h.engine, S1);
+    h.unattended.on = true;
+    await h.host.openSession(S1);
+    const query = h.engine.queries[h.engine.queries.length - 1];
+    await flush();
+    query.emit(initMessage(S1, { permissionMode: 'bypassPermissions' }));
+    await flush();
+    assert.equal(query.options.permissionMode, 'bypassPermissions');
+    assert.equal(h.host.liveInfo(S1).permissionMode, 'bypassPermissions');
+    await switchTo(h, false);
+    assert.deepEqual(modeCalls(query), [['setPermissionMode', 'default']]);
+  });
+
+  test('applying the switch again changes nothing, and a closed session is not reached', async () => {
+    const h = harness({ config: { allowBypass: true } });
+    const { sessionId, query } = await startLive(h, { cwd: CWD, permissionMode: 'acceptEdits' },
+      { permissionMode: 'acceptEdits' });
+    await switchTo(h, true);
+    await switchTo(h, true);
+    assert.deepEqual(modeCalls(query), [['setPermissionMode', 'bypassPermissions']]);
+    await h.host.closeSession(sessionId);
+    await switchTo(h, false);
+    assert.deepEqual(modeCalls(query), [['setPermissionMode', 'bypassPermissions']]);
+  });
+
+  test('switching on and off quickly ends in the value saved last, because each change reads the switch when it runs',
+    async () => {
+      const h = harness({ config: { allowBypass: true } });
+      const { sessionId, query } = await startLive(h, { cwd: CWD, permissionMode: 'acceptEdits' },
+        { permissionMode: 'acceptEdits' });
+      h.unattended.on = true;
+      const first = h.host.applyUnattended();
+      h.unattended.on = false;
+      const second = h.host.applyUnattended();
+      await Promise.all([first, second]);
+      assert.deepEqual(modeCalls(query), []);
+      assert.equal(h.host.liveInfo(sessionId).permissionMode, 'acceptEdits');
+    });
 });

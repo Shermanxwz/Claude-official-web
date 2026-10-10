@@ -101,6 +101,8 @@ export async function startServer({ env = process.env, engine, listenHost, liste
   const stateStore = (await import('./state.mjs')).createStateStore(config.stateDir);
   const workspaces = (await import('./workspaces.mjs')).createWorkspaces(config, { stateStore });
   const attachments = (await import('./attachments.mjs')).createAttachments({ config, log, workspaces, stateStore });
+  const unattendedSwitch = (await import('./unattended.mjs')).createUnattendedSwitch({ config, stateStore });
+  await unattendedSwitch.load();
   const { EngineHost } = await import('./engine/host.mjs');
   const engineHost = new EngineHost({
     engine: adapter,
@@ -111,7 +113,21 @@ export async function startServer({ env = process.env, engine, listenHost, liste
     isAllowedCwd: (/** @type {string} */ p) => workspaces.isInsideRoots(p),
     isTrustedCwd: (/** @type {string} */ p) => workspaces.isTrusted(p),
     resolveDir: (/** @type {string} */ p) => workspaces.resolveDir(p),
+    unattended: () => unattendedSwitch.enabled(),
   });
+  // Turning the switch on or off saves it, applies it to every live session and then tells every client.
+  /** @type {import('./unattended.mjs').UnattendedService} */
+  const unattended = {
+    state: () => unattendedSwitch.state(),
+    async set(enabled) {
+      const { changed, state } = await unattendedSwitch.set(enabled);
+      if (changed) {
+        await engineHost.applyUnattended();
+        publish({ type: 'unattended_changed', data: { ...state } });
+      }
+      return state;
+    },
+  };
   const account = (await import('./engine/account.mjs')).createAccount({
     engine: adapter,
     config,
@@ -126,8 +142,8 @@ export async function startServer({ env = process.env, engine, listenHost, liste
     .startMaintenance({ config, log, attachments, engineHost });
   const auth = await createAuth(config, { log, bootId, stateStore });
   const app = createApp({
-    config, log, engine: adapter, engineHost, events, auth, workspaces, attachments, terminal, account, bootId,
-    publicDir: PUBLIC_DIR,
+    config, log, engine: adapter, engineHost, events, auth, workspaces, attachments, terminal, account, unattended,
+    bootId, publicDir: PUBLIC_DIR,
   });
 
   let closing = /** @type {Promise<void>|null} */ (null);

@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning.
 
+## [1.3.0] - 2026-10-10
+
+Unattended mode, the counterpart of a Codex setup that never asks, checked on the real Claude Code 2.1.295 runtime.
+
+### Added
+
+- Unattended mode: one gateway-wide switch in Settings → Permissions, with `CAW_UNATTENDED=1` as its default. While it
+  is on, every query starts in `bypassPermissions` and live queries switch with `setPermissionMode`; the gateway
+  answers the requests that remain at once: permissions are allowed once, the model's questions are answered with
+  "decide yourself, say which option you chose and why", plans are approved, MCP forms are declined and refusal
+  dialogs are not retried on another model. Each automatic answer leaves one line in the conversation
+  (`request_resolved` with `auto: true`). Turning it off returns live sessions to their previous mode.
+  `GET`/`PUT /api/unattended`, `meta.features.unattended` and the `unattended_changed` event.
+- An **Unattended** pill in the header, a fixed permission mode and the composer label "Unattended — no approvals"
+  while the switch is on; a confirmation before it turns on.
+- `CAW_UNATTENDED`, which implies `CAW_ALLOW_BYPASS=1` and needs the `full` profile.
+
+### Changed
+
+- A request counts as waiting for you only after 300 ms unanswered, so a request the gateway answers at once never
+  flashes a badge, a sidebar count or a notification.
+- A plan approval may choose `bypassPermissions` as the next mode when bypass is allowed.
+- A question that unattended mode answered is not listed among the turn's denied tools.
+
+### Fixed
+
+- Root: Claude Code exits at startup when it may bypass permissions as root outside a sandbox, which broke every
+  session of a root gateway with `CAW_ALLOW_BYPASS=1`. The gateway now refuses to start with the bypass settings as
+  root unless `IS_SANDBOX=1` or `CLAUDE_CODE_BUBBLEWRAP` is set, and says why.
+
 ## [1.2.1] - 2026-10-10
 
 Fixes found by running Claude Code 2.1.295 subagents through the web interface.

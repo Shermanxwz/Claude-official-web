@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ACCESS_PROFILES, EFFORT_LEVELS, PERMISSION_MODES } from './contracts.mjs';
+import { ACCESS_PROFILES, BYPASS_ROOT_MESSAGE, EFFORT_LEVELS, PERMISSION_MODES } from './contracts.mjs';
 import { canonicalExactOrigin, isLoopbackHost } from './security.mjs';
 
 /** @typedef {import('./contracts.mjs').Config} Config */
@@ -172,6 +172,16 @@ function readPackageVersion() {
 }
 
 /**
+ * Whether Claude Code may run bypass mode as root: it refuses at startup unless IS_SANDBOX=1 or CLAUDE_CODE_BUBBLEWRAP
+ * is set (docs/PROTOCOL.md "Access profiles"). The runtime inherits this environment, so the gateway checks the same.
+ * @param {Record<string, string|undefined>} env
+ * @returns {boolean}
+ */
+function sandboxedIn(env) {
+  return optionalText(env.IS_SANDBOX) === '1' || optionalText(env.CLAUDE_CODE_BUBBLEWRAP) !== null;
+}
+
+/**
  * Whether the runtime will be told to run without background tasks: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is set to a
  * non-empty value other than 0 or false. The runtime inherits this environment, so the gateway checks the same value.
  * @param {string|undefined} raw
@@ -222,11 +232,12 @@ function resolveClaudeBin(env) {
 /**
  * Resolves and validates the gateway configuration.
  * @param {Record<string, string|undefined>} [env]
- * @param {{packageVersion?: string}} [options]
+ * @param {{packageVersion?: string, uid?: number}} [options] `uid` is the gateway's user id (default: the process's;
+ *   0 is root, and undefined on platforms without user ids)
  * @returns {Config}
  * @throws {ConfigError}
  */
-export function loadConfig(env = process.env, { packageVersion } = {}) {
+export function loadConfig(env = process.env, { packageVersion, uid = process.getuid?.() } = {}) {
   const host = optionalText(env.CAW_HOST) ?? '127.0.0.1';
   if (!HOST_RE.test(host)) throw new ConfigError('CAW_HOST must be an IP address or host name without spaces');
 
@@ -272,13 +283,21 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
 
   const modelRaw = optionalText(env.CAW_DEFAULT_MODEL);
   const model = modelRaw === null ? null : plainText('CAW_DEFAULT_MODEL', modelRaw, 200);
-  const allowBypass = flag('CAW_ALLOW_BYPASS', env.CAW_ALLOW_BYPASS, false);
+  const allowBypassFlag = flag('CAW_ALLOW_BYPASS', env.CAW_ALLOW_BYPASS, false);
+  const unattendedDefault = flag('CAW_UNATTENDED', env.CAW_UNATTENDED, false);
   // The one rule for bypassPermissions: the switch exists only for the full profile, so every gate below it holds.
-  if (allowBypass && profile !== 'full') {
+  if (allowBypassFlag && profile !== 'full') {
     throw new ConfigError('CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full');
   }
+  if (unattendedDefault && profile !== 'full') {
+    throw new ConfigError('CAW_UNATTENDED=1 requires CAW_ACCESS_PROFILE=full');
+  }
+  const allowBypass = allowBypassFlag || unattendedDefault;
   const permissionMode = /** @type {import('./contracts.mjs').Config['defaults']['permissionMode']} */ (
     choice('CAW_DEFAULT_PERMISSION_MODE', env.CAW_DEFAULT_PERMISSION_MODE, PERMISSION_MODES, null));
+  // Root without a sandbox: Claude Code would exit at startup, and every session with it.
+  const bypassRequested = allowBypass || permissionMode === 'bypassPermissions';
+  if (uid === 0 && bypassRequested && !sandboxedIn(env)) throw new ConfigError(BYPASS_ROOT_MESSAGE);
   if (permissionMode === 'bypassPermissions' && !allowBypass) {
     throw new ConfigError('CAW_DEFAULT_PERMISSION_MODE=bypassPermissions requires CAW_ALLOW_BYPASS=1');
   }
@@ -306,6 +325,7 @@ export function loadConfig(env = process.env, { packageVersion } = {}) {
     defaults: Object.freeze({ model, permissionMode, effort, fallbackModel }),
     terminal: flag('CAW_TERMINAL', env.CAW_TERMINAL, false),
     allowBypass,
+    unattendedDefault,
     chrome: flag('CAW_CHROME', env.CAW_CHROME, false),
     browserMcpCommand: browserMcpCommandOf(env.CAW_BROWSER_MCP_COMMAND),
     backgroundTasksDisabled: backgroundTasksDisabledIn(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS),

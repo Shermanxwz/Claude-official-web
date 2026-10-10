@@ -76,6 +76,24 @@ Out of scope:
 - Availability attacks by someone who already holds a valid login.
 - The security of Anthropic's models, services and the Claude Code runtime. Report those to Anthropic.
 
+### Unattended mode
+
+The unattended switch runs sessions in `bypassPermissions` and answers every remaining request itself: permission
+prompts are allowed once, the model's questions are answered with "decide yourself", plans are approved, MCP forms are
+declined and a refused answer is not retried on another model. Nothing waits for the operator. It is off by default.
+The operator makes it available with `CAW_ALLOW_BYPASS=1` (the switch then starts off) or `CAW_UNATTENDED=1` (the switch
+then starts on); both require `CAW_ACCESS_PROFILE=full`, and only the `full` profile can flip the switch in the
+interface. The gateway refuses to start as root with either flag, or with
+`CAW_DEFAULT_PERMISSION_MODE=bypassPermissions`, unless it runs in a sandbox (`IS_SANDBOX=1` or
+`CLAUDE_CODE_BUBBLEWRAP` set).
+
+Turning the switch on accepts these risks:
+
+- Prompt injection from files, web pages and tool output can make the model act without review. Every action runs with
+  the service account's full authority, destructive commands included.
+- No mistake is caught before it happens. Run the gateway on a dedicated machine or as a dedicated user, keep backups,
+  and keep the work in git so that changes can be reverted.
+
 ## Implemented controls
 
 Authentication and sessions:

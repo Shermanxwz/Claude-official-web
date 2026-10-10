@@ -25,6 +25,7 @@ import { isAllowedHost, secureHeaders } from './security.mjs';
 /** @typedef {import('./contracts.mjs').EffortLevel} EffortLevel */
 /** @typedef {import('./events.mjs').EventHub} EventHub */
 /** @typedef {import('./auth.mjs').AuthApi} AuthApi */
+/** @typedef {import('./unattended.mjs').UnattendedService} UnattendedService */
 
 /**
  * @typedef {Object} RouteContext
@@ -348,6 +349,19 @@ function rejectUpgrade(socket, status, reason) {
 }
 
 /**
+ * The body of PUT /api/unattended: exactly {enabled: boolean}.
+ * @param {Record<string, unknown>} body
+ * @returns {boolean}
+ */
+function unattendedBody(body) {
+  const keys = Object.keys(body);
+  if (keys.length !== 1 || keys[0] !== 'enabled' || typeof body.enabled !== 'boolean') {
+    throw badRequest('The body must be exactly {"enabled": true} or {"enabled": false}');
+  }
+  return body.enabled;
+}
+
+/**
  * @param {ServerResponse} res
  * @param {number} status
  * @param {string} text
@@ -361,12 +375,12 @@ function sendText(res, status, text, headers) {
 /**
  * @param {{config: Config, log: Logger, engine: EngineAdapter, engineHost: EngineHostApi, events: EventHub,
  *   auth: AuthApi, workspaces: WorkspacesApi, attachments: AttachmentsApi, terminal: TerminalApi, account: AccountApi,
- *   bootId: string, publicDir: string}} deps
+ *   unattended: UnattendedService, bootId: string, publicDir: string}} deps
  * @returns {{handleRequest: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
  *   handleUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => void}}
  */
 export function createApp({ config, log, engine, engineHost, events, auth, workspaces, attachments, terminal, account,
-  bootId, publicDir }) {
+  unattended, bootId, publicDir }) {
   const https = config.publicOrigin.startsWith('https://');
   const securityHeaders = () => secureHeaders({}, { https });
   const router = createRouter();
@@ -418,6 +432,7 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
         accountLogin: true,
         browserTools: Array.isArray(config.browserMcpCommand),
         chrome: config.chrome === true,
+        unattended: unattended.state(),
       },
       limits: {
         uploadMaxBytes: config.uploadMaxBytes,
@@ -530,6 +545,7 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   router.add('GET', '/api/sessions/:id/export', ({ params }) =>
     engineHost.exportConversation(sessionIdValue(params.id)), { profile: 'read' });
   router.add('GET', '/api/account', () => account.status(), { profile: 'read' });
+  router.add('GET', '/api/unattended', () => unattended.state(), { profile: 'read' });
 
   // standard
   router.add('POST', '/api/fs/mkdir', async ({ req }) => {
@@ -709,6 +725,8 @@ export function createApp({ config, log, engine, engineHost, events, auth, works
   }, { profile: 'full' });
 
   // full
+  router.add('PUT', '/api/unattended', async ({ req }) => unattended.set(unattendedBody(await readJson(req))),
+    { profile: 'full' });
   router.add('DELETE', '/api/sessions/:id', async ({ params }) => {
     await engineHost.deleteSession(sessionIdValue(params.id));
     return { ok: true };

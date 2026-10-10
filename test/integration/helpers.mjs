@@ -86,6 +86,9 @@ export async function startTestServer(overrides = {}, { wrapEngine, backgroundTi
       CAW_WORKSPACE_ROOTS: root,
       CAW_STATE_DIR: stateDir,
       CAW_LOG_LEVEL: 'error',
+      // The root guard (src/config.mjs) refuses bypassPermissions for root outside a sandbox; the harness marks one so
+      // the bypass and unattended tests behave the same for every user. config.test.mjs covers the guard itself.
+      IS_SANDBOX: '1',
       ...overrides,
     };
     const config = loadConfig(env);

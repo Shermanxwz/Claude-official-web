@@ -12,6 +12,7 @@ import { loadConfig } from '../../src/config.mjs';
 import { AppError } from '../../src/contracts.mjs';
 import { EventHub } from '../../src/events.mjs';
 import { createLogger } from '../../src/log.mjs';
+import { createUnattendedSwitch } from '../../src/unattended.mjs';
 
 const TOKEN = 'app-test-token-123';
 const BOOT = 'boot-app';
@@ -251,6 +252,9 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
     CAW_ACCESS_PROFILE: profile,
     CAW_ALLOW_BYPASS: allowBypass ? '1' : '0',
     CAW_TERMINAL: terminal ? '1' : '0',
+    // The root guard (src/config.mjs) refuses bypass for root outside a sandbox; config.test.mjs covers it with an
+    // injected uid, so these tests mark the sandbox to run the same way for every user.
+    IS_SANDBOX: '1',
   };
   if (requireAuth) env.CAW_TOKEN = TOKEN;
   else env.CAW_REQUIRE_AUTH = '0';
@@ -258,6 +262,16 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
   if (publicOrigin) env.CAW_PUBLIC_ORIGIN = publicOrigin;
   Object.assign(env, extraEnv);
   const config = loadConfig(env, { packageVersion: '1.2.3' });
+  // The saved value stays in memory here; test/unit/unattended.test.mjs covers the state file itself.
+  const switchState = createUnattendedSwitch({
+    config,
+    stateStore: { read: async (_name, fallback) => fallback, write: async () => {} },
+  });
+  await switchState.load();
+  const unattended = {
+    state: () => switchState.state(),
+    set: async (/** @type {boolean} */ enabled) => (await switchState.set(enabled)).state,
+  };
   /** @type {string[]} */
   const sink = [];
   const log = createLogger({ level: 'debug', stream: { write: (/** @type {string} */ line) => sink.push(line) } });
@@ -270,7 +284,7 @@ async function startApp({ profile = 'full', allowBypass = false, terminal = fals
   const account = makeAccount();
   const app = createApp({
     config, log, engine: { kind: 'mock', sdkVersion: '0.3.295' }, engineHost, events, auth, workspaces, attachments,
-    terminal: terminalApi, account, bootId: BOOT, publicDir,
+    terminal: terminalApi, account, unattended, bootId: BOOT, publicDir,
   });
   const server = http.createServer((req, res) => {
     void app.handleRequest(req, res);
@@ -721,6 +735,7 @@ describe('route mapping', () => {
         accountLogin: true,
         browserTools: false,
         chrome: false,
+        unattended: { available: true, enabled: false, reason: null, changedAt: null },
       });
       assert.deepEqual(first.limits, { uploadMaxBytes: 26214400, imageMaxBytes: 5242880, maxLiveSessions: 4 });
 

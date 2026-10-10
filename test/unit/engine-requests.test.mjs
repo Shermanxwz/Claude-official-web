@@ -1,9 +1,9 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  RequestRegistry, refusalDialogOf, toDialogResult, toPermissionResult, toElicitationResult,
+  RequestRegistry, automaticAnswerOf, refusalDialogOf, toDialogResult, toPermissionResult, toElicitationResult,
 } from '../../src/engine/requests.mjs';
-import { AppError } from '../../src/contracts.mjs';
+import { AppError, UNATTENDED_QUESTION_MESSAGE } from '../../src/contracts.mjs';
 
 const S1 = '11111111-1111-4111-8111-111111111111';
 const S2 = '22222222-2222-4222-8222-222222222222';
@@ -690,5 +690,116 @@ describe('toDialogResult', () => {
     const answered = toDialogResult({ body: { result: 'edit_prompt' } });
     assert.deepEqual(answered, { behavior: 'completed', result: 'edit_prompt' });
     assert.deepEqual(toDialogResult({ cancelled: true, reason: 'aborted' }), { behavior: 'cancelled' });
+  });
+});
+
+describe('RequestRegistry unattended answers (docs/PROTOCOL.md "Unattended mode")', () => {
+  test('automaticAnswerOf gives the answer a person could give for each kind, and refuses an unknown kind', () => {
+    assert.deepEqual(automaticAnswerOf(permissionRequest()), { decision: 'allow' });
+    assert.deepEqual(automaticAnswerOf(questionRequest()), { decline: true });
+    assert.deepEqual(automaticAnswerOf(planRequest()), { decision: 'approve', nextMode: 'bypassPermissions' });
+    assert.deepEqual(automaticAnswerOf(elicitationRequest()), { action: 'decline' });
+    assert.deepEqual(automaticAnswerOf(dialogRequest()), { result: 'cancelled' });
+    assert.throws(() => automaticAnswerOf({ kind: 'unknown' }), TypeError);
+  });
+
+  test('answerAutomatically settles a pending request and publishes it as resolved with auto: true', async () => {
+    const { registry, events } = harness({ allowBypass: true });
+    const pending = registry.create(permissionRequest());
+    registry.answerAutomatically(S1, 'req-1');
+    assert.deepEqual(await pending, { body: { decision: 'allow' }, auto: true });
+    assert.deepEqual(events[1], {
+      type: 'request_resolved',
+      sessionId: S1,
+      data: { sessionId: S1, requestId: 'req-1', outcome: 'allowed', auto: true },
+    });
+    assert.equal(registry.count(S1), 0);
+  });
+
+  test('every kind is answered with its automatic answer and the outcome a person would get', async () => {
+    const { registry, events } = harness({ allowBypass: true });
+    const pendings = [
+      registry.create(permissionRequest({ id: 'a' })),
+      registry.create(questionRequest({ id: 'b' })),
+      registry.create(planRequest({ id: 'c' })),
+      registry.create(elicitationRequest({ id: 'd' })),
+      registry.create(dialogRequest({ id: 'e' })),
+    ];
+    for (const id of ['a', 'b', 'c', 'd', 'e']) registry.answerAutomatically(S1, id);
+    const outcomes = await Promise.all(pendings);
+    assert.deepEqual(outcomes, [
+      { body: { decision: 'allow' }, auto: true },
+      { body: { decline: true }, auto: true },
+      { body: { decision: 'approve', nextMode: 'bypassPermissions' }, auto: true },
+      { body: { action: 'decline' }, auto: true },
+      { body: { result: 'cancelled' }, auto: true },
+    ]);
+    assert.deepEqual(events.filter((event) => event.type === 'request_resolved').map((event) => [
+      event.data.requestId, event.data.outcome, event.data.auto,
+    ]), [['a', 'allowed', true], ['b', 'denied', true], ['c', 'allowed', true], ['d', 'denied', true],
+      ['e', 'answered', true]]);
+  });
+
+  test('an automatic plan approval asks for bypassPermissions, which the gateway must allow', async () => {
+    const { registry, events } = harness();
+    const pending = registry.create(planRequest({ id: 'p-off' }));
+    assertAppError(() => registry.answerAutomatically(S1, 'p-off'), 400, 'BAD_REQUEST');
+    assert.equal(registry.count(S1), 1);
+    assert.equal(events.length, 1);
+    registry.respond(S1, 'p-off', { decision: 'reject' });
+    assert.deepEqual(await pending, { body: { decision: 'reject' } });
+  });
+
+  test('answerAutomatically leaves unknown, settled and other-session requests alone', async () => {
+    const { registry, events } = harness();
+    registry.answerAutomatically(S1, 'missing');
+    const pending = registry.create(permissionRequest());
+    registry.respond(S1, 'req-1', { decision: 'deny' });
+    await pending;
+    const published = events.length;
+    registry.answerAutomatically(S1, 'req-1');
+    registry.answerAutomatically(S2, 'req-1');
+    assert.equal(events.length, published);
+  });
+
+  test('a person\'s answer is published without the auto flag, even after an automatic one', async () => {
+    const { registry, events } = harness({ allowBypass: true });
+    const automatic = registry.create(permissionRequest({ id: 'm-1' }));
+    registry.answerAutomatically(S1, 'm-1');
+    await automatic;
+    const manual = registry.create(permissionRequest({ id: 'm-2' }));
+    registry.respond(S1, 'm-2', { decision: 'allow' });
+    await manual;
+    const resolved = events.filter((event) => event.type === 'request_resolved');
+    assert.equal(resolved[0].data.auto, true);
+    assert.equal('auto' in resolved[1].data, false);
+    assert.deepEqual(resolved[1].data, { sessionId: S1, requestId: 'm-2', outcome: 'allowed' });
+  });
+
+  test('an automatic question denial tells the model to choose for itself; a person decline keeps its own message',
+    async () => {
+      const { registry } = harness();
+      const automatic = registry.create(questionRequest({ id: 'q-auto' }));
+      registry.answerAutomatically(S1, 'q-auto');
+      const manual = registry.create(questionRequest({ id: 'q-manual' }));
+      registry.respond(S1, 'q-manual', { decline: true });
+      assert.deepEqual(toPermissionResult(questionRequest({ id: 'q-auto' }), await automatic), {
+        behavior: 'deny', message: UNATTENDED_QUESTION_MESSAGE,
+      });
+      assert.deepEqual(toPermissionResult(questionRequest({ id: 'q-manual' }), await manual), {
+        behavior: 'deny', message: 'The user declined to answer.',
+      });
+    });
+
+  test('automatic answers map to the same SDK results as a person\'s answer of that kind', async () => {
+    const permission = permissionRequest();
+    assert.deepEqual(toPermissionResult(permission, { body: { decision: 'allow' }, auto: true }), {
+      behavior: 'allow', updatedInput: { command: 'ls' },
+    });
+    assert.deepEqual(toPermissionResult(planRequest(), { body: { decision: 'approve', nextMode: 'bypassPermissions' },
+      auto: true }), { behavior: 'allow', updatedInput: { plan: '1. do it' } });
+    assert.deepEqual(toElicitationResult({ body: { action: 'decline' }, auto: true }), { action: 'decline' });
+    assert.deepEqual(toDialogResult({ body: { result: 'cancelled' }, auto: true }),
+      { behavior: 'completed', result: 'cancelled' });
   });
 });

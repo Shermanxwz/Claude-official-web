@@ -26,7 +26,10 @@
  *  - command-output: { text }
  *  - result:         { subtype, durationMs, durationApiMs, numTurns, isError, interrupted, errors,
  *                      permissionDenials: [{toolName}], terminalReason, totalCostUsd }
- *  - request:        { request }   (PendingRequest, placed after the active turn)
+ *  - request:        { request }   (PendingRequest, placed after the active turn; it shows only once it has waited for
+ *                      the user for the attention delay, see addPending and settlePending)
+ *  - auto:           { requestKind, toolName, input, serverName, questionText }   (a request the gateway answered on
+ *                      its own in unattended mode: one muted record, no buttons)
  *  - generic:        { label, raw, diagnostic: true }   (unknown message types or subtypes, kept for diagnostics;
  *                      the view shows them only while the runtime-events preference is on)
  *
@@ -89,7 +92,9 @@ const INTERRUPT_NOTICES = new Map([
  *   discardOptimistic: (clientMessageId: string) => void,
  *   applyNotice: (notice: {code: string, level?: string, text?: string}) => void,
  *   setPending: (requests: Array<Record<string, any>>) => void,
- *   resolvePending: (requestId: string) => void,
+ *   addPending: (request: Record<string, any>) => boolean,
+ *   settlePending: (requestId: string) => void,
+ *   resolvePending: (requestId: string, options?: {auto?: boolean}) => void,
  *   setSessionState: (state: string|null) => void,
  *   getEntries: () => Array<Record<string, any>>,
  *   getVersion: () => number,
@@ -124,6 +129,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   let groupOf = new Map();
   /** @type {Map<Object, Flow>} */
   let childFlowOf = new Map();
+  /** @type {Set<string>} tool_use ids of the requests unattended mode answered */
+  let autoAnswered = new Set();
   /** @type {Map<string, Record<string, any>>} */
   let rowIndex = new Map();
   /** @type {Map<string, Flow>} */
@@ -151,6 +158,11 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
    */
   /** @type {Map<string, Record<string, any>>} */
   let known = new Map();
+  /**
+   * Requests the model was told about that have not waited for the user for the attention delay (addPending), by id.
+   * @type {Map<string, Record<string, any>>}
+   */
+  let arriving = new Map();
   /** @type {string|null} */
   let sessionState = null;
 
@@ -630,6 +642,35 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     const last = flow.entries[flow.entries.length - 1];
     if (last && last.kind === 'notice' && last.code === code && last.text === text) return;
     addNotice(flow, level, code, {}, text, null);
+  };
+
+  /**
+   * A request the gateway answered on its own (unattended mode: request_resolved with auto). It leaves one muted record
+   * in the flow of the tool it belongs to, else in the live turn. A record never has buttons.
+   * @param {Record<string, any>} request
+   */
+  const addAutoEntry = (request) => {
+    if (typeof request.toolUseId === 'string' && request.toolUseId) autoAnswered.add(request.toolUseId);
+    const tool = typeof request.toolUseId === 'string' ? toolIndex.get(request.toolUseId) : undefined;
+    const flow = (tool && containerOf.get(tool)) || liveFlow();
+    const server = isObject(request.mcpServer) ? request.mcpServer : {};
+    const elicitation = isObject(request.elicitation) ? request.elicitation : {};
+    const serverName = [server.name, elicitation.serverName].find((name) => typeof name === 'string' && name) ?? '';
+    const questions = isObject(request.input) && Array.isArray(request.input.questions) ? request.input.questions : [];
+    const questionText = questions
+      .map((question) => (isObject(question) && typeof question.question === 'string' ? question.question : ''))
+      .filter(Boolean)
+      .join('\n\n')
+      .slice(0, 2000);
+    pushEntry(flow, {
+      kind: 'auto',
+      key: `a:${request.id}`,
+      requestKind: typeof request.kind === 'string' ? request.kind : 'unknown',
+      toolName: typeof request.toolName === 'string' ? request.toolName : (tool?.name ?? ''),
+      input: isObject(request.input) ? request.input : {},
+      serverName,
+      questionText,
+    });
   };
 
   /** @param {any} raw @param {boolean} live @param {string|null} label @returns {Flow} */
@@ -1248,8 +1289,11 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     const errors = interrupted ? [] : rawErrors;
     const failed = !interrupted && (raw.is_error === true || subtype !== 'success');
     if (failed && errors.length === 0 && typeof raw.result === 'string' && raw.result) errors.push(raw.result);
+    // A question that unattended mode answered is recorded as such; the runtime still lists it as a denial.
     const denials = Array.isArray(raw.permission_denials)
-      ? raw.permission_denials.filter(isObject).map((denial) => ({ toolName: String(denial.tool_name ?? '') }))
+      ? raw.permission_denials.filter(isObject)
+        .filter((denial) => !autoAnswered.has(String(denial.tool_use_id ?? '')))
+        .map((denial) => ({ toolName: String(denial.tool_name ?? '') }))
       : [];
     pushEntry(flow, {
       kind: 'result',
@@ -1519,6 +1563,9 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       case 'notice':
         addInlineNotice(operation);
         break;
+      case 'auto':
+        addAutoEntry(operation.request);
+        break;
       default:
         break;
     }
@@ -1532,6 +1579,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     containerOf = new Map();
     groupOf = new Map();
     childFlowOf = new Map();
+    autoAnswered = new Set();
     rowIndex = new Map();
     flowOfUuid = new Map();
     bubbleCount = new Map();
@@ -2004,6 +2052,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       const next = [];
       for (const request of Array.isArray(requests) ? requests : []) {
         if (!isObject(request) || typeof request.id !== 'string') continue;
+        arriving.delete(request.id);
         const previous = pending.find((entry) => entry.request.id === request.id);
         if (previous && previous.request === request) {
           next.push(previous);
@@ -2019,16 +2068,54 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     },
 
     /**
-     * A request was answered or dropped. A refusal dialog that resolves evicts the refused messages it retracted,
-     * without a marker: the retry replaces them. The eviction is logged, so a replay keeps it.
+     * A live request the page has just learned of. It waits in `arriving` until settlePending moves it to the pending
+     * list the view shows, so a request the gateway resolves within the attention delay never shows: no card, no
+     * buttons and no signal.
+     * @param {Record<string, any>} request
+     * @returns {boolean} true when the request is new
+     */
+    addPending(request) {
+      if (!isObject(request) || typeof request.id !== 'string' || known.has(request.id)) return false;
+      known.set(request.id, request);
+      arriving.set(request.id, request);
+      return true;
+    },
+
+    /**
+     * A request has waited for the user for the attention delay: it joins the pending list and the render. Nothing
+     * happens for a request that was resolved meanwhile.
      * @param {string} requestId
      */
-    resolvePending(requestId) {
+    settlePending(requestId) {
+      const request = arriving.get(requestId);
+      if (!request) return;
+      arriving.delete(requestId);
+      const item = { request, version: 0 };
+      touch(item);
+      pending = [...pending, item];
+      relinkPending();
+    },
+
+    /**
+     * A request was answered or dropped. A refusal dialog that resolves evicts the refused messages it retracted,
+     * without a marker: the retry replaces them. The eviction is logged, so a replay keeps it. With `auto`, the gateway
+     * answered the request itself (unattended mode), and the timeline keeps one muted record of it.
+     * @param {string} requestId
+     * @param {{auto?: boolean}} [options]
+     */
+    resolvePending(requestId, { auto = false } = {}) {
       const request = known.get(requestId);
       known.delete(requestId);
+      arriving.delete(requestId);
       pending = pending.filter((entry) => entry.request.id !== requestId);
       relinkPending();
-      if (request && request.kind === 'dialog') {
+      if (!request) return;
+      if (auto) {
+        const record = { op: 'auto', request };
+        log.push(record);
+        apply(record);
+      }
+      if (request.kind === 'dialog') {
         const uuids = Array.isArray(request.dialog?.retractedMessageUuids)
           ? request.dialog.retractedMessageUuids.filter((id) => typeof id === 'string' && id !== '')
           : [];

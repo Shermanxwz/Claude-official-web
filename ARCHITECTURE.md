@@ -102,6 +102,7 @@ The gateway implements only what has no runtime interface:
 | Folder trust record for `settingSources` | Claude Code's trust is recorded through its `set_cwd` handshake; the gateway keeps its own record to decide which settings a query loads |
 | Writing a memory file the runtime listed | The terminal's `/memory` opens an editor; the runtime has no write control |
 | Conversation search | `listSessions` and `getSessionMessages` are read through the SDK; matching is the gateway's |
+| Unattended mode's automatic answers | The runtime's "never ask" is `bypassPermissions` (set through the official option and `setPermissionMode`); questions, plans, MCP forms and refusal dialogs still need an answer, which the gateway gives through the same `canUseTool`, `onElicitation` and `onUserDialog` callbacks a person's answer uses |
 
 Interfaces that are deliberately not used:
 

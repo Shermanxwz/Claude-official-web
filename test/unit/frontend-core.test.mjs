@@ -398,10 +398,11 @@ describe('ApiError and event types', () => {
     assert.equal(error.retryAfter, 3);
   });
 
-  it('lists the thirteen event types from docs/PROTOCOL.md, and the list is frozen', () => {
+  it('lists the fourteen event types from docs/PROTOCOL.md, and the list is frozen', () => {
     assert.deepEqual([...EVENT_TYPES].sort(), [
       'account_changed', 'heartbeat', 'hello', 'message_accepted', 'message_cancelled', 'notice', 'request',
       'request_resolved', 'resync', 'sdk', 'session_state', 'sessions_changed', 'terminal_state',
+      'unattended_changed',
     ]);
     assert.equal(Object.isFrozen(EVENT_TYPES), true);
   });

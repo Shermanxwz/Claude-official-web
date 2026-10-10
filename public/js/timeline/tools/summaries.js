@@ -513,3 +513,35 @@ export function describeActivity(name, input, t, cwd) {
     }
   }
 }
+
+/**
+ * The short target a tool acts on, for a one-line record: the path of a file tool, the command of Bash, the pattern
+ * of a search, the domain of WebFetch. Empty when the tool has no such target (MCP tools, TodoWrite). Never throws.
+ * @param {unknown} name
+ * @param {unknown} input
+ * @param {unknown} [cwd] session working directory, used to shorten paths
+ * @returns {string}
+ */
+export function toolTarget(name, input, cwd) {
+  const args = isRecord(input) ? input : {};
+  switch (str(name)) {
+    case 'Read':
+    case 'Write':
+    case 'Edit':
+    case 'MultiEdit':
+      return displayPath(args.file_path, cwd);
+    case 'NotebookEdit':
+      return displayPath(args.notebook_path, cwd);
+    case 'Bash':
+      return truncate(firstLine(args.command), 80);
+    case 'Grep':
+    case 'Glob':
+      return truncate(firstLine(args.pattern), 80);
+    case 'WebSearch':
+      return truncate(firstLine(args.query), 80);
+    case 'WebFetch':
+      return domainOf(args.url);
+    default:
+      return '';
+  }
+}

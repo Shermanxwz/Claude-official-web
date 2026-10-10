@@ -140,6 +140,13 @@ export const store = createStore({
   capabilities: {},
   /** GET /api/account, then account_changed: `{ account: AccountInfo | null, signInPending }`; null until loaded. */
   account: null,
+  /** The gateway's unattended switch (docs/PROTOCOL.md): from meta at boot, then unattended_changed and the PUT. */
+  unattended: null,
+  /**
+   * Requests that have waited for the user for ATTENTION_DELAY_MS (unattended.js), per session. The sidebar badge, the
+   * header's "Needs you" and the document title read this, never the raw pending list.
+   */
+  attention: {},
   terminal: {},
   tasks: {},
   prefs: { ...defaultPrefs(), ...loadPrefs() },

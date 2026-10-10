@@ -1050,6 +1050,44 @@ describe('control methods', () => {
     await assert.rejects(query.setMcpPermissionModeOverride('github', 'always'), /mode must be default, auto or null/);
   });
 
+  test('bypassPermissions asks only for the interaction tools: a question and a plan reach canUseTool', async (t) => {
+    /** @type {string[]} */
+    const asked = [];
+    const canUseTool = async (name, input) => {
+      asked.push(name);
+      if (name === 'AskUserQuestion') return { behavior: 'deny', message: 'Declined by the test.', interrupt: false };
+      return { behavior: 'allow', updatedInput: input };
+    };
+    const options = { canUseTool, permissionMode: 'bypassPermissions' };
+    const tool = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Please run a tool', options);
+    const [toolResult] = assertWellFormed(tool);
+    assert.equal(toolResult.subtype, 'success');
+    assert.deepEqual(asked, []);
+
+    const question = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Please ask a question', options);
+    const [questionResult] = assertWellFormed(question);
+    assert.equal(questionResult.subtype, 'success');
+    assert.deepEqual(asked, ['AskUserQuestion']);
+
+    const plan = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'Please make a plan', options);
+    const [planResult] = assertWellFormed(plan);
+    assert.equal(planResult.subtype, 'success');
+    assert.deepEqual(asked, ['AskUserQuestion', 'ExitPlanMode']);
+  });
+
+  test('setPermissionMode refuses bypassPermissions unless the query was launched with the bypass flag', async (t) => {
+    const { query } = await openQuery(t, tempDir(t), projectDir(t));
+    await assert.rejects(query.setPermissionMode('bypassPermissions'), {
+      message: 'Cannot set permission mode to bypassPermissions because the session was not launched with '
+        + '--dangerously-skip-permissions',
+    });
+    const { query: allowed } = await openQuery(t, tempDir(t), projectDir(t), { allowDangerouslySkipPermissions: true });
+    await allowed.setPermissionMode('bypassPermissions');
+    const status = await allowed.next();
+    assert.equal(status.value.subtype, 'status');
+    assert.equal(status.value.permissionMode, 'bypassPermissions');
+  });
+
   test('setPermissionMode and setModel announce a status, and the new model answers the next turn', async (t) => {
     const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
     await query.setPermissionMode('acceptEdits');

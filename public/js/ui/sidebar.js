@@ -19,6 +19,7 @@ import {
 import {
   SEARCH_LIMIT, scanLimitOf, searchRowVisible, segmentText, shortcutLabel, termRanges,
 } from './quick-switcher.js';
+import { attentionState, waitingCount } from '../unattended.js';
 
 const PAGE_SIZE = 100;
 const TIME_REFRESH_MS = 60 * 1000;
@@ -228,8 +229,11 @@ export function createSidebar({ container, api, store, t, actions }) {
    */
   function sessionRow(session, activeId) {
     const state = store.get();
-    const live = state.live[session.sessionId] ?? session.live ?? null;
-    const pendingCount = live?.pendingCount ?? state.pending[session.sessionId]?.length ?? 0;
+    const stored = state.live[session.sessionId] ?? session.live ?? null;
+    // Only requests that have waited for the user count (unattended.js), so a request answered at once shows nothing.
+    const pendingCount = waitingCount(state, session.sessionId);
+    const attention = attentionState(stored, pendingCount);
+    const live = stored && attention !== stored.state ? { ...stored, state: attention } : stored;
     const pendingKey = pendingCount === 1 ? 'shell.sidebar.pending.one' : 'shell.sidebar.pending.other';
     const selected = session.sessionId === activeId;
     const title = sessionTitle(session, t('shell.untitled'));
@@ -505,8 +509,8 @@ export function createSidebar({ container, api, store, t, actions }) {
     if (destroyed) return;
     if (state.meta !== prev.meta || state.auth !== prev.auth || state.connection !== prev.connection) renderChrome();
     if (state.sessions !== prev.sessions || state.live !== prev.live || state.pending !== prev.pending
-      || state.currentSessionId !== prev.currentSessionId || state.sessionsReady !== prev.sessionsReady
-      || state.sessionsHasMore !== prev.sessionsHasMore) {
+      || state.attention !== prev.attention || state.currentSessionId !== prev.currentSessionId
+      || state.sessionsReady !== prev.sessionsReady || state.sessionsHasMore !== prev.sessionsHasMore) {
       renderList();
     }
   });

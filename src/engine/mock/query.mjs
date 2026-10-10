@@ -131,6 +131,8 @@ const TOOL_NAMES = ['Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'WebFetch',
   'AskUserQuestion', 'ExitPlanMode'];
 /** Tools that acceptEdits mode runs without asking. */
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+/** Tools that ask the user under every permission mode, bypassPermissions included (requiresUserInteraction). */
+const INTERACTION_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
 /** The output styles Claude Code 2.1.x ships, with the names it reports. */
 const OUTPUT_STYLES = ['default', 'Proactive', 'Concise', 'Explanatory', 'Learning'];
 /** The filesystem settings sources a query loads when settingSources is omitted. */
@@ -378,6 +380,8 @@ async function* singlePrompt(text) {
  * @property {string} home the HOME the query runs with (the user's ~/.claude is read under it)
  * @property {string} model
  * @property {PermissionMode} permissionMode
+ * @property {boolean} allowBypass                  the query was launched with allowDangerouslySkipPermissions, so
+ *   setPermissionMode may choose bypassPermissions
  * @property {EffortLevel|null} effort
  * @property {string} outputStyle
  * @property {number} delayMs
@@ -703,6 +707,7 @@ export function createCore({
     home: typeof options.env?.HOME === 'string' && options.env.HOME !== '' ? options.env.HOME : homedir(),
     model: typeof options.model === 'string' ? options.model : MODEL_DEFAULT,
     permissionMode: startModeOf(options.permissionMode, { ...loaded, ...flagLayer }),
+    allowBypass: options.allowDangerouslySkipPermissions === true,
     effort: options.effort ?? null,
     outputStyle: 'default',
     delayMs,
@@ -1047,9 +1052,10 @@ export function sessionView(core) {
 }
 
 /**
- * Asks whether a tool call may run. The permission mode decides first: bypassPermissions allows everything,
- * acceptEdits allows edit tools and dontAsk denies. Without a canUseTool callback nothing can be asked, so the call is
- * denied, as the SDK does without a prompt tool. Otherwise the callback answers, and its request ends with the turn.
+ * Asks whether a tool call may run. The permission mode decides first: bypassPermissions allows everything except the
+ * interaction tools (AskUserQuestion, ExitPlanMode), which still ask under every mode; acceptEdits allows edit tools
+ * and dontAsk denies. Without a canUseTool callback nothing can be asked, so the call is denied, as the SDK does
+ * without a prompt tool. Otherwise the callback answers, and its request ends with the turn.
  * @param {SessionCore} core
  * @param {TurnState} turn
  * @param {string} toolName
@@ -1060,7 +1066,9 @@ export function sessionView(core) {
 export async function* askPermission(core, turn, toolName, input, detail) {
   const view = sessionView(core);
   const mode = core.permissionMode;
-  if (mode === 'bypassPermissions' || (mode === 'acceptEdits' && EDIT_TOOLS.has(toolName))) {
+  // The CLI checks requiresUserInteraction before its bypass branch, so the interaction tools still reach the prompt.
+  const bypassed = mode === 'bypassPermissions' && !INTERACTION_TOOLS.has(toolName);
+  if (bypassed || (mode === 'acceptEdits' && EDIT_TOOLS.has(toolName))) {
     return { allowed: true, input, updatedPermissions: [] };
   }
   if (mode === 'dontAsk' || turn.canUseTool === undefined) {
@@ -2202,6 +2210,11 @@ export function createControls({ open, isClosed, close, queue, store, runtime, o
       const current = live();
       if (!PERMISSION_MODES.some((candidate) => candidate === mode)) {
         throw new TypeError(`Unknown permission mode: ${String(mode)}`);
+      }
+      // The runtime's refusal (its bypass_not_launched code) for a query started without the bypass flag.
+      if (mode === 'bypassPermissions' && !current.allowBypass) {
+        throw new Error('Cannot set permission mode to bypassPermissions because the session was not launched with '
+          + '--dangerously-skip-permissions');
       }
       current.permissionMode = mode;
       announce(current, mode);

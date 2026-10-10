@@ -173,6 +173,25 @@ matter on a server:
 
 Restart the service after you change any of them.
 
+### Unattended mode
+
+To let sessions run without any approval (see the README's "Unattended mode"), add this line to
+`~/.config/claude-official-web/env` and restart the service:
+
+```bash
+CAW_UNATTENDED=1
+```
+
+It needs `CAW_ACCESS_PROFILE=full` (the default). The switch in Settings → Permissions can turn it off and on again;
+the last choice is saved in the state directory and wins over the variable after that. To make the switch available
+but off by default, set `CAW_ALLOW_BYPASS=1` instead.
+
+Claude Code refuses bypass mode when it runs as root, and the gateway then refuses to start with these settings. The
+service user created in step 2 is not root, so this applies only to a gateway that you run as root yourself. On a
+machine that is a dedicated sandbox, `IS_SANDBOX=1` in the same file lifts the restriction; anywhere else, run the
+gateway as its own user. Give that user only the folders and credentials the agent should have, and keep the projects
+in git, because nothing is reviewed before it runs.
+
 ### Browser tools on a headless server
 
 A server without a display cannot run Claude in Chrome, so use a browser MCP server instead. The gateway starts that

@@ -190,11 +190,14 @@ export function runtimeHasCommand(commands, name) {
 }
 
 /**
- * The composer footer's words for a permission mode (message keys under composer.modeWord).
+ * The composer footer's words for a permission mode (message keys under composer.modeWord). While unattended mode is
+ * on, the footer says so instead: every request is answered without a person, whatever mode the session chose.
  * @param {string|null|undefined} mode
+ * @param {{unattended?: boolean}} [options]
  * @returns {string} message key
  */
-export function modeWordKey(mode) {
+export function modeWordKey(mode, { unattended = false } = {}) {
+  if (unattended) return 'composer.modeWord.unattended';
   switch (mode) {
     case 'default': return 'composer.modeWord.default';
     case 'acceptEdits': return 'composer.modeWord.acceptEdits';
@@ -210,9 +213,11 @@ export function modeWordKey(mode) {
  * The short name of a permission mode for the footer on a phone ("Ask", "Accept edits"...). The full name stays in the
  * footer's tooltip and in the mode menu.
  * @param {string | null} mode
+ * @param {{unattended?: boolean}} [options]
  * @returns {string} the message key of the short name
  */
-export function modeShortKey(mode) {
+export function modeShortKey(mode, { unattended = false } = {}) {
+  if (unattended) return 'composer.modeShort.unattended';
   switch (mode) {
     case 'default': return 'composer.modeShort.default';
     case 'acceptEdits': return 'composer.modeShort.acceptEdits';

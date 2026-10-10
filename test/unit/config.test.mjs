@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { BYPASS_ROOT_MESSAGE } from '../../src/contracts.mjs';
 import { ConfigError, loadConfig } from '../../src/config.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -30,12 +31,14 @@ after(() => {
 });
 
 /**
- * Environment that is valid by default. HOME and the state directory point into the temporary tree.
+ * Environment that is valid by default. HOME and the state directory point into the temporary tree. IS_SANDBOX=1 keeps
+ * the root guard (bypass refused as root outside a sandbox) out of the tests that are not about it: the guard's own
+ * tests inject the user id and the environment they need.
  * @param {Record<string, string>} [extra]
  * @returns {Record<string, string>}
  */
 function env(extra = {}) {
-  return { HOME: root, CAW_TOKEN: TOKEN, CAW_STATE_DIR: path.join(root, 'state'), ...extra };
+  return { HOME: root, CAW_TOKEN: TOKEN, CAW_STATE_DIR: path.join(root, 'state'), IS_SANDBOX: '1', ...extra };
 }
 
 /**
@@ -369,5 +372,95 @@ describe('runtime options', () => {
     assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['npx', 'a\nb']) }, 'CAW_BROWSER_MCP_COMMAND');
     assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['./relative/server']) }, 'CAW_BROWSER_MCP_COMMAND');
     assertInvalid({ CAW_BROWSER_MCP_COMMAND: JSON.stringify(['x'.repeat(1025)]) }, 'CAW_BROWSER_MCP_COMMAND');
+  });
+});
+
+describe('unattended mode and the root guard', () => {
+  const ROOT_MESSAGE = 'Claude Code refuses bypass mode as root. Run the gateway as a normal user, or set '
+    + 'IS_SANDBOX=1 if this machine is a dedicated sandbox.';
+
+  /** The environment of a gateway with no sandbox marker: the root guard sees exactly these variables. */
+  function bare(extra = {}) {
+    return { HOME: root, CAW_TOKEN: TOKEN, CAW_STATE_DIR: path.join(root, 'state'), ...extra };
+  }
+
+  it('starts with the switch off and bypass unavailable by default', () => {
+    const config = loadConfig(env());
+    assert.equal(config.unattendedDefault, false);
+    assert.equal(config.allowBypass, false);
+  });
+
+  it('CAW_UNATTENDED=1 makes the switch on by default and bypass available', () => {
+    const config = loadConfig(env({ CAW_UNATTENDED: '1' }));
+    assert.equal(config.unattendedDefault, true);
+    assert.equal(config.allowBypass, true);
+  });
+
+  it('CAW_ALLOW_BYPASS=1 makes bypass available without making the switch on', () => {
+    const config = loadConfig(env({ CAW_ALLOW_BYPASS: '1' }));
+    assert.equal(config.allowBypass, true);
+    assert.equal(config.unattendedDefault, false);
+  });
+
+  it('CAW_UNATTENDED=1 needs the full profile, under read and standard alike', () => {
+    for (const profile of ['read', 'standard']) {
+      assert.throws(() => loadConfig(env({ CAW_UNATTENDED: '1', CAW_ACCESS_PROFILE: profile })),
+        (error) => error instanceof ConfigError
+          && error.message === 'CAW_UNATTENDED=1 requires CAW_ACCESS_PROFILE=full', profile);
+    }
+    assert.equal(loadConfig(env({ CAW_UNATTENDED: '0', CAW_ACCESS_PROFILE: 'read' })).unattendedDefault, false);
+  });
+
+  it('CAW_ALLOW_BYPASS=1 keeps its own message under the other profiles', () => {
+    assert.throws(() => loadConfig(env({ CAW_ALLOW_BYPASS: '1', CAW_ACCESS_PROFILE: 'standard' })),
+      (error) => error instanceof ConfigError && error.message === 'CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full');
+  });
+
+  it('CAW_UNATTENDED is read as a flag', () => {
+    assert.throws(() => loadConfig(env({ CAW_UNATTENDED: 'yes' })),
+      (error) => error instanceof ConfigError && error.message === 'CAW_UNATTENDED must be 0, 1, true or false');
+  });
+
+  it('refuses every bypass setting as root without a sandbox, with the documented message', () => {
+    for (const extra of [
+      { CAW_ALLOW_BYPASS: '1' },
+      { CAW_UNATTENDED: '1' },
+      { CAW_DEFAULT_PERMISSION_MODE: 'bypassPermissions' },
+      { CAW_ALLOW_BYPASS: '1', CAW_DEFAULT_PERMISSION_MODE: 'bypassPermissions' },
+    ]) {
+      assert.throws(() => loadConfig(bare(extra), { uid: 0 }),
+        (error) => error instanceof ConfigError && error.message === ROOT_MESSAGE, JSON.stringify(extra));
+    }
+    assert.equal(ROOT_MESSAGE, BYPASS_ROOT_MESSAGE);
+  });
+
+  it('accepts bypass as root when IS_SANDBOX=1 or a non-empty CLAUDE_CODE_BUBBLEWRAP is set', () => {
+    const sandboxes = [{ IS_SANDBOX: '1' }, { CLAUDE_CODE_BUBBLEWRAP: '/usr/bin/bwrap' }];
+    for (const sandbox of sandboxes) {
+      const config = loadConfig(bare({ CAW_UNATTENDED: '1', ...sandbox }), { uid: 0 });
+      assert.equal(config.allowBypass, true, JSON.stringify(sandbox));
+      assert.equal(config.unattendedDefault, true);
+    }
+    assert.equal(loadConfig(bare({ CAW_ALLOW_BYPASS: '1', IS_SANDBOX: '1' }), { uid: 0 }).allowBypass, true);
+  });
+
+  it('does not count IS_SANDBOX set to anything but 1, or a blank CLAUDE_CODE_BUBBLEWRAP, as a sandbox', () => {
+    for (const sandbox of [{ IS_SANDBOX: '0' }, { IS_SANDBOX: 'true' }, { CLAUDE_CODE_BUBBLEWRAP: '  ' }]) {
+      assert.throws(() => loadConfig(bare({ CAW_ALLOW_BYPASS: '1', ...sandbox }), { uid: 0 }),
+        (error) => error instanceof ConfigError && error.message === ROOT_MESSAGE, JSON.stringify(sandbox));
+    }
+  });
+
+  it('accepts bypass for a normal user, with or without a sandbox', () => {
+    assert.equal(loadConfig(bare({ CAW_ALLOW_BYPASS: '1' }), { uid: 1000 }).allowBypass, true);
+    assert.equal(loadConfig(bare({ CAW_UNATTENDED: '1' }), { uid: 1000 }).unattendedDefault, true);
+    assert.equal(loadConfig(bare({ CAW_DEFAULT_PERMISSION_MODE: 'bypassPermissions', CAW_ALLOW_BYPASS: '1' }),
+      { uid: 1000 }).defaults.permissionMode, 'bypassPermissions');
+  });
+
+  it('leaves root alone when no bypass setting is made', () => {
+    const config = loadConfig(bare({ CAW_DEFAULT_PERMISSION_MODE: 'default', CAW_ALLOW_BYPASS: '0' }), { uid: 0 });
+    assert.equal(config.allowBypass, false);
+    assert.equal(config.defaults.permissionMode, 'default');
   });
 });

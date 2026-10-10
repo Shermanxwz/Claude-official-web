@@ -222,7 +222,8 @@ describe('auth and security', { timeout: 120000 }, () => {
       assert.deepEqual(res.json.roots, [fresh.root]);
       assert.deepEqual(res.json.defaults, { model: null, permissionMode: null, effort: null, fallbackModel: null });
       assert.deepEqual(res.json.features, { terminal: false, bypass: false, uploads: true, backgroundTasks: true,
-        accountLogin: true, browserTools: false, chrome: false });
+        accountLogin: true, browserTools: false, chrome: false,
+        unattended: { available: false, enabled: false, reason: 'not-allowed', changedAt: null } });
       assert.deepEqual(res.json.limits, { uploadMaxBytes: 26214400, imageMaxBytes: 5242880, maxLiveSessions: 4 });
       assert.equal(res.json.bootId, (await client(fresh.url).get('/api/session')).json.bootId);
     } finally {

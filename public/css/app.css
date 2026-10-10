@@ -2482,6 +2482,11 @@ kbd {
   background: var(--accent-fg);
 }
 
+.switch:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
 .newsession {
   display: grid;
   gap: var(--space-4);

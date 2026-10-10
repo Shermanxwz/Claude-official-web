@@ -13,6 +13,7 @@ import { formatClock, mergeLive, sessionTitle } from './sidebar-model.js';
 import { mountRuntimePanel } from './runtime-panels.js';
 import { mountDeveloperPanel } from './devtools.js';
 import { mountAccountSection, planLabel, providerLabel } from './account.js';
+import { newerUnattended, normalizeUnattended, unattendedSwitch } from '../unattended.js';
 
 const PANEL_NAMES = ['session', 'capabilities', 'context', 'tasks', 'settings', 'runtime', 'developer'];
 /** Task states that can still produce output. */
@@ -1810,6 +1811,53 @@ function settingsPanel({ body, api, store, t, actions }) {
       runtimeEventsControl.sync(next);
     });
 
+  // Unattended mode is gateway-wide (docs/PROTOCOL.md): only the full access profile may switch it, and turning it on
+  // asks first. Turning it off needs no question.
+  let unattendedBusy = false;
+  const unattendedReason = h('p', { class: 'field-hint', attrs: { role: 'status' } });
+  const unattendedControl = switchControl(t('shell.settings.unattended'), false, (next) => {
+    if (next) confirmUnattended();
+    else putUnattended(false);
+  });
+  const syncUnattended = () => {
+    const state = store.get();
+    const view = unattendedSwitch(state.unattended, state.auth?.profile ?? state.meta?.profile ?? null);
+    unattendedControl.sync(view.checked);
+    unattendedControl.el.disabled = view.disabled || unattendedBusy;
+    const reasonText = view.reason === 'profile' ? t('shell.settings.unattended.profile')
+      : view.reason === 'not-allowed' ? t('shell.settings.unattended.notAllowed') : '';
+    unattendedReason.textContent = reasonText;
+    unattendedReason.hidden = reasonText === '';
+  };
+
+  /** Writes the switch. The answer is the gateway's state after the change, newer than any earlier one. */
+  async function putUnattended(/** @type {boolean} */ enabled) {
+    unattendedBusy = true;
+    syncUnattended();
+    try {
+      const answer = await api.setUnattended(enabled);
+      store.set({ unattended: newerUnattended(store.get().unattended, normalizeUnattended(answer)) });
+    } catch (err) {
+      actions.toast(errorText(err, t), 'error');
+    } finally {
+      unattendedBusy = false;
+      syncUnattended();
+    }
+  }
+
+  /** Turning unattended mode on: a dialog says what it does; its primary button switches it. */
+  function confirmUnattended() {
+    openDialog({
+      title: t('shell.unattended.confirmTitle'),
+      body: h('p', { class: 'dialog-text', text: t('shell.unattended.confirmBody') }),
+      size: 'sm',
+      actions: [
+        { label: t('common.cancel'), kind: 'secondary' },
+        { label: t('shell.unattended.confirm'), kind: 'primary', onClick: () => putUnattended(true) },
+      ],
+    });
+  }
+
   const accountEl = h('div', { class: 'account' });
   const disposeAccount = mountAccountSection(accountEl, { api, store, t, actions });
 
@@ -1826,6 +1874,12 @@ function settingsPanel({ body, api, store, t, actions }) {
         h('span', { class: 'settings-label', text: t('shell.settings.notifications') }),
         notifyControl.el),
       h('p', { class: 'field-hint', text: t('shell.settings.notificationsHint') })),
+    keyedSection('permissions', t('shell.settings.permissions'),
+      h('div', { class: 'settings-row' },
+        h('span', { class: 'settings-label', text: t('shell.settings.unattended') }),
+        unattendedControl.el),
+      h('p', { class: 'field-hint', text: t('shell.settings.unattendedHint') }),
+      unattendedReason),
     section(t('shell.settings.troubleshooting'),
       h('div', { class: 'settings-row' },
         h('span', { class: 'settings-label', text: t('shell.settings.runtimeEvents') }),
@@ -1841,7 +1895,14 @@ function settingsPanel({ body, api, store, t, actions }) {
     keyedSection('account', t('shell.settings.account'), accountEl),
   );
 
+  syncUnattended();
+  // The current state from the gateway, in case the page has missed a change.
+  api.unattended()
+    .then((answer) => store.set({ unattended: newerUnattended(store.get().unattended, normalizeUnattended(answer)) }))
+    .catch(() => {});
+
   const unsubscribe = store.subscribe((state, prev) => {
+    if (state.unattended !== prev.unattended || state.auth !== prev.auth || state.meta !== prev.meta) syncUnattended();
     if (state.prefs === prev.prefs) return;
     themeControl.sync(state.prefs.theme);
     fontControl.sync(state.prefs.fontSize);

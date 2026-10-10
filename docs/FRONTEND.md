@@ -311,6 +311,33 @@ monitor, copy, check, x, alert, info, edit, trash, fork, rewind, refresh, plug, 
 tool, image, paperclip, external, more, logout, globe, list, spark, layers, play, lock, unlock, brain, download,
 command, at.
 
+## Unattended mode
+
+The gateway's unattended switch (docs/PROTOCOL.md, "Unattended mode") is gateway-wide. The state lives in
+`store.unattended` (`UnattendedState`): read from `meta.features.unattended` at boot, refreshed by `unattended_changed`
+and by the answer to `PUT /api/unattended`, and read again when Settings opens. The newer state by `changedAt` wins
+(`newerUnattended`), so an answer to an older request cannot undo a change; a gateway restart (new `bootId`) takes its
+state as it is.
+
+- **Switch**: Settings → Permissions (`panels.js`, the `permissions` section that the header's pill opens). Turning
+  it on asks first (`openDialog`, the primary button switches it); turning it off needs no question. Only the full
+  access profile may switch it; other profiles and an unavailable gateway see it disabled with the reason
+  (`unattendedSwitch`). A failed write is a toast.
+- **Indicators while it is on**: the header's attention-toned pill (`hdr-unattended`, icon only on phones), the
+  header's permission select and the overflow's permission item disabled with the reason as tooltip, and the
+  composer's mode label "Unattended — no approvals". Shift+Tab and the composer's mode menu do nothing
+  (`modeCycleAllowed`).
+- **Attention**: `store.attention` counts, per session, the requests that have waited for the user for
+  `ATTENTION_DELAY_MS` (300 ms, `unattended.js`). The sidebar badge, the header's "Needs you" and the document title
+  read it; a session whose only request is answered inside the delay stays "running". A desktop notification fires
+  when a request settles, never for one answered sooner. The timeline's pending list follows the same rule: a request
+  enters the render only when it settles (`model.addPending`, `settlePending`).
+- **Automatic answers**: `request_resolved` with `auto: true` leaves one muted `auto` record in the timeline (`autoEl`
+  in `timeline/view.js`) instead of a card: "Allowed automatically (unattended)" with the tool and its target, the
+  question collapsed under "Question answered automatically", "Plan approved automatically", "Form declined
+  automatically" with the server, or "Not retried on the fallback model (unattended)". Records last for the page's
+  lifetime; a reload shows the transcript and the live events only.
+
 ## UX requirements
 
 - Desktop: sidebar (sessions grouped by project, search, new session), header (title, cwd, model, permission mode,

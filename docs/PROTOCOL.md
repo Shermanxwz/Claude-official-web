@@ -57,7 +57,15 @@ TypeScript notation; SDK types refer to `node_modules/@anthropic-ai/claude-agent
 - The bypass rule, stated once: `CAW_ALLOW_BYPASS=1` is accepted only with `CAW_ACCESS_PROFILE=full`, and under `read`
   or `standard` the gateway refuses to start with it (`CAW_ALLOW_BYPASS=1 requires CAW_ACCESS_PROFILE=full`). A default
   mode of `bypassPermissions` (`CAW_DEFAULT_PERMISSION_MODE`) needs the switch too. Without the switch, setting
-  `bypassPermissions` answers `501 FEATURE_DISABLED`, and `meta.features.bypass` is false.
+  `bypassPermissions` answers `501 FEATURE_DISABLED`, and `meta.features.bypass` is false. `CAW_UNATTENDED=1` (see
+  Unattended mode) turns the switch on by itself and follows the same profile rule.
+- Root: Claude Code exits at startup when it is allowed to bypass permissions (`allowDangerouslySkipPermissions`, the
+  CLI's `--allow-dangerously-skip-permissions`) or starts in `bypassPermissions` while it runs as root, unless its
+  environment has `IS_SANDBOX=1` or `CLAUDE_CODE_BUBBLEWRAP` set (verified in 2.1.295). The runtime inherits the
+  gateway's environment, so when the gateway's user id is 0 and neither variable is set, `CAW_ALLOW_BYPASS=1`,
+  `CAW_UNATTENDED=1` and `CAW_DEFAULT_PERMISSION_MODE=bypassPermissions` refuse to start with the message `Claude Code
+  refuses bypass mode as root. Run the gateway as a normal user, or set IS_SANDBOX=1 if this machine is a dedicated
+  sandbox.`
 
 ## Auth and meta
 
@@ -88,7 +96,8 @@ Rate limit: 10 failed attempts per 10 minutes per client address → `429 RATE_L
               uploads: boolean, backgroundTasks: boolean,  // see POST /api/sessions/:id/background
               accountLogin: boolean,                 // the engine can run Claude Code's own sign-in (see Account)
               browserTools: boolean,                 // CAW_BROWSER_MCP_COMMAND is configured (see Browser tools)
-              chrome: boolean },                     // CAW_CHROME=1: queries start with --chrome
+              chrome: boolean,                       // CAW_CHROME=1: queries start with --chrome
+              unattended: UnattendedState },         // see Unattended mode
   limits: { uploadMaxBytes: number, imageMaxBytes: number, maxLiveSessions: number } }
 ```
 
@@ -344,7 +353,8 @@ Body depends on the request kind:
 // question (AskUserQuestion)
 { answers: Record<string, string | string[]>, response?: string } | { decline: true }
 // plan (ExitPlanMode)
-{ decision: 'approve' | 'reject', message?: string, nextMode?: 'default'|'acceptEdits'|'auto' }
+{ decision: 'approve' | 'reject', message?: string,
+  nextMode?: 'default'|'acceptEdits'|'auto'|'bypassPermissions' /* bypassPermissions only when bypass is allowed */ }
 // elicitation (MCP)
 { action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown> }
 // dialog (refusal_fallback_prompt)
@@ -559,6 +569,61 @@ needs profile `full`. Without the command, such a request answers `501 FEATURE_D
 The user never supplies the command. Screenshots the server returns are image blocks in its tool results and render in
 the MCP tool card.
 
+## Unattended mode
+
+The equivalent of Codex's `approvalPolicy: 'never'` with `danger-full-access`: one gateway-wide switch under which
+nothing waits for a person. It uses only official interfaces: the `bypassPermissions` permission mode (with
+`allowDangerouslySkipPermissions`), `setPermissionMode` for live queries, and the gateway's own answers to the requests
+the runtime raises.
+
+```ts
+type UnattendedState = { available: boolean,  // the switch can be on: bypass is allowed (see Access profiles)
+                         enabled: boolean,    // the switch is on (always false while unavailable)
+                         reason: null | 'not-allowed' | 'profile',  // why it is unavailable
+                         changedAt: number | null }                 // when it was last switched, ms since epoch
+```
+
+- Availability: `available` is `meta.features.bypass`. `reason` is `'profile'` when the access profile is not `full`,
+  and `'not-allowed'` when neither `CAW_ALLOW_BYPASS=1` nor `CAW_UNATTENDED=1` is set. (Root without a sandbox never
+  reaches this point: it refuses to start, see Access profiles.)
+- State: the switch is kept in `<stateDir>/unattended.json` (`{enabled, changedAt}`) and survives restarts. When that
+  file does not exist, the switch starts as `CAW_UNATTENDED` says (default `0`). While unavailable it reads
+  `enabled: false`, and the saved value is kept for when it becomes available again.
+- `GET /api/unattended` → `UnattendedState` (profile `read`).
+- `PUT /api/unattended` `{ enabled: boolean }` → `UnattendedState` (profile `full`; the body is checked first:
+  `400 BAD_REQUEST` for anything but exactly `{enabled: boolean}`, then `501 FEATURE_DISABLED` while unavailable). Saves
+  the switch, applies it to every live session as below, and publishes `unattended_changed` when the value changed.
+  Switching on a live query that fails is logged and the session stays open (its requests are still answered
+  automatically); switching off a live query that fails closes that session, so no session stays in
+  `bypassPermissions` after the switch is off.
+
+While the switch is on:
+
+1. **Permission mode.** Every query the gateway starts (new, resumed, reopened, restarted, forked) starts with
+   `permissionMode: 'bypassPermissions'`, whatever mode the session chose; the chosen mode is kept, not overwritten.
+   Turning the switch on calls `setPermissionMode('bypassPermissions')` on every live query. Turning it off returns
+   each live query to the mode it had before the switch changed it (`'default'` when that mode was not known), with
+   `setPermissionMode`. `LiveInfo.permissionMode` reports what the runtime runs. `POST /api/sessions/:id/settings` with
+   a `permissionMode` stores it as the session's chosen mode, applied when the switch turns off; the live query stays
+   in `bypassPermissions`.
+2. **Requests.** The gateway answers every request itself, at once, with an answer a person could give:
+
+   | kind | automatic answer |
+   |---|---|
+   | `permission` | allow once (`{decision: 'allow'}`; no suggestion is saved) |
+   | `question` (AskUserQuestion) | deny with the message below |
+   | `plan` (ExitPlanMode) | approve, with `nextMode: 'bypassPermissions'` |
+   | `elicitation` (MCP) | decline (`{action: 'decline'}`); no form is filled in on the user's behalf |
+   | `dialog` (refusal fallback) | the result `cancelled` (outcome `answered`), as if a person chose Cancel: a refused turn is never retried on another model |
+
+   The question message: `The user is away (unattended mode) and cannot answer. Do not ask again: choose the option
+   that best fits the request, say which one you chose and why, and continue.` The request is still published
+   (`request`) and then resolved (`request_resolved` with `auto: true`), so the conversation keeps a record of what was
+   asked and how it was answered. Requests already pending when the switch turns on are answered the same way at once.
+   Subagents inherit the parent's permission mode, so they run unattended too.
+3. Nothing else changes: the idle sweep, background tasks, interrupts and every other route behave as usual, and the
+   switch never changes folder trust.
+
 ## Account (Claude Code's own sign-in)
 
 Claude Code's `/login`, run by the runtime itself; the gateway never reads or writes credentials. The calls go to a
@@ -617,10 +682,11 @@ Global events are delivered to every client; `sdk` events only for the watched s
 | `session_state` | `{ live: LiveInfo }` or `{ sessionId, live: null }` when closed | global |
 | `sdk` | `{ sessionId, msg: SDKMessage }` | watched session only |
 | `request` | `{ request: PendingRequest }` | global |
-| `request_resolved` | `{ sessionId, requestId, outcome: 'allowed'|'denied'|'answered'|'cancelled' }` | global |
+| `request_resolved` | `{ sessionId, requestId, outcome: 'allowed'|'denied'|'answered'|'cancelled', auto?: true }` | global — `auto: true` when unattended mode answered it |
 | `message_accepted` | `{ sessionId, clientMessageId }` | global |
 | `message_cancelled` | `{ sessionId, clientMessageId }` | global — a queued message the runtime dropped |
 | `account_changed` | `{ account: AccountInfo|null }` | global — after a sign-in through the GUI |
+| `unattended_changed` | `UnattendedState` | global — the unattended switch changed (see Unattended mode) |
 | `notice` | `{ sessionId?, level: 'info'|'warning'|'error', code, message }` | global |
 | `terminal_state` | `{ sessionId, attached: boolean }` | global |
 

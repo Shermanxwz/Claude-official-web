@@ -43,7 +43,7 @@ export const LIVE_STATES = /** @type {const} */ (['starting', 'idle', 'running',
 export const REQUEST_KINDS = /** @type {const} */ (['permission', 'question', 'plan', 'elicitation', 'dialog']);
 export const EVENT_TYPES = /** @type {const} */ (['hello', 'heartbeat', 'resync', 'sessions_changed',
   'session_state', 'sdk', 'request', 'request_resolved', 'message_accepted', 'message_cancelled', 'account_changed',
-  'notice', 'terminal_state']);
+  'unattended_changed', 'notice', 'terminal_state']);
 /** Dialog kinds of the runtime's request_user_dialog that the gateway renders (declared as supportedDialogKinds). */
 export const DIALOG_KINDS = /** @type {const} */ (['refusal_fallback_prompt']);
 /** Answers of a refusal_fallback_prompt dialog. */
@@ -71,6 +71,12 @@ export const RUNTIME_VIEWS = Object.freeze({
 });
 /** Name of the operator's browser MCP server when a session attaches it (docs/PROTOCOL.md "Browser tools"). */
 export const BROWSER_MCP_SERVER = 'browser';
+/** What unattended mode tells the model when it asks the user a question (docs/PROTOCOL.md "Unattended mode"). */
+export const UNATTENDED_QUESTION_MESSAGE = 'The user is away (unattended mode) and cannot answer. Do not ask again: '
+  + 'choose the option that best fits the request, say which one you chose and why, and continue.';
+/** Why bypass mode cannot run: Claude Code refuses it as root outside a deliberate sandbox. */
+export const BYPASS_ROOT_MESSAGE = 'Claude Code refuses bypass mode as root. Run the gateway as a normal user, or set '
+  + 'IS_SANDBOX=1 if this machine is a dedicated sandbox.';
 /** Event types delivered only to clients watching the event's session. */
 export const SESSION_SCOPED_EVENTS = /** @type {const} */ (['sdk']);
 export const UPLOAD_DIR_NAME = '.caw-uploads';
@@ -102,7 +108,8 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {{model: string|null, permissionMode: PermissionMode|null, effort: EffortLevel|null,
  *   fallbackModel: string|null}} defaults   permissionMode null (default) = Claude Code's settings decide
  * @property {boolean} terminal
- * @property {boolean} allowBypass
+ * @property {boolean} allowBypass          CAW_ALLOW_BYPASS=1 or CAW_UNATTENDED=1 (full profile only)
+ * @property {boolean} unattendedDefault    CAW_UNATTENDED=1: the unattended switch's value when none is saved
  * @property {boolean} chrome               CAW_CHROME=1: queries start with the CLI's --chrome flag
  * @property {string[]|null} browserMcpCommand   CAW_BROWSER_MCP_COMMAND (command + args), null when unset
  * @property {boolean} backgroundTasksDisabled   CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is set (non-empty, not 0/false)
@@ -115,6 +122,15 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {number} sessionTtlMs
  * @property {boolean} trustProxy
  * @property {'debug'|'info'|'warn'|'error'} logLevel
+ */
+
+/**
+ * The gateway-wide unattended switch (docs/PROTOCOL.md "Unattended mode").
+ * @typedef {Object} UnattendedState
+ * @property {boolean} available     bypass is allowed on this gateway (meta.features.bypass)
+ * @property {boolean} enabled       the switch is on; always false while unavailable
+ * @property {null|'not-allowed'|'profile'} reason   why it is unavailable
+ * @property {number|null} changedAt when it was last switched (ms since epoch), null when never
  */
 
 /**

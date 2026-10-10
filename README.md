@@ -52,6 +52,9 @@ This is an overview. The complete map, with the SDK call or message behind each 
   file (`/export`), and a session list grouped by project. Search matches the titles and first prompts of every
   conversation, and the message text of the 50 most recently changed ones (within 5 seconds). A quick switcher (Ctrl+K,
   or ⌘K on a Mac) finds sessions by title and runs the same search.
+- **Unattended mode:** one switch under which nothing waits for you: Claude runs every tool without asking, decides
+  its own questions and approves its own plans, like a Codex setup that never asks (see
+  [Unattended mode](#unattended-mode)).
 - **Session settings:** an agent, additional directories, a fallback model and browser tools for each session. A change
   to the fallback model applies after a restart, and a change to the additional directories restarts a live session.
 - **Input:** slash commands from Claude Code (skills, custom commands and MCP prompts, plus the built-in commands that
@@ -199,7 +202,8 @@ names the variable, and the exit status is 2.
 | `CAW_CHROME` | `0` | `1` starts each query with Claude in Chrome (the CLI's `--chrome` flag). It needs a claude.ai sign-in, and Chrome with the Claude in Chrome extension on the gateway's machine. |
 | `CAW_BROWSER_MCP_COMMAND` | unset | A JSON array with the command and its arguments for a browser MCP server, for example `["npx","-y","@playwright/mcp@0.0.82","--headless","--isolated"]`. Sessions can switch it on as the `browser` server. The array holds 1 to 32 strings of up to 1024 characters; the first is an absolute path or a bare command name. |
 | `CAW_TERMINAL` | `0` | `1` enables the terminal tab. It needs the `full` profile and node-pty, and it is equivalent to shell access. |
-| `CAW_ALLOW_BYPASS` | `0` | `1` allows the `bypassPermissions` mode, including as the default mode. It needs `CAW_ACCESS_PROFILE=full`; under `read` or `standard` the gateway refuses to start with it. |
+| `CAW_ALLOW_BYPASS` | `0` | `1` allows the `bypassPermissions` mode, including as the default mode, and makes the unattended switch available. It needs `CAW_ACCESS_PROFILE=full`; under `read` or `standard` the gateway refuses to start with it. As root it also needs `IS_SANDBOX=1` (see [Unattended mode](#unattended-mode)). |
+| `CAW_UNATTENDED` | `0` | `1` turns on [unattended mode](#unattended-mode) by default and implies `CAW_ALLOW_BYPASS=1`. The switch in Settings can still turn it off; the saved choice wins after that. Needs the `full` profile. |
 | `CAW_IDLE_TIMEOUT_MS` | `1800000` (30 minutes) | Idle live sessions close after this time, from 60000 to 86400000 milliseconds, and resume when you send the next message. |
 | `CAW_MAX_LIVE_SESSIONS` | `4` | The maximum number of live Claude Code processes at once, from 1 to 32. |
 | `CAW_UPLOAD_MAX_BYTES` | `26214400` (25 MiB) | The largest accepted attachment, from 1 KiB to 1 GiB. |
@@ -242,6 +246,26 @@ The full threat model and the list of controls are in [SECURITY.md](SECURITY.md)
 - Model output is untrusted. Markdown is sanitized, and tool output is shown as text.
 - Permissions are Claude Code's own. Approve only what you have read: an approved command runs with the service user's
   full authority. Browser tools have the same authority; see [Browser](#browser).
+
+## Unattended mode
+
+The equivalent of a "never ask" Codex setup (`approvalPolicy: 'never'` with `danger-full-access`): one switch under
+which nothing waits for you. Claude runs every tool without asking (Claude Code's `bypassPermissions` mode), its
+questions are answered with "decide yourself, say which option you chose and why", its plans are approved, MCP forms
+are declined, and a refused answer is not retried on another model. Each automatic answer leaves one line in the
+conversation, so you can see afterwards what was asked. Subagents inherit the mode.
+
+- Turn it on for the server with `CAW_UNATTENDED=1` (it needs `CAW_ACCESS_PROFILE=full`). It is then on by default,
+  and anyone with the `full` profile can switch it off and on again in Settings → Permissions. The choice is saved in
+  the state directory and survives restarts. With only `CAW_ALLOW_BYPASS=1`, the switch is available but starts off.
+- While it is on, the header shows an **Unattended** pill and the permission mode is fixed. Turning it off returns each
+  live session to the mode it had before.
+- Claude Code refuses bypass mode when it runs as root. Run the gateway as a normal user (the installer's default), or,
+  on a machine that is a dedicated sandbox, set `IS_SANDBOX=1` in the service environment. As root without either, the
+  gateway refuses to start with the bypass settings and says why.
+
+Unattended means that whatever a file, a web page or a tool result tells the model can be acted on without review, with
+the service user's authority. Use it on a machine or user account dedicated to the agent, with backups and git.
 
 ## Browser
 

@@ -27,7 +27,7 @@ export class ApiError extends Error {
 /** Every event type the gateway can send (docs/PROTOCOL.md, Events). */
 export const EVENT_TYPES = Object.freeze([
   'hello', 'heartbeat', 'resync', 'sessions_changed', 'session_state', 'sdk', 'request', 'request_resolved',
-  'message_accepted', 'message_cancelled', 'account_changed', 'notice', 'terminal_state',
+  'message_accepted', 'message_cancelled', 'account_changed', 'unattended_changed', 'notice', 'terminal_state',
 ]);
 
 const RECONNECT_MIN_MS = 1000;
@@ -246,6 +246,17 @@ export const api = {
   /** @param {string} path */
   del(path) {
     return send('DELETE', path);
+  },
+  /** GET /api/unattended: the gateway's unattended switch (profile read). */
+  unattended() {
+    return send('GET', '/api/unattended');
+  },
+  /**
+   * PUT /api/unattended: turns the gateway's unattended switch on or off (profile full).
+   * @param {boolean} enabled
+   */
+  setUnattended(enabled) {
+    return sendJson('PUT', '/api/unattended', { enabled });
   },
   /**
    * Upload one file into `<cwd>/.caw-uploads`. Progress requires XMLHttpRequest, so it is used only when

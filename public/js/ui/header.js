@@ -4,6 +4,7 @@ import { clear, h, icon } from '../dom.js';
 import { effortLevelsFor, effortModelFor, fastModeView, modelSelectPlan } from './composer-logic.js';
 import { openDialog } from './dialog.js';
 import { openMenu } from './menu.js';
+import { attentionState, waitingCount } from '../unattended.js';
 
 /**
  * Session header: title, working directory, model / permission / effort and fast mode controls, the background tasks
@@ -193,6 +194,14 @@ export function createHeader({ container, api, store, t, actions }) {
   const badgeText = h('span', { class: 'state-text' });
   const badge = h('span', { class: 'state-badge' }, spinner, badgeText);
 
+  // Shown while the gateway's unattended mode is on: Claude runs without asking. A click opens the switch in Settings.
+  // Phones keep only the icon (the composer's label names the mode there).
+  const unattendedBtn = /** @type {HTMLButtonElement} */ (h('button', {
+    class: 'hdr-unattended',
+    attrs: { type: 'button', hidden: true, title: t('header.unattended.tip'), 'aria-label': t('header.unattended') },
+    on: { click: () => actions.openPanel('settings', { section: 'permissions' }) },
+  }, icon('bot'), h('span', { class: 'hdr-unattended-text', text: t('header.unattended') })));
+
   const moreBtn = h('button', {
     class: 'hdr-icon-btn hdr-more',
     attrs: { type: 'button', 'aria-haspopup': 'menu', 'aria-label': t('header.more') },
@@ -200,7 +209,7 @@ export function createHeader({ container, api, store, t, actions }) {
   }, icon('more'));
 
   const controls = h('div', { class: 'hdr-controls' }, modelSel, modeSel, effortSel, fastBtn, fastNote, ctxBtn);
-  const right = h('div', { class: 'hdr-right' }, controls, tasksBtn, badge, moreBtn);
+  const right = h('div', { class: 'hdr-right' }, controls, tasksBtn, unattendedBtn, badge, moreBtn);
   const root = h('header', { class: 'session-header' }, left, right);
   container.appendChild(root);
 
@@ -286,6 +295,7 @@ export function createHeader({ container, api, store, t, actions }) {
     const readOnly = profile === 'read';
     const locked = Boolean(id && (live?.lockedBy === 'terminal' || s.terminal?.[id]?.attached));
     const editable = hasSession && !readOnly && !locked;
+    const unattendedOn = s.unattended?.enabled === true;
 
     root.classList.toggle('is-empty', !hasSession);
     const agent = hasSession && typeof live?.agent === 'string' ? live.agent : '';
@@ -308,7 +318,9 @@ export function createHeader({ container, api, store, t, actions }) {
       view.cwd = '';
     }
 
-    const badgeKey = !hasSession ? null : locked ? 'locked' : live ? live.state : 'closed';
+    // "Needs you" only while a request waits for the user; a request the gateway answers at once reads as running.
+    const shownState = live ? attentionState(live, waitingCount(s, id)) : null;
+    const badgeKey = !hasSession ? null : locked ? 'locked' : shownState ?? 'closed';
     badge.hidden = !badgeKey;
     if (badgeKey) {
       badge.dataset.state = badgeKey;
@@ -348,9 +360,10 @@ export function createHeader({ container, api, store, t, actions }) {
     fillSelect(modeSel, modeOptions, modeValue);
     fillSelect(effortSel, effortOptions, effortValue);
     modelSel.disabled = !editable;
-    modeSel.disabled = !editable;
+    modeSel.disabled = !editable || unattendedOn;
     effortSel.disabled = !editable;
-    modeSel.title = modeValue ? t(`common.mode.${modeValue}.hint`) : t('composer.modeWord.settings');
+    modeSel.title = unattendedOn ? t('header.unattended.tip')
+      : modeValue ? t(`common.mode.${modeValue}.hint`) : t('composer.modeWord.settings');
     effortSel.hidden = levels.length === 0;
 
     const fast = fastView(models, defaults.model ?? null, live, settings);
@@ -370,6 +383,7 @@ export function createHeader({ container, api, store, t, actions }) {
     if (background > 0) tasksText.textContent = t('header.background', { count: background });
 
     controls.hidden = !hasSession;
+    unattendedBtn.hidden = !unattendedOn;
     view.options = { model: modelPlan.options, mode: modeOptions, effort: effortOptions.slice(1) };
     view.selected = { model: modelPlan.value, mode: modeValue, effort: effortValue };
 
@@ -549,6 +563,7 @@ export function createHeader({ container, api, store, t, actions }) {
     const live = id ? (s.live?.[id] ?? null) : null;
     const locked = Boolean(id && (live?.lockedBy === 'terminal' || s.terminal?.[id]?.attached));
     const editable = Boolean(id) && !readOnly && !locked;
+    const unattendedOn = s.unattended?.enabled === true;
     // The runtime refuses a rewind while a turn runs or a request waits (409 CONFLICT), so the item waits too.
     const busy = Boolean(id) && (BUSY_STATES.includes(live?.state) || (s.pending?.[id]?.length ?? 0) > 0);
     const mobile = globalThis.matchMedia?.(MOBILE_QUERY)?.matches === true;
@@ -560,16 +575,19 @@ export function createHeader({ container, api, store, t, actions }) {
       items.push(menuItem('header.capabilities', 'plug', () => actions.openPanel('capabilities')));
       items.push(menuItem('header.tasks', 'layers', () => actions.openPanel('tasks')));
       if (mobile) {
-        const pick = (key, iconName, options, selected, onChoose) => items.push(menuItem(key, iconName, () => {
-          openChoice(key, options, selected, onChoose);
-        }, {
-          disabled: !editable,
-          label: `${t(key)}: ${options.find((o) => o.value === selected)?.label ?? selected}`,
-        }));
+        /** @param {Record<string, unknown>} [extra] menu item fields that override the defaults */
+        const pick = (key, iconName, options, selected, onChoose, extra = {}) => items.push(menuItem(key, iconName,
+          () => openChoice(key, options, selected, onChoose), {
+            disabled: !editable,
+            label: `${t(key)}: ${options.find((o) => o.value === selected)?.label ?? selected}`,
+            ...extra,
+          }));
         pick('header.model', 'cpu', view.options.model, view.selected.model,
           (value) => commitChange({ model: value || null }));
+        // Unattended mode answers every request itself, so the permission mode is fixed while it is on.
         pick('header.permissionMode', 'shield', view.options.mode, view.selected.mode,
-          (value) => { if (value) commitChange({ permissionMode: value }); });
+          (value) => { if (value) commitChange({ permissionMode: value }); },
+          unattendedOn ? { disabled: true, title: t('header.unattended.tip') } : {});
         if (view.options.effort.length > 0) {
           const effortChoices = [{ value: '', label: t('header.effortDefault') }, ...view.options.effort];
           pick('header.effortLabel', 'gauge', effortChoices, view.selected.effort,

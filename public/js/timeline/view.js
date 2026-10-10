@@ -6,11 +6,12 @@ import { h, clear, icon } from '../dom.js';
 import { errorText } from '../api.js';
 import { createModel } from './model.js';
 import { renderTool } from './tools/index.js';
-import { describeActivity } from './tools/summaries.js';
+import { describeActivity, toolTarget } from './tools/summaries.js';
 import { renderRequest } from './requests.js';
 import { renderMarkdown } from '../markdown.js';
 import { formatDuration, formatTokens, truncateMiddle, pluralKey } from './format.js';
 import { getLocale } from '../i18n.js';
+import { createAttentionTracker } from '../unattended.js';
 
 /** Window event that asks every timeline to reload one session's snapshot. `detail: { sessionId }`. */
 export const TIMELINE_RELOAD_EVENT = 'caw:timeline-reload';
@@ -21,6 +22,14 @@ const NOTE_COLLAPSE_CHARS = 160;
 const GENERIC_JSON_LIMIT = 20000;
 /** Event types that wait in the queue while the session's history loads, then replay in order. */
 const QUEUED_WHILE_LOADING = new Set(['sdk', 'request', 'request_resolved', 'notice', 'message_cancelled']);
+/** The line an automatic answer (unattended mode) leaves, by request kind. */
+const AUTO_HEADLINES = new Map([
+  ['permission', 'cards.auto.permission'],
+  ['question', 'cards.auto.question'],
+  ['plan', 'cards.auto.plan'],
+  ['elicitation', 'cards.auto.elicitation'],
+  ['dialog', 'cards.auto.dialog'],
+]);
 
 /**
  * @typedef {Object} Env
@@ -55,7 +64,6 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     sessionId: /** @type {string|null} */ (null),
     model: newModel(),
     liveState: /** @type {string|null} */ (null),
-    pendingList: /** @type {Array<Record<string, any>>} */ ([]),
     loading: false,
     loadError: /** @type {null | 'error' | 'notFound'} */ (null),
     hasMore: false,
@@ -117,6 +125,15 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
       render();
     });
   };
+
+  // A live request shows only once it has waited for the user (unattended.js). One the gateway answers sooner leaves no
+  // card, button or signal behind, only the record of its answer.
+  const attention = createAttentionTracker({
+    onSettle: (request) => {
+      state.model.settlePending(request.id);
+      scheduleRender();
+    },
+  });
 
   // The runtime-events preference shows or hides the diagnostic rows. The store reports every change, and the timeline
   // re-renders only when its reading of the preference actually changed.
@@ -192,11 +209,11 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     const token = ++state.loadToken;
     state.sessionId = sessionId;
     state.model = newModel();
+    attention.reset();
     // The composer was reset for the new session, so the first render sends its todos and activity again.
     state.publishedTodos = undefined;
     state.publishedActivity = undefined;
     state.liveState = null;
-    state.pendingList = [];
     state.loading = true;
     state.loadError = null;
     state.queue = [];
@@ -219,8 +236,8 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
       for (const event of Array.isArray(detail?.liveEvents) ? detail.liveEvents : []) {
         state.model.applyLiveEvent(event?.msg);
       }
-      state.pendingList = Array.isArray(detail?.pending) ? detail.pending : [];
-      state.model.setPending(state.pendingList);
+      // Requests the snapshot holds have waited already, so they show at once.
+      state.model.setPending(Array.isArray(detail?.pending) ? detail.pending : []);
       state.liveState = detail?.live ? detail.live.state : 'closed';
       state.model.setSessionState(state.liveState);
       for (const entry of carried) restoreOptimistic(state.model, entry);
@@ -261,16 +278,14 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
       case 'request': {
         const request = data.request;
         if (!request || request.sessionId !== state.sessionId) return;
-        state.pendingList = state.pendingList.filter((item) => item.id !== request.id).concat([request]);
-        state.model.setPending(state.pendingList);
+        if (state.model.addPending(request)) attention.arrived(request);
         break;
       }
       case 'request_resolved': {
         if (data.sessionId !== state.sessionId) return;
-        // The model evicts what a resolved dialog retracted before the pending list drops the request.
-        state.model.resolvePending(data.requestId);
-        state.pendingList = state.pendingList.filter((item) => item.id !== data.requestId);
-        state.model.setPending(state.pendingList);
+        // A request answered inside the attention delay never shows. The model evicts what a resolved dialog retracted.
+        attention.resolved(data.requestId);
+        state.model.resolvePending(data.requestId, { auto: data.auto === true });
         break;
       }
       case 'message_cancelled': {
@@ -411,6 +426,7 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
   const destroy = () => {
     state.destroyed = true;
     state.controller?.abort();
+    attention.reset();
     if (state.frame) cancelAnimationFrame(state.frame);
     refs.scroller.removeEventListener('scroll', onScroll);
     refs.jump.removeEventListener('click', onJump);
@@ -676,6 +692,7 @@ function buildEntry(ui, entry, previous) {
     case 'command-output': return commandEl(ui, entry);
     case 'result': return resultEl(ui, entry);
     case 'request': return requestEl(ui, entry);
+    case 'auto': return autoEl(ui, entry);
     default: return genericEl(entry.label ?? entry.kind, entry.raw, ui);
   }
 }
@@ -1109,6 +1126,32 @@ function withdrawnEl(ui) {
   const { t } = ui.env;
   return h('div', { class: 'withdrawn', dataset: { kind: 'withdrawn' }, attrs: { role: 'status' } },
     icon('x'), h('span', { text: t('cards.withdrawn') }));
+}
+
+/**
+ * The record of a request the gateway answered on its own (unattended mode): one muted line, with the tool and its
+ * target for a permission or the server of a form, and the question collapsed under the line. It never has buttons.
+ * @param {any} ui
+ * @param {Record<string, any>} entry
+ */
+function autoEl(ui, entry) {
+  const { t } = ui.env;
+  const kind = String(entry.requestKind ?? '');
+  const tool = kind === 'permission' ? String(entry.toolName ?? '') : '';
+  const target = kind === 'permission'
+    ? toolTarget(tool, entry.input, ui.cwd())
+    : kind === 'elicitation' ? String(entry.serverName ?? '') : '';
+  const question = kind === 'question' ? String(entry.questionText ?? '') : '';
+  return h('div', { class: 'work-auto', dataset: { kind: 'auto', requestKind: kind } },
+    icon('bot'),
+    h('div', { class: 'work-auto-body' },
+      h('div', { class: 'work-auto-line' },
+        h('span', { class: 'work-auto-text', text: t(AUTO_HEADLINES.get(kind) ?? 'cards.auto.permission') }),
+        tool ? h('span', { class: 'work-auto-tool', text: tool }) : null,
+        target ? h('span', { class: 'work-auto-target', text: target }) : null),
+      question ? h('details', { class: ['notice-collapse', 'work-auto-detail'] },
+        h('summary', { text: t('cards.auto.questionShow') }),
+        h('div', { class: 'work-auto-question', text: question })) : null));
 }
 
 /** @param {any} ui @param {Record<string, any>} entry */
