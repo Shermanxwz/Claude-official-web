@@ -2308,6 +2308,27 @@ kbd {
   gap: var(--space-4);
 }
 
+/* The live figures above the breakdown: they update with every API call and compaction. */
+.context-live {
+  display: grid;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.context-live:empty {
+  display: none;
+}
+
+.context-last {
+  display: grid;
+  gap: 4px;
+}
+
+.context-last-time {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+}
+
 .context-summary {
   display: flex;
   flex-wrap: wrap;
@@ -2347,6 +2368,14 @@ kbd {
   border-radius: inherit;
   background: var(--accent);
   transition: width 300ms var(--ease);
+}
+
+.progress.is-attention .progress-bar {
+  background: var(--attention);
+}
+
+.progress.is-danger .progress-bar {
+  background: var(--danger);
 }
 
 .bar-list {

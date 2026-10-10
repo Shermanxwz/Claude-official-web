@@ -66,7 +66,7 @@ function makeEngineHost() {
   const replies = {
     listSessions: () => [],
     listAllSessions: () => [],
-    getSession: () => ({ info: null, live: null, pending: [], liveEvents: [], seq: 0, init: null }),
+    getSession: () => ({ info: null, live: null, pending: [], liveEvents: [], seq: 0, init: null, now: 0 }),
     getTranscript: () => ({ messages: [], total: 0, start: 0, hasMore: false }),
     createSession: () => liveInfo(NEW_SESSION),
     openSession: (/** @type {string} */ id) => liveInfo(id),
@@ -762,7 +762,7 @@ describe('route mapping', () => {
     await withApp({}, async (ctx) => {
       await login(ctx);
       const detail = await request(ctx, 'GET', `/api/sessions/${SESSION}`, {});
-      assert.deepEqual(Object.keys(detail.json).sort(), ['info', 'init', 'live', 'liveEvents', 'pending', 'seq']);
+      assert.deepEqual(Object.keys(detail.json).sort(), ['info', 'init', 'live', 'liveEvents', 'now', 'pending', 'seq']);
       assert.equal((await request(ctx, 'GET', `/api/sessions/${SESSION}/messages`, {})).json.total, 0);
       await request(ctx, 'GET', `/api/sessions/${SESSION}/messages?before=10&limit=50`, {});
       await request(ctx, 'GET', `/api/sessions/${SESSION}/messages?tail=20`, {});

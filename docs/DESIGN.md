@@ -74,8 +74,9 @@ Never use Anthropic's or Claude Code's brand colors.
 - Depth: only floating layers have shadows — menus and the docked request card `0 8px 24px -8px rgba(15,17,20,.18)`,
   dialogs and panels `0 24px 64px -16px rgba(15,17,20,.28)` (dark: black at .5/.6). Anything in the flow uses a
   border or a tint, not a shadow.
-- Motion answers actions: expand/collapse 140 ms, panels and sheets 200 ms, both `cubic-bezier(.2,.7,.2,1)`. The one
-  ambient motion is the running glyph. `prefers-reduced-motion: reduce` removes all of it.
+- Motion answers actions: expand/collapse 140 ms, panels and sheets 200 ms, both `cubic-bezier(.2,.7,.2,1)`. The
+  ambient motions are the running glyph and, only while a compaction runs, the context ring's arc and the compacting
+  row's sweep (1.4 s). `prefers-reduced-motion: reduce` removes all of it.
 - Focus: `outline: 2px solid var(--accent); outline-offset: 2px` on every focusable element (`:focus-visible`).
 
 ## State glyphs (same everywhere)
@@ -98,11 +99,14 @@ Never use Anthropic's or Claude Code's brand colors.
   `--bg-hover` with a 2 px accent bar on the left. Footer: connection dot and label, settings, sign out.
 - **Header (52 px).** Title (`--fs-md`, 600) above the folder path (`--fs-xs`, mono, `--fg-muted`, middle-truncated).
   Right side: session controls as pills — model, permission mode, effort (native selects styled as 32 px pills with a
-  chevron, `appearance: none`), the Fast toggle, the agent chip when set, a context ring (18 px circle showing the
-  percentage; the exact number in its tooltip), the state badge (`Working` accent, `Needs you` attention, `Idle`
-  muted), overflow menu. While unattended mode is on, an attention-toned "Unattended" pill sits before the state badge
-  (32 px; icon only below 768 px; 44 px on touch screens), the permission select is disabled with the reason in its
-  tooltip, and the composer's mode label reads "Unattended — no approvals".
+  chevron, `appearance: none`), the Fast toggle, the agent chip when set, a context ring (18 px circle in a 32 px target
+  showing how full the context window is, live from `LiveInfo.context`; the exact numbers and the auto-compact point in
+  its tooltip; `--fg-muted`, then `--attention` from 85 % of the auto-compact point, then `--danger` from 95 % of the
+  window; a 2 × 3 px `--fg-muted` mark just outside the ring at the auto-compact point; its fill eases over 400 ms so a
+  compaction's drop is visible; while a compaction runs a 30 % accent arc turns around it), the state badge (`Working`
+  accent, `Needs you` attention, `Idle` muted), overflow menu. While unattended mode is on, an attention-toned
+  "Unattended" pill sits before the state badge (32 px; icon only below 768 px; 44 px on touch screens), the permission
+  select is disabled with the reason in its tooltip, and the composer's mode label reads "Unattended — no approvals".
 - **Messages.** The user's message: right-aligned, `--bg-sunken`, radius 14 px, `--fs-prose`, at most 80 % wide.
   Claude's prose: no container, `--fs-prose`. Turn footer: a muted sentence such as "Done in 0.9 s, 3 turns" with a
   check, or "Interrupted", or the error in `--danger` — no middle-dot meta strings.
@@ -135,6 +139,13 @@ Never use Anthropic's or Claude Code's brand colors.
   radius 14 px, footer actions right-aligned (primary last). Opening focuses the first enabled control of the body,
   else the primary action; a pending action's button gets focus back when it settles; closing returns focus to the
   control that opened it.
+- **Compaction.** While Claude Code compacts the conversation, the end of the turn shows one row in the divider's
+  style: the running glyph, "Compacting the conversation", the elapsed seconds and a slim accent sweep along its rule.
+  When the compaction ends the same row becomes the divider ("Compacted automatically: 103.5k tokens summarized into
+  2.1k in 10.5 s"), in place, with no layout jump. The summary the runtime leaves follows it as a collapsed note,
+  "Summary of the earlier conversation". After a reload, a compaction still running shows its row at the end of the
+  conversation, counting from the session's own start; a finished one shows its divider where the summary is, with the
+  sizes the session reports.
 - **Requests answered automatically.** A request counts as waiting only after 300 ms unanswered. One that unattended
   mode answers sooner leaves a single muted line in the action log ("Allowed automatically (unattended)"), with no
   card, buttons, badge, count or notification.

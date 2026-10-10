@@ -31,10 +31,26 @@ import { BROWSER_MCP_SERVER } from '../../contracts.mjs';
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').NonNullableUsage} NonNullableUsage */
 /** @typedef {Exclude<SDKUserMessage['message']['content'], string>[number]} UserContentBlock */
 
-/** Context-window numbers shared by the scenarios and the query. */
-export const CONTEXT_MAX_TOKENS = 200000;
-const BASE_PROMPT_TOKENS = 900;
-const CACHE_READ_TOKENS = 2048;
+/** Context-window numbers shared by the scenarios and the query: the window the runtime reports (100 000 tokens). */
+export const CONTEXT_MAX_TOKENS = 100000;
+/** Input tokens a call reports outside the cache: the runtime counts a few, the rest is cache creation or read. */
+const UNCACHED_INPUT_TOKENS = 3;
+/** Input tokens of a subagent's call. A subagent has its own context, which never counts toward the main thread. */
+const SUBAGENT_INPUT_TOKENS = 6000;
+/** A compaction pauses for this many steps of the mock delay: about 1.2 s at the default pace, none at pace 0. */
+const COMPACT_PAUSE_STEPS = 100;
+const MAX_COMPACT_PAUSE_MS = 10000;
+/** Tokens of the summary a compaction leaves in the context: 1 960 after a manual one, 2 069 after an automatic one. */
+const MANUAL_SUMMARY_TOKENS = 1960;
+const AUTO_SUMMARY_TOKENS = 2069;
+/** How the runtime opens the summary of a compaction, which the transcript and the stream both keep. */
+const COMPACT_SUMMARY_START = 'This session is being continued from a previous conversation that ran out of context.';
+const COMPACT_SUMMARY_TEXT = `${COMPACT_SUMMARY_START} Summary of the conversation so far: the user asked the `
+  + 'assistant several questions about this project, and each answer was a short Markdown reply.';
+/** The notice /compact writes once its summary is in place: the output of the command, echoed as a user message. */
+export const COMPACT_NOTICE_TEXT = '<local-command-stdout>Compacted </local-command-stdout>';
+/** Lines of log text the autocompact scenario reads: enough to pass the threshold with the second read. */
+const AUTOCOMPACT_LOG_LINES = 1000;
 
 /**
  * Raised by a scenario that must end the turn with an error result.
@@ -117,6 +133,10 @@ export class ScenarioFailure extends Error {
  * @property {(request: ElicitationRequest) => AsyncGenerator<SDKMessage, ElicitationResult, unknown>} elicitation
  * @property {(serverName: string) => boolean} mcpConnected
  * @property {() => SessionSummary} describeSession
+ * @property {() => {total: number, fresh: number}} contextTokens   what the next model call sends: the fixed part of
+ *   the context, the summary of the last compaction and the messages since it (total); fresh is the part added since
+ *   the last model response
+ * @property {() => SDKMessage} initialize   the session's system/init, which the runtime sends after a compaction
  */
 
 /**
@@ -263,7 +283,7 @@ export function usageOf({ input, output, cacheRead = 0, cacheCreate = 0, webSear
  * notice sent between turns carries an empty list.
  * @param {SessionView} ctx
  * @param {'compacting'|'requesting'|null} status
- * @param {{permissionMode?: PermissionMode, compact_result?: 'success'|'failed'}} [extra]
+ * @param {{permissionMode?: PermissionMode, compact_result?: 'success'|'failed', compact_error?: string}} [extra]
  * @returns {SDKStatusMessage & {user_message_uuids: string[]}}
  */
 export function statusMessage(ctx, status, extra = {}) {
@@ -296,8 +316,8 @@ export function statusMessage(ctx, status, extra = {}) {
  *   AutocompactStateMessage | ActiveGoalMessage} RuntimeMessage
  */
 
-/** Context tokens at which the runtime compacts the conversation by itself. */
-export const AUTOCOMPACT_THRESHOLD_TOKENS = 167000;
+/** Context tokens at which the runtime compacts the conversation by itself (the runtime measured 67 000). */
+export const AUTOCOMPACT_THRESHOLD_TOKENS = 67000;
 
 /**
  * @param {RuntimeMessage} message
@@ -530,11 +550,57 @@ export function toolUseSummary(ctx, summary, toolUseIds) {
 
 /**
  * @param {TurnContext} ctx
- * @param {{trigger: 'manual'|'auto', pre_tokens: number, post_tokens?: number}} metadata
+ * @param {{trigger: 'manual'|'auto', pre_tokens: number, post_tokens?: number, duration_ms?: number}} metadata
  * @returns {import('@anthropic-ai/claude-agent-sdk').SDKCompactBoundaryMessage}
  */
 export function compactBoundary(ctx, metadata) {
   return { type: 'system', subtype: 'compact_boundary', compact_metadata: metadata, ...ctx.envelope() };
+}
+
+/** The summaries that compactSummaryMessage made, so that the transcript can keep them as summaries. */
+const compactSummaries = new WeakSet();
+
+/**
+ * The summary a compaction leaves in the context, as the runtime streams it: a synthetic user message that is not a
+ * replay. Its size is the boundary's post_tokens, which is why the context does not count the message itself.
+ * @param {TurnContext} ctx
+ * @returns {SDKUserMessage}
+ */
+export function compactSummaryMessage(ctx) {
+  const message = {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text: COMPACT_SUMMARY_TEXT }] },
+    isSynthetic: true,
+    isReplay: false,
+    parent_tool_use_id: null,
+    ...ctx.envelope(),
+  };
+  compactSummaries.add(message);
+  return /** @type {SDKUserMessage} */ (message);
+}
+
+/**
+ * Whether a message is the summary of a compaction (see compactSummaryMessage).
+ * @param {SDKMessage} message
+ * @returns {boolean}
+ */
+export function isCompactSummaryMessage(message) {
+  return compactSummaries.has(message);
+}
+
+/**
+ * The notice /compact streams once its summary is in place: the output of the command, replayed as a user message.
+ * @param {TurnContext} ctx
+ * @returns {SDKUserMessageReplay}
+ */
+export function compactNoticeMessage(ctx) {
+  return {
+    type: 'user',
+    message: { role: 'user', content: COMPACT_NOTICE_TEXT },
+    parent_tool_use_id: null,
+    isReplay: true,
+    ...ctx.envelope(),
+  };
 }
 
 /**
@@ -951,20 +1017,39 @@ function contentBlockOf(ctx, block) {
 }
 
 /**
- * @param {TurnContext} ctx
+ * The output tokens of some blocks, about four characters each. A tool call counts its input.
  * @param {ResponseBlock[]} blocks
- * @returns {NonNullableUsage}
+ * @returns {number}
  */
-function responseUsage(ctx, blocks) {
+function outputTokensOf(blocks) {
   const outputText = blocks
     .map((block) => (block.type === 'tool_use' ? JSON.stringify(block.input) : block.text))
     .join('');
-  return usageOf({
-    input: BASE_PROMPT_TOKENS + Math.ceil(ctx.userText.length / 4) + ctx.turnIndex * 350,
-    output: Math.max(1, Math.ceil(outputText.length / 4)),
-    cacheRead: CACHE_READ_TOKENS,
+  return Math.max(1, Math.ceil(outputText.length / 4));
+}
+
+/**
+ * Usage of one model call. The input side is the context the call sends (see TurnContext.contextTokens): the part
+ * added since the last response is cache creation and the rest is cache read. A subagent's call has its own context.
+ * @param {TurnContext} ctx
+ * @param {ResponseBlock[]} blocks
+ * @param {boolean} subagent
+ * @returns {NonNullableUsage}
+ */
+function callUsage(ctx, blocks, subagent) {
+  const counts = {
+    output: outputTokensOf(blocks),
     webSearch: blocks.filter((block) => block.type === 'tool_use' && block.name === 'WebSearch').length,
     webFetch: blocks.filter((block) => block.type === 'tool_use' && block.name === 'WebFetch').length,
+  };
+  if (subagent) return usageOf({ ...counts, input: SUBAGENT_INPUT_TOKENS });
+  const { total, fresh } = ctx.contextTokens();
+  const cacheCreate = Math.min(fresh, total);
+  return usageOf({
+    ...counts,
+    input: UNCACHED_INPUT_TOKENS,
+    cacheCreate,
+    cacheRead: Math.max(0, total - cacheCreate - UNCACHED_INPUT_TOKENS),
   });
 }
 
@@ -985,7 +1070,7 @@ export async function* modelResponse(ctx, blocks, options = {}) {
   const stopReason = options.stopReason ?? 'end_turn';
   const pacing = options.pacing ?? ctx.delayMs;
   const id = ctx.nextId('message');
-  const usage = responseUsage(ctx, blocks);
+  const usage = callUsage(ctx, blocks, parentToolUseId !== null);
   if (streamed) {
     yield streamEvent(ctx, {
       type: 'message_start',
@@ -1050,7 +1135,8 @@ export async function* modelResponse(ctx, blocks, options = {}) {
     yield assistantMessage(ctx, {
       id,
       content: [contentBlockOf(ctx, block)],
-      usage,
+      // Like the runtime, a block reports the output tokens known at its point; the last block has all of them.
+      usage: { ...usage, output_tokens: outputTokensOf(blocks.slice(0, index + 1)) },
       stopReason: index === blocks.length - 1 ? stopReason : null,
       parentToolUseId,
       agentId,
@@ -1194,12 +1280,90 @@ async function* answerScenario(ctx) {
   yield* modelResponse(ctx, [{ type: 'text', text: markdownAnswer(ctx.userText) }]);
 }
 
-/** @type {Scenario['run']} */
+/**
+ * How long a compaction takes at the given pace: about 1.2 s at the default delay, and none at pace 0.
+ * @param {TurnContext} ctx
+ * @returns {number} milliseconds
+ */
+function compactPauseOf(ctx) {
+  return Math.min(ctx.delayMs * COMPACT_PAUSE_STEPS, MAX_COMPACT_PAUSE_MS);
+}
+
+/**
+ * /compact: the runtime compacts on request. It streams, in this order: the status that starts the compaction, the
+ * status that ends it, the init that follows, the boundary of a manual compaction, the summary that replaces the
+ * conversation and the notice of the command, as the runtime reports them.
+ * @type {Scenario['run']}
+ */
 async function* compactScenario(ctx) {
+  const pause = compactPauseOf(ctx);
+  const before = ctx.contextTokens().total;
   yield statusMessage(ctx, 'compacting');
-  yield* ctx.pause(ctx.delayMs * 2);
-  yield compactBoundary(ctx, { trigger: 'manual', pre_tokens: 12000, post_tokens: 3400 });
+  yield* ctx.pause(pause);
   yield statusMessage(ctx, null, { compact_result: 'success' });
+  yield ctx.initialize();
+  yield compactBoundary(ctx, {
+    trigger: 'manual',
+    pre_tokens: before,
+    post_tokens: MANUAL_SUMMARY_TOKENS,
+    duration_ms: pause,
+  });
+  yield compactSummaryMessage(ctx);
+  yield compactNoticeMessage(ctx);
+}
+
+/**
+ * The text of one log batch that the autocompact scenario reads: one line per record, about 70 characters each.
+ * @param {number} batch
+ * @returns {string}
+ */
+function logBatchText(batch) {
+  return Array.from({ length: AUTOCOMPACT_LOG_LINES }, (_, line) =>
+    `2026-10-10 12:00:00 INFO batch ${batch} record ${line} processed without errors`).join('\n');
+}
+
+/**
+ * A long session that the runtime compacts by itself. Two reads of log batches take the context past the auto-compact
+ * threshold, so the runtime compacts in the middle of the turn, before it answers again: requesting, compacting, a
+ * pause, the result, the boundary and the summary of an automatic compaction (no init and no notice). The answer then
+ * comes from the shorter context.
+ * @type {Scenario['run']}
+ */
+async function* autocompactScenario(ctx) {
+  for (const batch of [1, 2]) {
+    const toolUseId = ctx.nextId('tool');
+    yield* modelResponse(ctx, [
+      { type: 'text', text: `Reading log batch ${batch}.` },
+      { type: 'tool_use', id: toolUseId, name: 'Read', input: { file_path: `logs/batch-${batch}.log` } },
+    ], { stopReason: 'tool_use' });
+    yield toolResult(ctx, { toolUseId, content: logBatchText(batch) });
+  }
+  const pause = compactPauseOf(ctx);
+  const before = ctx.contextTokens().total;
+  yield statusMessage(ctx, 'requesting');
+  yield statusMessage(ctx, 'compacting');
+  yield* ctx.pause(pause);
+  yield statusMessage(ctx, null, { compact_result: 'success' });
+  yield compactBoundary(ctx, {
+    trigger: 'auto',
+    pre_tokens: before,
+    post_tokens: AUTO_SUMMARY_TOKENS,
+    duration_ms: pause,
+  });
+  yield compactSummaryMessage(ctx);
+  yield* modelResponse(ctx, [{ type: 'text', text: 'Both log batches processed without errors.' }]);
+}
+
+/**
+ * A compaction that fails: its status ends with the failure, and the turn goes on without a boundary.
+ * @type {Scenario['run']}
+ */
+async function* compactFailScenario(ctx) {
+  const pause = compactPauseOf(ctx);
+  yield statusMessage(ctx, 'compacting');
+  yield* ctx.pause(pause);
+  yield statusMessage(ctx, null, { compact_result: 'failed', compact_error: 'The summary request was refused.' });
+  yield* modelResponse(ctx, [{ type: 'text', text: 'The conversation keeps its full length.' }]);
 }
 
 /** @type {Scenario['run']} */
@@ -1942,6 +2106,8 @@ function keyword(word) {
  * @type {Scenario[]}
  */
 const SCENARIOS = [
+  { name: 'autocompact', matches: keyword('autocompact'), run: autocompactScenario },
+  { name: 'compact-fail', matches: keyword('compact-fail'), run: compactFailScenario },
   { name: 'compact', matches: (text) => /^\/compact(\s|$)/i.test(text), run: compactScenario },
   { name: 'context', matches: (text) => /^\/context(\s|$)/i.test(text), run: contextScenario },
   { name: 'usage', matches: (text) => /^\/usage(\s|$)/i.test(text), run: usageScenario },

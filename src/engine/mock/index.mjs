@@ -12,6 +12,7 @@ import { createMockStore } from './store.mjs';
 /** @typedef {import('../../contracts.mjs').EngineAdapter} EngineAdapter */
 /** @typedef {import('../../contracts.mjs').Config} Config */
 /** @typedef {import('../../contracts.mjs').Logger} Logger */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').SessionMessage} SessionMessage */
 
 /** Pause between streamed chunks when nothing else is configured. */
 export const DEFAULT_DELAY_MS = 12;
@@ -79,7 +80,9 @@ export function createMockAdapter({ config, log, delayMs, resolvedSettings = {},
       sources: [],
     }),
     listSessions: (options) => store.listSessions(options),
-    getSessionMessages: (sessionId, options) => store.getSessionMessages(sessionId, options),
+    // The SDK declares a message on every entry; a compact boundary has none, as the runtime answers it (chainOf).
+    getSessionMessages: async (sessionId, options) =>
+      /** @type {SessionMessage[]} */ (await store.getSessionMessages(sessionId, options)),
     getSessionInfo: (sessionId, options) => store.getSessionInfo(sessionId, options),
     renameSession: (sessionId, title, options) => store.renameSession(sessionId, title, options),
     tagSession: (sessionId, tag, options) => store.tagSession(sessionId, tag, options),

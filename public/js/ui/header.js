@@ -5,6 +5,7 @@ import { effortLevelsFor, effortModelFor, fastModeView, modelSelectPlan } from '
 import { openDialog } from './dialog.js';
 import { openMenu } from './menu.js';
 import { attentionState, waitingCount } from '../unattended.js';
+import { meterTooltip, meterView } from '../context.js';
 
 /**
  * Session header: title, working directory, model / permission / effort and fast mode controls, the background tasks
@@ -15,45 +16,7 @@ import { attentionState, waitingCount } from '../unattended.js';
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto', 'dontAsk'];
 /** Live states in which a turn runs or a request waits for the user; a rewind is refused meanwhile. */
 const BUSY_STATES = ['running', 'requires_action'];
-const CONTEXT_WARN_PERCENT = 80;
 const MOBILE_QUERY = '(max-width: 767.98px)';
-
-/** @type {Map<string, Intl.NumberFormat>} */
-const countFormatters = new Map();
-
-/**
- * @param {number} value
- * @param {string} locale
- * @returns {string}
- */
-function formatCount(value, locale) {
-  let formatter = countFormatters.get(locale);
-  if (!formatter) {
-    formatter = new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 });
-    countFormatters.set(locale, formatter);
-  }
-  return formatter.format(value);
-}
-
-/**
- * Turns SDKControlGetContextUsageResponse into the meter's view, or null when no usable figure is present.
- * @param {string} id
- * @param {any} usage
- * @returns {{id: string, percent: number, used: number, max: number}|null}
- */
-function toContextView(id, usage) {
-  const used = Number(usage?.totalTokens);
-  const max = Number(usage?.maxTokens);
-  let percent = Number(usage?.percentage);
-  if (!Number.isFinite(percent)) percent = max > 0 ? (used / max) * 100 : Number.NaN;
-  if (!Number.isFinite(percent)) return null;
-  return {
-    id,
-    percent: Math.min(100, Math.max(0, percent)),
-    used: Number.isFinite(used) ? used : 0,
-    max: Number.isFinite(max) ? max : 0,
-  };
-}
 
 /**
  * Replaces the text of `el` with `full`, shortened in the middle with an ellipsis until it fits its box.
@@ -123,7 +86,6 @@ export function createHeader({ container, api, store, t, actions }) {
     id: /** @type {string|null} */ (null),
     cwd: '',
     liveState: /** @type {string|null} */ (null),
-    ctx: /** @type {ReturnType<typeof toContextView>} */ (null),
     /** Settings chosen in the header that the live query has not confirmed yet (or that wait for the next open). */
     overrides: /** @type {Map<string, Record<string, unknown>>} */ (new Map()),
     options: { model: [], mode: [], effort: [] },
@@ -182,13 +144,15 @@ export function createHeader({ container, api, store, t, actions }) {
     on: { click: () => actions.openPanel('tasks') },
   }, icon('layers'), tasksText));
 
-  // The context ring: an 18 px circle filled to the percentage (--pct); the exact number is in the tooltip.
+  // The context ring (LiveInfo.context): an 18 px circle filled to the share of the window in use, a tick where
+  // automatic compaction starts, and a sweep while the conversation compacts. The exact figures are in the tooltip.
   const ctxRing = h('span', { class: 'ctx-ring', attrs: { 'aria-hidden': 'true' } });
+  const ctxTick = h('span', { class: 'ctx-tick', attrs: { 'aria-hidden': 'true' } });
   const ctxBtn = h('button', {
     class: 'ctx-meter',
     attrs: { type: 'button' },
     on: { click: () => actions.openPanel('context') },
-  }, ctxRing);
+  }, ctxRing, ctxTick);
 
   const spinner = h('span', { class: 'state-spinner', attrs: { 'aria-hidden': 'true' } });
   const badgeText = h('span', { class: 'state-text' });
@@ -208,8 +172,9 @@ export function createHeader({ container, api, store, t, actions }) {
     on: { click: openOverflow },
   }, icon('more'));
 
-  const controls = h('div', { class: 'hdr-controls' }, modelSel, modeSel, effortSel, fastBtn, fastNote, ctxBtn);
-  const right = h('div', { class: 'hdr-right' }, controls, tasksBtn, unattendedBtn, badge, moreBtn);
+  // The ring sits beside the controls, not inside them, so it stays in the header on phones (which hide the controls).
+  const controls = h('div', { class: 'hdr-controls' }, modelSel, modeSel, effortSel, fastBtn, fastNote);
+  const right = h('div', { class: 'hdr-right' }, controls, ctxBtn, tasksBtn, unattendedBtn, badge, moreBtn);
   const root = h('header', { class: 'session-header' }, left, right);
   container.appendChild(root);
 
@@ -387,18 +352,15 @@ export function createHeader({ container, api, store, t, actions }) {
     view.options = { model: modelPlan.options, mode: modeOptions, effort: effortOptions.slice(1) };
     view.selected = { model: modelPlan.value, mode: modeValue, effort: effortValue };
 
-    const ctxReady = Boolean(live && view.ctx && view.ctx.id === id);
-    ctxBtn.hidden = !ctxReady;
-    if (ctxReady) {
-      const percent = Math.round(view.ctx.percent);
-      const locale = getLocale();
-      const tip = t('header.context.tooltip', {
-        used: formatCount(view.ctx.used, locale),
-        max: formatCount(view.ctx.max, locale),
-        percent,
-      });
-      ctxRing.style.setProperty('--pct', String(Math.min(100, Math.max(0, view.ctx.percent))));
-      ctxBtn.classList.toggle('is-warning', view.ctx.percent >= CONTEXT_WARN_PERCENT);
+    const meter = live ? meterView(live.context) : null;
+    ctxBtn.hidden = !meter;
+    if (meter) {
+      const tip = meterTooltip(meter, { t, locale: getLocale() });
+      ctxRing.style.setProperty('--ctx-pct', String(meter.fill));
+      ctxBtn.dataset.tone = meter.tone;
+      ctxBtn.classList.toggle('is-compacting', meter.compacting);
+      ctxTick.hidden = meter.tickPercent === null;
+      if (meter.tickPercent !== null) ctxTick.style.setProperty('--tick', `${meter.tickPercent * 3.6}deg`);
       ctxBtn.title = tip;
       ctxBtn.setAttribute('aria-label', tip);
     }
@@ -470,17 +432,6 @@ export function createHeader({ container, api, store, t, actions }) {
     }
   }
 
-  async function refreshContext(id) {
-    try {
-      const usage = await api.get(`/api/sessions/${encodeURIComponent(id)}/context`);
-      if (view.disposed || view.id !== id) return;
-      view.ctx = toContextView(id, usage);
-    } catch {
-      if (view.id === id) view.ctx = null;
-    }
-    sync();
-  }
-
   function onStoreChange() {
     if (view.disposed) return;
     const id = view.id;
@@ -490,14 +441,9 @@ export function createHeader({ container, api, store, t, actions }) {
       const before = view.liveState;
       if (now !== before) {
         view.liveState = now;
-        if (!now) {
-          view.ctx = null;
-        } else if (!before) {
+        if (now && !before) {
           view.overrides.delete(id);
           loadCapabilities(id);
-          refreshContext(id);
-        } else if (now === 'idle') {
-          refreshContext(id);
         }
       }
     }
@@ -627,13 +573,9 @@ export function createHeader({ container, api, store, t, actions }) {
       const s = store.get();
       if (next !== view.id) {
         view.id = next;
-        view.ctx = null;
         view.liveState = next ? (s.live?.[next]?.state ?? null) : null;
       }
-      if (next) {
-        loadCapabilities(next);
-        if (view.liveState) refreshContext(next);
-      }
+      if (next) loadCapabilities(next);
       sync();
     },
     /**

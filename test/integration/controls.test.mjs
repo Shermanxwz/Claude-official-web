@@ -164,8 +164,14 @@ describe('controls: turns and slash commands', { timeout: 120000 }, () => {
       assert.ok(boundary, 'the turn reports a compact boundary');
       assert.ok(messages.some((msg) => msg.type === 'system' && msg.subtype === 'status'
         && msg.status === 'compacting'));
+      // The history route answers with the conversation chain: it starts at the boundary, as a bare record, and holds
+      // the summary and the notice after it. The prompt before the compaction is not returned.
       const stored = await transcriptOf(api, sessionId);
-      assert.ok(stored.some((msg) => msg.type === 'system'), 'the boundary is stored with the transcript');
+      assert.deepEqual(stored.map((msg) => msg.type), ['system', 'user', 'user'],
+        'the transcript starts at the boundary');
+      assert.equal(stored[0].uuid, boundary.uuid);
+      assert.equal('message' in stored[0], false, 'the boundary is a bare record');
+      assert.equal(stored.some((msg) => msg.message?.content === 'Give me some history first'), false);
     } finally {
       events.close();
     }

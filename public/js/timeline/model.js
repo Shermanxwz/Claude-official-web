@@ -22,7 +22,11 @@
  *                      row item  = {kind:'row', key, rowKind:'hook'|'task'|'denied'|'notice'|'withdrawn', ...fields}
  *  - withdrawn:      { key, uuid }   (a retracted response, shown as one muted "Response withdrawn" row)
  *  - notice:         { level:'info'|'warning'|'error'|'muted', code, text, vars }
- *  - divider:        { variant:'compact'|'clear', preTokens, trigger }
+ *  - divider:        { variant:'compact'|'clear'|'compacting', preTokens, postTokens, durationMs, trigger, since }
+ *                      'compacting' is the live row of a compaction in progress (since: epoch ms, null when the status
+ *                      was replayed without a time); the boundary turns that same entry into 'compact' in place. A
+ *                      status that ends the compaction without a boundary drops the row. A 'compact' divider with null
+ *                      sizes is one the summary added (see addSummary); the view fills its sizes from the session
  *  - command-output: { text }
  *  - result:         { subtype, durationMs, durationApiMs, numTurns, isError, interrupted, errors,
  *                      permissionDenials: [{toolName}], terminalReason, totalCostUsd }
@@ -43,6 +47,11 @@ const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp
 const BASE64_RE = /^[A-Za-z0-9+/=\s]+$/;
 const AGENT_TOOLS = new Set(['Agent', 'Task']);
 const ACTIVE_STATES = new Set(['starting', 'running', 'requires_action']);
+/**
+ * The states in which the session runs a message. 'starting' only opens the query: a session resumed by its first
+ * message reports 'idle' once Claude Code is ready, before it takes the message, then 'running'.
+ */
+const RUNNING_STATES = new Set(['running', 'requires_action']);
 const INACTIVE_STATES = new Set(['idle', 'closing', 'error', 'closed', 'stopped']);
 const HOOK_TEXT_LIMIT = 4000;
 const REMINDER_RE = /<system-reminder>([\s\S]*?)<\/system-reminder>/g;
@@ -54,6 +63,8 @@ const INTERRUPT_NOTICES = new Map([
   ['[Request interrupted by user]', 'interrupted'],
   ['[Request interrupted by user for tool use]', 'interrupted-tool'],
 ]);
+/** The sizes of a compaction divider that has none (a summary with no boundary before it). */
+const NO_SIZES = Object.freeze({ trigger: null, preTokens: null, postTokens: null, durationMs: null });
 
 /**
  * @typedef {Object} Turn   state shared by a turn's main flow and the child flows of its subagents
@@ -81,11 +92,34 @@ const INTERRUPT_NOTICES = new Map([
  */
 
 /**
+ * The snapshot's live events that a load replays after the transcript page. The transcript of a compacted session
+ * starts at its last compaction (getSessionMessages returns the chain from that boundary, a system record without its
+ * subtype), while the snapshot still holds the events of the whole query. The events before the snapshot's copy of
+ * that boundary belong to the conversation the compaction replaced, so they are left out; otherwise every event is
+ * replayed.
+ * @template {{msg?: unknown}} T
+ * @param {T[]|null|undefined} events the snapshot's liveEvents, oldest first
+ * @param {{messages?: unknown, start?: unknown}|null|undefined} page the transcript page the load shows
+ * @returns {T[]}
+ */
+export function replayedEvents(events, page) {
+  const list = Array.isArray(events) ? events : [];
+  const messages = Array.isArray(page?.messages) ? page.messages : [];
+  const first = page?.start === 0 ? messages[0] : null;
+  if (!first || first.type !== 'system' || typeof first.uuid !== 'string') return list;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const msg = /** @type {{uuid?: unknown}|null|undefined} */ (list[index]?.msg);
+    if (msg?.uuid === first.uuid) return list.slice(index);
+  }
+  return list;
+}
+
+/**
  * Creates an independent timeline model.
  * @returns {{
  *   loadTranscript: (messages: Array<Record<string, any>>) => void,
  *   prependTranscript: (messages: Array<Record<string, any>>) => void,
- *   applyLiveEvent: (msg: Record<string, any>) => void,
+ *   applyLiveEvent: (msg: Record<string, any>, time?: number|null) => void,
  *   addOptimistic: (message: {clientMessageId: string, text: string, attachments?: unknown}) => void,
  *   markAccepted: (clientMessageId: string) => void,
  *   markFailed: (clientMessageId: string, error: unknown) => void,
@@ -101,7 +135,8 @@ const INTERRUPT_NOTICES = new Map([
  *   getUserMessages: () => Array<{uuid: string, text: string, index: number}>,
  *   getPendingUserMessages: () => Array<{clientMessageId: string, text: string,
  *     attachments: Array<Record<string, any>>, accepted: boolean, status: string, error: string|null}>,
- *   getRunState: () => {running: boolean, status: string|null, compactResult: string|null, activity: string|null}
+ *   getRunState: () => {running: boolean, status: string|null, compactResult: string|null, activity: string|null,
+ *     compactingSince: number|null}
  * }}
  */
 export function createModel({ now = Date.now, describeTool = null } = {}) {
@@ -135,6 +170,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   let rowIndex = new Map();
   /** @type {Map<string, Flow>} */
   let flowOfUuid = new Map();
+  /** @type {Set<string>} the uuid of every transcript record, shown or not (a replayed boundary is checked here) */
+  let transcriptUuids = new Set();
   /** @type {Map<string, number>} */
   let bubbleCount = new Map();
   /** @type {Map<string, Array<{raw: any, live: boolean}>>} */
@@ -148,6 +185,10 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   /** @type {Map<string, Record<string, any>>} user entries by clientMessageId and by uuid */
   let userEntries = new Map();
   let runStatus = { status: null, compactResult: null };
+  /** @type {{entry: Record<string, any>, flow: Flow}|null} the compaction in progress and the row that shows it */
+  let compacting = null;
+  /** Set by a main-thread compact_boundary: the next main-thread user message may be the summary it leaves. */
+  let summaryDue = false;
   /** @type {string|null} the runtime's one-line activity for the running turn (system/task_summary) */
   let activity = null;
   /** @type {Array<{request: Record<string, any>, version: number}>} */
@@ -196,6 +237,15 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
 
   /** @param {unknown} value @returns {value is Record<string, any>} */
   const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
+
+  /** @param {Record<string, any>} raw @returns {boolean} true for a message of the main thread, not of a subagent */
+  const isMainThread = (raw) => !(typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id);
+
+  /** @param {Record<string, any>} raw @returns {boolean} true for the boundary that ends a compaction */
+  const isBoundary = (raw) => raw.type === 'system' && raw.subtype === 'compact_boundary';
+
+  /** @param {...unknown} values @returns {number|null} the first finite number among the values */
+  const firstNumber = (...values) => values.find((value) => Number.isFinite(value)) ?? null;
 
   /** @param {unknown} content @returns {Array<Record<string, any>>} */
   const normalizeContent = (content) => {
@@ -420,6 +470,62 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
   };
 
   /**
+   * Removes an entry from a flow. A structural change, so the model's version moves on.
+   * @param {Flow} flow
+   * @param {Record<string, any>} entry
+   */
+  const dropEntry = (flow, entry) => {
+    const index = flow.entries.indexOf(entry);
+    if (index < 0) return;
+    flow.entries.splice(index, 1);
+    bump();
+    touchOwners(flow);
+  };
+
+  /**
+   * The live compaction starts as one row at the end of the turn; a repeated status shows the same row. The row starts
+   * at the time the status arrived, or with no start when the status was replayed without a time. Returns the flow the
+   * row sits in.
+   * @param {string|null} uuid
+   * @returns {Flow}
+   */
+  const startCompacting = (uuid) => {
+    const flow = liveFlow();
+    markLive(flow.state);
+    if (!compacting) {
+      const entry = pushEntry(flow, {
+        kind: 'divider', key: nextKey('cmp', uuid), variant: 'compacting', since: eventTime || null,
+        trigger: null, preTokens: null, postTokens: null, durationMs: null,
+      });
+      compacting = { entry, flow };
+    }
+    return flow;
+  };
+
+  /**
+   * The boundary of a compaction turns its row into the divider, in place (same key, so the view keeps the position).
+   * @param {{trigger: string|null, preTokens: number|null, postTokens: number|null, durationMs: number|null}} details
+   * @returns {Flow|null} the flow of the row, or null when no row waits for a boundary
+   */
+  const settleCompacting = (details) => {
+    if (!compacting) return null;
+    const { entry, flow } = compacting;
+    compacting = null;
+    Object.assign(entry, details, { variant: 'compact' });
+    touch(entry);
+    touchOwners(flow);
+    return flow;
+  };
+
+  /** The status says the compaction is over and no boundary turned the row into a divider: the row goes. */
+  const endCompacting = () => {
+    if (!compacting) return;
+    const { entry, flow } = compacting;
+    compacting = null;
+    dropEntry(flow, entry);
+  };
+
+  /**
    * Ends a turn, then starts the messages that waited behind it, in order. A turn ended by its result hands them to the
    * SDK, which runs them next; a turn ended by an idle session only moves them into the timeline.
    * @param {Turn} state
@@ -430,6 +536,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     state.closed = true;
     state.sendPending = false;
     activity = null;
+    // A compaction belongs to the turn it runs in; when the turn ends, its row cannot still be waiting.
+    if (compacting && compacting.flow.state === state) endCompacting();
     if (state.main) {
       syncFlow(state.main);
       pruneLocals(state.main);
@@ -686,6 +794,26 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     return flow;
   };
 
+  /**
+   * The summary a compaction leaves in place of the conversation: one muted note under its own name, after the divider
+   * of its compaction. A summary with no divider before it (a transcript that starts at a compaction, or a stream that
+   * dropped the boundary) gets a plain one. A compaction still waiting for its boundary turns its row into that plain
+   * divider, because the summary says the compaction is over.
+   * @param {boolean} live
+   * @param {string} text
+   * @param {string|null} uuid
+   * @returns {Flow}
+   */
+  const addSummary = (live, text, uuid) => {
+    const waiting = compacting ? settleCompacting(NO_SIZES) : null;
+    const flow = waiting ?? (live ? liveFlow() : baseFlow());
+    const last = flow.entries[flow.entries.length - 1];
+    if (!last || last.kind !== 'divider' || last.variant !== 'compact') {
+      pushEntry(flow, { kind: 'divider', key: nextKey('dv', uuid), variant: 'compact', ...NO_SIZES });
+    }
+    return addNotice(flow, 'muted', 'compact-summary', {}, text, nextKey('n', uuid));
+  };
+
   // ---------------------------------------------------------------------------------------------------------------
   // Message handlers. Each returns the flow it wrote to, or null when it wrote nothing.
 
@@ -694,6 +822,11 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     const message = isObject(raw.message) ? raw.message : {};
     const blocks = normalizeContent(message.content);
     const uuid = typeof raw.uuid === 'string' ? raw.uuid : null;
+    // The first main-thread user message after a compaction boundary may be the summary. Any main-thread user message
+    // ends that wait, so a synthetic message that comes later is a plain note again.
+    const mainThread = isMainThread(raw);
+    const afterBoundary = mainThread && summaryDue;
+    if (mainThread) summaryDue = false;
     const toolResults = blocks.filter((block) => block.type === 'tool_result');
     const rest = blocks.filter((block) => block.type !== 'tool_result');
     for (const block of toolResults) {
@@ -703,7 +836,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       deliverResult(String(block.tool_use_id ?? ''), toolResultFrom(block), structured, uuid);
     }
     if (toolResults.length > 0 && rest.length === 0) return current ?? null;
-    if (typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id) return onSubagentUser(raw, live, rest);
+    if (!mainThread) return onSubagentUser(raw, live, rest);
 
     const rawText = rest
       .filter((block) => block.type === 'text' && typeof block.text === 'string')
@@ -720,7 +853,13 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       return flow;
     }
 
-    if (raw.isSynthetic === true || raw.is_meta === true || raw.isCompactSummary === true ||
+    // The summary a compaction leaves in place of the conversation. A transcript marks it isCompactSummary; the live
+    // stream sends it as the synthetic user message that follows the boundary.
+    if (raw.isCompactSummary === true || (afterBoundary && raw.isSynthetic === true)) {
+      return addSummary(live, visible || stripReminders(rawText, true), uuid);
+    }
+
+    if (raw.isSynthetic === true || raw.is_meta === true ||
         (origin && typeof origin.kind === 'string' && origin.kind !== 'human')) {
       const flow = live ? liveFlow() : baseFlow();
       addNotice(flow, 'muted', 'user-meta',
@@ -1159,26 +1298,35 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       case 'status': {
         runStatus = { status: raw.status ?? null, compactResult: raw.compact_result ?? null };
         if (live && raw.status && current && !current.state.closed) markLive(current.state);
+        let flow = null;
+        if (raw.status === 'compacting') {
+          if (live) flow = startCompacting(uuid);
+        } else if (!raw.status && raw.compact_result !== 'success') {
+          // A success keeps the row: the boundary that follows turns it into the divider in place.
+          endCompacting();
+        }
         if (raw.compact_result === 'failed') {
-          const flow = baseFlow();
-          return addNotice(flow, 'error', 'compact-failed', {},
+          const failed = baseFlow();
+          return addNotice(failed, 'error', 'compact-failed', {},
             typeof raw.compact_error === 'string' ? raw.compact_error : '', uuid ? `n:${uuid}` : null);
         }
-        return null;
+        return flow;
       }
       case 'compact_boundary': {
-        const flow = live ? liveFlow() : baseFlow();
         const meta = isObject(raw.compact_metadata) ? raw.compact_metadata
           : (isObject(raw.compactMetadata) ? raw.compactMetadata : {});
-        const preTokens = typeof meta.pre_tokens === 'number' ? meta.pre_tokens
-          : (typeof meta.preTokens === 'number' ? meta.preTokens : null);
-        pushEntry(flow, {
-          kind: 'divider',
-          key: nextKey('dv', uuid),
-          variant: 'compact',
-          preTokens,
+        const details = {
           trigger: typeof meta.trigger === 'string' ? meta.trigger : null,
-        });
+          preTokens: firstNumber(meta.pre_tokens, meta.preTokens),
+          postTokens: firstNumber(meta.post_tokens, meta.postTokens),
+          durationMs: firstNumber(meta.duration_ms, meta.durationMs),
+        };
+        // The summary follows as the next main-thread user message (see onUser).
+        if (isMainThread(raw)) summaryDue = true;
+        const settled = live ? settleCompacting(details) : null;
+        if (settled) return settled;
+        const flow = live ? liveFlow() : baseFlow();
+        pushEntry(flow, { kind: 'divider', key: nextKey('dv', uuid), variant: 'compact', ...details });
         return flow;
       }
       case 'api_retry': {
@@ -1461,15 +1609,25 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       return;
     }
     const uuid = typeof raw.uuid === 'string' && raw.uuid ? raw.uuid : null;
+    if (!live && uuid) transcriptUuids.add(uuid);
     if (uuid && flowOfUuid.has(uuid)) {
       const known = flowOfUuid.get(uuid);
       if (live && known) {
         if (isActivity(raw)) markLive(known.state);
+        // A replayed boundary that the transcript shows ends the compaction row the replay started.
+        if (isBoundary(raw)) endCompacting();
         // A subagent's flow is not a turn: the turn it belongs to becomes current.
         current = known.state.main ?? known;
         // A replayed final message still settles the draft its stream built (rule 1).
         if (raw.type === 'assistant') settleDraft(raw);
       }
+      return;
+    }
+    // The transcript keeps a compaction's boundary as a record without its subtype, which shows nothing, and the
+    // summary after it adds the divider (addSummary). A reload replays that boundary with its subtype: it ends the row
+    // the replay started and adds no second divider.
+    if (live && uuid && isBoundary(raw) && transcriptUuids.has(uuid)) {
+      endCompacting();
       return;
     }
     // A message that names its user message is placed in that turn, and the cursor moves there so the messages after it
@@ -1582,6 +1740,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     autoAnswered = new Set();
     rowIndex = new Map();
     flowOfUuid = new Map();
+    transcriptUuids = new Set();
     bubbleCount = new Map();
     orphans = new Map();
     pendingResults = new Map();
@@ -1589,6 +1748,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     locals = [];
     userEntries = new Map();
     runStatus = { status: null, compactResult: null };
+    compacting = null;
+    summaryDue = false;
     activity = null;
   };
 
@@ -1664,7 +1825,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
 
   /**
    * Starts a turn with a message the user just sent. A session that reports running marks the turn live at once; one
-   * that does not yet keeps it pending until it reports running.
+   * that does not yet, or only starts, keeps it pending until it reports running, so the 'idle' of a session that has
+   * just become ready does not end the turn before it runs.
    * @param {Record<string, any>} entry
    */
   const startLocalTurn = (entry) => {
@@ -1672,7 +1834,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     turn.state.sendPending = true;
     turn.state.startedAt = eventTime || now();
     placeUser(turn, entry);
-    if (sessionState === null || ACTIVE_STATES.has(sessionState)) markLive(turn.state);
+    if (sessionState === null || RUNNING_STATES.has(sessionState)) markLive(turn.state);
     return turn;
   };
 
@@ -1987,10 +2149,15 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       replay();
     },
 
-    /** @param {Record<string, any>} msg a live SDK message, or a message from the snapshot's liveEvents */
-    applyLiveEvent(msg) {
-      log.push({ op: 'live', msg, at: now() });
-      apply({ op: 'live', msg, at: log[log.length - 1].at });
+    /**
+     * @param {Record<string, any>} msg a live SDK message, or a message from the snapshot's liveEvents
+     * @param {number|null} [time] when the message arrived (epoch ms); null when that is not known, as for a snapshot's
+     *   events. A live message is stamped with the time it is applied.
+     */
+    applyLiveEvent(msg, time = now()) {
+      const operation = { op: 'live', msg, at: typeof time === 'number' ? time : null };
+      log.push(operation);
+      apply(operation);
       relinkPending();
     },
 
@@ -2144,8 +2311,8 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     setSessionState(state) {
       sessionState = typeof state === 'string' ? state : null;
       if (sessionState !== null && ACTIVE_STATES.has(sessionState)) {
-        // The session now runs the message sent behind this pending turn.
-        if (current && current.state.sendPending) markLive(current.state);
+        // The session now runs the message sent behind this pending turn (not yet while it only starts).
+        if (current && current.state.sendPending && RUNNING_STATES.has(sessionState)) markLive(current.state);
         return;
       }
       applySessionState();
@@ -2226,8 +2393,11 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     },
 
     /**
-     * @returns {{running: boolean, status: string|null, compactResult: string|null, activity: string|null}}
-     *   activity: the runtime's one-line activity of the running turn, null when none is reported
+     * activity: the runtime's one-line activity of the running turn, null when none is reported.
+     * compactingSince: epoch ms when the compaction in progress started; null while none runs, and when its row was
+     * replayed without a time (the view then counts from the session's start).
+     * @returns {{running: boolean, status: string|null, compactResult: string|null, activity: string|null,
+     *   compactingSince: number|null}}
      */
     getRunState() {
       return {
@@ -2235,6 +2405,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
         status: runStatus.status,
         compactResult: runStatus.compactResult,
         activity: turnRunning() ? activity : null,
+        compactingSince: compacting ? compacting.entry.since : null,
       };
     },
 

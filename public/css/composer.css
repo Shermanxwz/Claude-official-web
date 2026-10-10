@@ -230,8 +230,17 @@
   height: 16px;
 }
 
-/* The context ring: 18 px, filled to --pct, the exact number lives in its tooltip. */
+/* The context ring (LiveInfo.context): 18 px, filled to --ctx-pct. The property is registered so the fill eases between
+   values (400 ms, reduced motion makes it instant), which shows the drop after a compaction. The exact figures live in
+   the tooltip. The tone colors the fill; the tick marks where automatic compaction starts. */
+@property --ctx-pct {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 0;
+}
+
 .ctx-meter {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -246,17 +255,54 @@
 }
 
 .ctx-ring {
+  --ctx-fill: var(--fg-muted);
   display: block;
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: conic-gradient(var(--fg-muted) calc(var(--pct, 0) * 1%), var(--border) 0);
+  background: conic-gradient(var(--ctx-fill) calc(var(--ctx-pct, 0) * 1%), var(--border) 0);
   -webkit-mask: radial-gradient(circle, transparent 5.5px, black 6px);
   mask: radial-gradient(circle, transparent 5.5px, black 6px);
+  transition: --ctx-pct 400ms var(--ease);
 }
 
 .ctx-meter:hover .ctx-ring {
-  background: conic-gradient(var(--accent) calc(var(--pct, 0) * 1%), var(--border) 0);
+  --ctx-fill: var(--accent);
+}
+
+.ctx-meter[data-tone="attention"] .ctx-ring {
+  --ctx-fill: var(--attention);
+}
+
+.ctx-meter[data-tone="danger"] .ctx-ring {
+  --ctx-fill: var(--danger);
+}
+
+/* Where automatic compaction starts: a short mark just outside the ring's edge, turned by --tick (0 deg is 12 o'clock). */
+.ctx-tick {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2px;
+  height: 3px;
+  margin: -1.5px 0 0 -1px;
+  border-radius: 1px;
+  background: var(--fg-muted);
+  pointer-events: none;
+  transform: rotate(var(--tick, 0deg)) translateY(-11px);
+}
+
+/* A compaction in progress: an indeterminate arc sweeps around the ring. Reduced motion keeps a static partial ring. */
+.ctx-meter.is-compacting .ctx-ring {
+  --ctx-fill: var(--accent);
+  background: conic-gradient(var(--accent) 0 30%, var(--border) 30% 100%);
+  animation: ctx-sweep 1100ms linear infinite;
+}
+
+@keyframes ctx-sweep {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* State badge: the same words and glyphs as the sidebar. */
@@ -881,6 +927,7 @@
 @media (prefers-reduced-motion: reduce) {
   .activity-arc,
   .todo-item.is-in_progress .todo-mark,
+  .ctx-meter.is-compacting .ctx-ring,
   .state-badge[data-state="running"] .state-spinner,
   .state-badge[data-state="starting"] .state-spinner {
     animation: none;

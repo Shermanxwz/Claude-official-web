@@ -3,6 +3,60 @@
 All notable changes to this project are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning.
 
+## [1.4.0] - 2026-10-10
+
+Live context length, Claude Code's own automatic compaction and a live compaction animation, all from the official SDK
+interfaces, checked on the real Claude Code 2.1.295 runtime.
+
+### Added
+
+- A live context meter, `LiveInfo.context` (`ContextMeter`: `used`, `max`, `autoCompactAt`, `autoCompact`, `source`,
+  `compacting`, `lastCompaction`), published with `session_state` when it changes. `used` follows the runtime's own
+  stream: the usage of each main-thread API call (`message_start`, then the output tokens of `message_delta` and of the
+  assistant message); subagent calls never count. The window, the auto-compact threshold and the auto-compact switch
+  come from `getContextUsage()`.
+- The header context ring follows the meter live: a tick at the auto-compact threshold, a tooltip with the tokens, the
+  window and the auto-compact point (or "Automatic compaction is off"), and a tone that turns as the context nears the
+  threshold. Its fill eases, so a compaction's drop is visible.
+- A compaction in progress, automatic (also in the middle of a turn) or `/compact`, shows as a "Compacting the
+  conversation" row with the elapsed seconds and a slim sweep, an arc around the ring and "Compacting the conversation
+  (N s)" above the composer. `prefers-reduced-motion` stops the motion.
+- When the compaction ends, the same row becomes its divider in place: the trigger, the size before, the size of what
+  replaced the conversation and the time. On the real runtime: "Compacted automatically: 104.3k tokens summarized into
+  2.1k in 10.6 s" and "Compacted with /compact: 32.6k tokens summarized into 2.1k in 7.3 s". A failed compaction shows
+  an error notice.
+- Right after a compaction the meter shows an estimate at once (the fixed part of the context plus `post_tokens`), then
+  the gateway counts the whole context once (`getContextUsage({detail: 'full'})`, `source: 'count'`) unless a newer
+  API call has reported. When the count fails, the estimate stays; `apiUsage` from before the compaction is never used.
+  A resumed session whose last compaction has no call after it is counted in full too.
+- The context panel shows the live figures, the auto-compact point, a running compaction and the last compaction.
+- `GET /api/sessions/:id` returns `now`, the gateway's clock, so a page reloaded in the middle of a compaction counts
+  from the compaction's real start.
+- Mock engine: realistic usage, and compact, autocompact and compact-fail scenarios in the runtime's order (status,
+  result, init for `/compact`, boundary, the summary as a synthetic user message, "Compacted"). Its
+  `getSessionMessages` returns the chain from the last compaction, as the SDK does.
+
+### Changed
+
+- The summary Claude Code leaves after a compaction is a collapsed note, "Summary of the earlier conversation",
+  recognised on the live stream (the first synthetic user message after a boundary) and in transcripts
+  (`isCompactSummary`). It was a generic note.
+- The divider says "N tokens summarized into M" instead of "Context compacted from N tokens": `post_tokens` is the
+  runtime's estimate of what replaces the conversation (the summary and what is re-attached), not the new context size.
+
+### Fixed
+
+- The header ring did not move on the real runtime: `getContextUsage({detail: 'summary'})` leaves the conversation
+  out, so the ring showed only the fixed part of the context. The ring now uses the live meter.
+- Reopening a live session after a compaction: `getSessionMessages` returns the conversation from the last compaction
+  on, while the snapshot holds the events of the whole query, so the conversation the compaction replaced came back
+  after the transcript, out of order, and the compaction had no divider. The snapshot is now replayed from that
+  compaction, and its divider, with its sizes, sits before the summary.
+- The first message of a reopened session: the session reports `idle` once Claude Code is ready, before it takes the
+  message, and that ended the message's turn early, so messages that name no user message (a compaction's boundary
+  and summary, notices) landed in a new turn after it. The turn now waits until the session runs the message.
+- Long collapsed notes put their icon on a line of its own; the icon and the text now share the line.
+
 ## [1.3.0] - 2026-10-10
 
 Unattended mode, the counterpart of a Codex setup that never asks, checked on the real Claude Code 2.1.295 runtime.

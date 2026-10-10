@@ -13,12 +13,14 @@ import {
   MAX_DELAY_MS,
   resolveDelay,
 } from '../../src/engine/mock/index.mjs';
-import { createMockQuery } from '../../src/engine/mock/query.mjs';
+import { CONTEXT_BASE_TOKENS, createMockQuery } from '../../src/engine/mock/query.mjs';
 import { createMockStore, newRecord } from '../../src/engine/mock/store.mjs';
 import { createModel } from '../../public/js/timeline/model.js';
-import { SCENARIO_NAMES, selectScenario } from '../../src/engine/mock/scenarios.mjs';
+import { COMPACT_NOTICE_TEXT, SCENARIO_NAMES, selectScenario } from '../../src/engine/mock/scenarios.mjs';
 
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
+/** How the runtime opens the summary a compaction leaves in the context. */
+const COMPACT_SUMMARY_START = 'This session is being continued from a previous conversation that ran out of context.';
 
 /**
  * A fresh state directory, removed when the test ends.
@@ -256,6 +258,8 @@ const SCENARIO_PROMPTS = {
   context: '/context',
   usage: '/usage',
   clear: '/clear',
+  autocompact: 'autocompact the long logs',
+  'compact-fail': 'compact-fail please',
   browse: 'browse the page and take a screenshot',
   tool: 'please run the tool',
   edit: 'edit the server file',
@@ -1200,8 +1204,13 @@ describe('control methods', () => {
   test('getContextUsage and the usage response follow the session and its five-hour utilization', async (t) => {
     const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
     const fresh = await query.getContextUsage();
-    assert.equal(fresh.maxTokens, 200000);
+    // The fixed overhead is CONTEXT_BASE_TOKENS, plus the MCP tools row while the GitHub server is connected.
+    const fixed = CONTEXT_BASE_TOKENS + fresh.mcpTools.reduce((sum, tool) => sum + tool.tokens, 0);
+    assert.equal(fresh.maxTokens, 100000);
+    assert.equal(fresh.autoCompactThreshold, 67000);
     assert.equal(fresh.isAutoCompactEnabled, true);
+    assert.equal(fresh.totalTokens, fixed);
+    assert.equal(fresh.apiUsage, null, 'no model call has been made by this process');
     assert.ok(fresh.categories.some((category) => category.kind === 'free'));
     channel.push(userPrompt('check the rate'));
     await pullUntil(query, (message) => message.type === 'result');
@@ -1211,6 +1220,10 @@ describe('control methods', () => {
     const after = await query.getContextUsage();
     assert.ok(after.totalTokens > fresh.totalTokens);
     assert.notEqual(after.apiUsage, null);
+    const summary = await query.getContextUsage({ detail: 'summary' });
+    assert.equal(summary.totalTokens, fixed, 'a summary leaves the conversation out');
+    assert.equal(summary.categories.some((category) => category.name === 'Messages'), false);
+    assert.deepEqual(summary.apiUsage, after.apiUsage);
   });
 });
 
@@ -1286,6 +1299,242 @@ describe('store files', () => {
     assert.throws(() => store.create(upper), /Session id must be a lowercase UUID/);
     const record = store.create(newRecord({ sessionId: randomUUID(), cwd: projectDir(t) }));
     assert.throws(() => store.create(record), /Session already exists/);
+  });
+});
+
+describe('the transcript a compaction leaves', () => {
+  /**
+   * A main-thread entry of the transcript: a user prompt or an assistant answer, with its Messages API payload.
+   * @param {string} sessionId
+   * @param {'user'|'assistant'} type
+   * @param {string} text
+   */
+  function turnEntry(sessionId, type, text) {
+    return {
+      type,
+      uuid: randomUUID(),
+      session_id: sessionId,
+      message: { role: type, content: text },
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+    };
+  }
+
+  /**
+   * The boundary of a compaction, stored as the mock stores it: a system entry whose message is the SDK payload.
+   * @param {string} sessionId
+   * @param {'manual'|'auto'} [trigger]
+   */
+  function boundaryEntry(sessionId, trigger = 'manual') {
+    return {
+      type: 'system',
+      uuid: randomUUID(),
+      session_id: sessionId,
+      message: { type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger, pre_tokens: 40000 } },
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+    };
+  }
+
+  /**
+   * The summary a compaction leaves: a user message that the transcript flags as a compaction summary.
+   * @param {string} sessionId
+   */
+  function summaryEntry(sessionId) {
+    return {
+      type: 'user',
+      uuid: randomUUID(),
+      session_id: sessionId,
+      message: { role: 'user', content: [{ type: 'text', text: 'Summary of the conversation so far.' }] },
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      isCompactSummary: true,
+      is_meta: true,
+    };
+  }
+
+  /**
+   * A system entry that is not a boundary: the output of a local command, which the chain keeps as it is.
+   * @param {string} sessionId
+   */
+  function outputEntry(sessionId) {
+    return {
+      type: 'system',
+      uuid: randomUUID(),
+      session_id: sessionId,
+      message: { type: 'system', subtype: 'local_command_output', content: 'Usage: 12 tokens' },
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+    };
+  }
+
+  /**
+   * A store with one session whose transcript is the given entries, stored the way the mock stores them.
+   * @param {import('node:test').TestContext} t
+   * @param {string} sessionId
+   * @param {any[]} transcript
+   * @returns {{store: ReturnType<typeof createMockStore>, cwd: string}}
+   */
+  function storeWith(t, sessionId, transcript) {
+    const store = createMockStore(join(tempDir(t), 'mock-sessions'));
+    const cwd = projectDir(t);
+    const record = newRecord({ sessionId, cwd });
+    record.transcript = transcript;
+    store.create(record);
+    return { store, cwd };
+  }
+
+  /**
+   * @param {Array<{uuid: string}>} entries
+   * @returns {string[]} the uuids, in order
+   */
+  function uuidsOf(entries) {
+    return entries.map((entry) => entry.uuid);
+  }
+
+  test('after a compaction the chain starts with the bare boundary, then the summary and the later entries',
+    async (t) => {
+      const sessionId = randomUUID();
+      const boundary = boundaryEntry(sessionId);
+      const summary = summaryEntry(sessionId);
+      const output = outputEntry(sessionId);
+      const later = turnEntry(sessionId, 'user', 'And one more thing');
+      const reply = turnEntry(sessionId, 'assistant', 'Here is the answer.');
+      const { store, cwd } = storeWith(t, sessionId, [
+        turnEntry(sessionId, 'user', 'Tell me something about the project'),
+        turnEntry(sessionId, 'assistant', 'Here is what I found.'),
+        boundary,
+        summary,
+        output,
+        later,
+        reply,
+      ]);
+      const chain = await store.getSessionMessages(sessionId, { dir: cwd, includeSystemMessages: true });
+      assert.deepEqual(uuidsOf(chain), [boundary.uuid, summary.uuid, output.uuid, later.uuid, reply.uuid]);
+      assert.deepEqual(chain[0], {
+        type: 'system',
+        uuid: boundary.uuid,
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      }, 'the boundary is a bare record: no message and no subtype');
+      assert.deepEqual(chain.slice(1), [summary, output, later, reply], 'the entries after the boundary are as stored');
+    });
+
+  test('after two compactions only the last one starts the chain', async (t) => {
+    const sessionId = randomUUID();
+    const latest = boundaryEntry(sessionId, 'auto');
+    const summary = summaryEntry(sessionId);
+    const third = turnEntry(sessionId, 'user', 'Third topic');
+    const { store, cwd } = storeWith(t, sessionId, [
+      turnEntry(sessionId, 'user', 'First topic'),
+      boundaryEntry(sessionId),
+      summaryEntry(sessionId),
+      turnEntry(sessionId, 'user', 'Second topic'),
+      latest,
+      summary,
+      third,
+    ]);
+    const chain = await store.getSessionMessages(sessionId, { dir: cwd, includeSystemMessages: true });
+    assert.deepEqual(uuidsOf(chain), [latest.uuid, summary.uuid, third.uuid]);
+    assert.equal('message' in chain[0], false, 'the boundary is a bare record');
+    assert.equal(chain[0].type, 'system');
+  });
+
+  test('without includeSystemMessages the boundary is left out, and the chain still starts at the summary',
+    async (t) => {
+      const sessionId = randomUUID();
+      const summary = summaryEntry(sessionId);
+      const later = turnEntry(sessionId, 'user', 'And one more thing');
+      const reply = turnEntry(sessionId, 'assistant', 'Here is the answer.');
+      const { store, cwd } = storeWith(t, sessionId, [
+        turnEntry(sessionId, 'user', 'Tell me something about the project'),
+        boundaryEntry(sessionId),
+        summary,
+        outputEntry(sessionId),
+        later,
+        reply,
+      ]);
+      const plain = await store.getSessionMessages(sessionId, { dir: cwd });
+      assert.deepEqual(uuidsOf(plain), [summary.uuid, later.uuid, reply.uuid]);
+      assert.deepEqual(plain.map((entry) => entry.type), ['user', 'user', 'assistant']);
+    });
+
+  test('limit and offset page within the chain, so nothing before its boundary can be reached', async (t) => {
+    const sessionId = randomUUID();
+    const boundary = boundaryEntry(sessionId);
+    const summary = summaryEntry(sessionId);
+    const output = outputEntry(sessionId);
+    const later = turnEntry(sessionId, 'user', 'And one more thing');
+    const reply = turnEntry(sessionId, 'assistant', 'Here is the answer.');
+    const { store, cwd } = storeWith(t, sessionId, [
+      turnEntry(sessionId, 'user', 'Tell me something about the project'),
+      boundary,
+      summary,
+      output,
+      later,
+      reply,
+    ]);
+    const read = async (options) => uuidsOf(await store.getSessionMessages(sessionId, { dir: cwd, ...options }));
+    assert.deepEqual(await read({ includeSystemMessages: true, offset: 0, limit: 1 }), [boundary.uuid]);
+    assert.deepEqual(await read({ includeSystemMessages: true, offset: 1, limit: 2 }), [summary.uuid, output.uuid]);
+    assert.deepEqual(await read({ includeSystemMessages: true, offset: 3 }), [later.uuid, reply.uuid]);
+    assert.deepEqual(await read({ includeSystemMessages: true, offset: 5 }), []);
+    assert.deepEqual(await read({ offset: 1, limit: 1 }), [later.uuid]);
+    assert.deepEqual(await read({ offset: 2 }), [reply.uuid]);
+    assert.deepEqual(await read({ offset: 3 }), []);
+  });
+
+  test('a session that was never compacted is returned whole, with its system entries as stored', async (t) => {
+    const sessionId = randomUUID();
+    const transcript = [
+      turnEntry(sessionId, 'user', 'Tell me something about the project'),
+      turnEntry(sessionId, 'assistant', 'Here is what I found.'),
+      outputEntry(sessionId),
+      turnEntry(sessionId, 'user', 'And one more thing'),
+      turnEntry(sessionId, 'assistant', 'Here is the answer.'),
+    ];
+    const { store, cwd } = storeWith(t, sessionId, transcript);
+    assert.deepEqual(await store.getSessionMessages(sessionId, { dir: cwd, includeSystemMessages: true }), transcript);
+    assert.deepEqual(await store.getSessionMessages(sessionId, { dir: cwd }),
+      transcript.filter((entry) => entry.type !== 'system'));
+  });
+
+  test('an entry of a subagent never counts as a compaction boundary', async (t) => {
+    const sessionId = randomUUID();
+    const boundary = boundaryEntry(sessionId);
+    const summary = summaryEntry(sessionId);
+    const later = turnEntry(sessionId, 'user', 'And one more thing');
+    const nested = { ...boundaryEntry(sessionId, 'auto'), parent_tool_use_id: 'toolu_nested' };
+    const { store, cwd } = storeWith(t, sessionId, [
+      turnEntry(sessionId, 'user', 'Tell me something about the project'),
+      boundary,
+      summary,
+      later,
+      nested,
+    ]);
+    const chain = await store.getSessionMessages(sessionId, { dir: cwd, includeSystemMessages: true });
+    assert.deepEqual(uuidsOf(chain), [boundary.uuid, summary.uuid, later.uuid, nested.uuid]);
+    assert.deepEqual(chain.at(-1), nested, 'the nested entry is kept as stored, with its payload');
+  });
+
+  test('two /compact turns in one session leave the chain at the second boundary', async (t) => {
+    const adapter = adapterAt(tempDir(t));
+    const cwd = projectDir(t);
+    const { query, channel } = await openOn(t, adapter, cwd);
+    channel.push(userPrompt('Tell me something about the project'));
+    const first = await pullUntil(query, (m) => m.type === 'result');
+    const sessionId = first.find((m) => typeof m.session_id === 'string').session_id;
+    for (const text of ['/compact', 'And one more thing', '/compact']) {
+      channel.push(userPrompt(text));
+      await pullUntil(query, (m) => m.type === 'result');
+    }
+    // The chain is the second boundary, its summary and its notice: the prompt and answer before it are not returned.
+    const chain = await adapter.getSessionMessages(sessionId, { dir: cwd, includeSystemMessages: true });
+    assert.deepEqual(chain.map((entry) => entry.type), ['system', 'user', 'user']);
+    assert.deepEqual(chain.map((entry) => entry.isCompactSummary === true), [false, true, false]);
+    assert.equal(chain.some((entry) => entry.message?.content === 'Tell me something about the project'), false);
+    assert.equal(chain.some((entry) => entry.message?.content === 'And one more thing'), false);
   });
 });
 
@@ -1725,8 +1974,8 @@ describe('runtime messages around each turn', () => {
     assert.equal(messages[2].subtype, 'init');
     assert.deepEqual(messages[3].value, {
       enabled: true,
-      effective_window: 200000,
-      threshold: 167000,
+      effective_window: 100000,
+      threshold: 67000,
       enforced: true,
       source: 'clientdata',
     });
@@ -2259,5 +2508,216 @@ describe('output style and local settings', () => {
     await assert.rejects(query.updateSettings('localSettings', { outputStyle: 'Learning' }),
       /Local settings are not loaded for this session\./);
     assert.equal((await query.initializationResult()).output_style, 'default');
+  });
+});
+
+describe('context meter of the mock', () => {
+  /**
+   * The prompt side (input, cache creation and cache read) that each top-level model call streamed when it started.
+   * @param {any[]} messages
+   * @returns {number[]}
+   */
+  function promptsOf(messages) {
+    return messages
+      .filter((m) => m.type === 'stream_event' && !m.parent_tool_use_id && m.event.type === 'message_start')
+      .map((m) => {
+        const usage = m.event.message.usage;
+        return usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
+      });
+  }
+
+  /**
+   * The statuses of the compactions in some messages: each system/status as its status and compact result.
+   * @param {any[]} messages
+   * @returns {Array<[string|null, string|null]>}
+   */
+  function compactionStatusesOf(messages) {
+    return messages.filter((m) => m.type === 'system' && m.subtype === 'status')
+      .map((m) => [m.status, m.compact_result ?? null]);
+  }
+
+  /**
+   * The tokens of the fixed overhead the query reports: CONTEXT_BASE_TOKENS plus the MCP tools it lists.
+   * @param {{mcpTools: Array<{tokens: number}>}} usage
+   */
+  function fixedOf(usage) {
+    return CONTEXT_BASE_TOKENS + usage.mcpTools.reduce((sum, tool) => sum + tool.tokens, 0);
+  }
+
+  /** @param {any[]} messages */
+  function topLevelAssistants(messages) {
+    return messages.filter((m) => m.type === 'assistant' && !m.parent_tool_use_id);
+  }
+
+  test('before any message the context is the fixed overhead, in the rows the runtime shows', async (t) => {
+    const { query } = await openQuery(t, tempDir(t), projectDir(t));
+    const usage = await query.getContextUsage();
+    const rows = Object.fromEntries(usage.categories.filter((c) => c.kind === 'used').map((c) => [c.name, c.tokens]));
+    assert.equal(rows['System prompt'], 9400);
+    assert.equal(rows['System tools'], 27600);
+    assert.equal(rows.Skills, 1476);
+    assert.equal(rows['Memory files'], 640);
+    assert.equal(rows.Messages, 0);
+    assert.equal(usage.totalTokens, fixedOf(usage));
+    assert.equal(usage.categories.find((c) => c.kind === 'buffer').tokens, 33000);
+    assert.equal(usage.categories.find((c) => c.kind === 'free').tokens, 67000 - usage.totalTokens);
+    assert.equal(usage.apiUsage, null, 'no model call has been made by this process');
+  });
+
+  test('a turn adds its messages to the context, and apiUsage is the usage of the last top-level call', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t), { includePartialMessages: true });
+    const fixed = fixedOf(await query.getContextUsage({ detail: 'summary' }));
+    channel.push(userPrompt('Tell me something about the project'));
+    const messages = await pullUntil(query, (m) => m.type === 'result');
+    const full = await query.getContextUsage();
+    const summary = await query.getContextUsage({ detail: 'summary' });
+    assert.equal(summary.totalTokens, fixed, 'a summary leaves the conversation out');
+    assert.ok(full.totalTokens > fixed + 100, 'the prompt and the answer are in the context');
+    const [prompt] = promptsOf(messages);
+    assert.ok(prompt > fixed && prompt < full.totalTokens, 'the call sends the fixed overhead and the prompt');
+    const last = topLevelAssistants(messages).at(-1).message.usage;
+    assert.deepEqual(full.apiUsage, {
+      input_tokens: last.input_tokens,
+      output_tokens: last.output_tokens,
+      cache_creation_input_tokens: last.cache_creation_input_tokens,
+      cache_read_input_tokens: last.cache_read_input_tokens,
+    });
+    assert.equal(full.apiUsage.input_tokens, 3, 'the runtime counts a few input tokens outside the cache');
+  });
+
+  test('a response reports its output so far in each block, and the last block reports all of it', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t), { includePartialMessages: true });
+    channel.push(userPrompt('please run the tool'));
+    const messages = await pullUntil(query, (m) => m.type === 'result');
+    const first = topLevelAssistants(messages)[0].message.id;
+    const outputs = messages.filter((m) => m.type === 'assistant' && m.message.id === first)
+      .map((m) => m.message.usage.output_tokens);
+    assert.ok(outputs.length >= 2, 'the response has a text block and a tool call');
+    assert.ok(outputs.every((tokens, index) => index === 0 || tokens >= outputs[index - 1]), `grows: ${outputs}`);
+    assert.ok(outputs[0] < outputs.at(-1));
+    const delta = messages.find((m) => m.type === 'stream_event' && m.event.type === 'message_delta');
+    assert.equal(delta.event.usage.output_tokens, outputs.at(-1), 'the stream ends with the response output');
+  });
+
+  test('autocompact: the second read passes the threshold, so the runtime compacts before answering', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t), { includePartialMessages: true });
+    const fixed = fixedOf(await query.getContextUsage({ detail: 'summary' }));
+    channel.push(userPrompt('autocompact the long logs'));
+    const messages = await pullUntil(query, (m) => m.type === 'result');
+    assert.deepEqual(compactionStatusesOf(messages), [['requesting', null], ['compacting', null], [null, 'success']]);
+    const boundaries = messages.filter((m) => m.type === 'system' && m.subtype === 'compact_boundary');
+    assert.equal(boundaries.length, 1);
+    const metadata = boundaries[0].compact_metadata;
+    assert.equal(metadata.trigger, 'auto');
+    assert.equal(metadata.post_tokens, 2069);
+    const [firstRead, secondRead, answer] = promptsOf(messages);
+    assert.ok(secondRead < 67000, 'the second call still sits below the threshold');
+    assert.ok(metadata.pre_tokens > 67000 && metadata.pre_tokens > secondRead, 'the reads pass the threshold');
+    assert.ok(firstRead < secondRead);
+    assert.equal(answer, fixed + 2069, 'the answer comes from the summary and the fixed overhead');
+    assert.equal(topLevelAssistants(messages).at(-1).message.content[0].text,
+      'Both log batches processed without errors.');
+  });
+
+  test('autocompact: the summary follows the boundary and the transcript keeps it, with no notice', async (t) => {
+    const adapter = adapterAt(tempDir(t));
+    const cwd = projectDir(t);
+    const { query, channel } = await openOn(t, adapter, cwd, { includePartialMessages: true });
+    channel.push(userPrompt('autocompact the long logs'));
+    const messages = await pullUntil(query, (m) => m.type === 'result');
+    const at = messages.findIndex((m) => m.type === 'system' && m.subtype === 'compact_boundary');
+    const summary = messages[at + 1];
+    assert.deepEqual([summary.type, summary.isSynthetic, summary.isReplay], ['user', true, false]);
+    assert.ok(summary.message.content[0].text.startsWith(COMPACT_SUMMARY_START));
+    const answered = messages.slice(at + 2).some((m) => m.type === 'assistant' && !m.parent_tool_use_id);
+    assert.ok(answered, 'the answer follows the summary');
+    const sessionId = messages.find((m) => typeof m.session_id === 'string').session_id;
+    const stored = await adapter.getSessionMessages(sessionId, { dir: cwd, includeSystemMessages: true });
+    assert.equal(stored.filter((entry) => entry.isCompactSummary === true).length, 1);
+    assert.equal(stored.some((entry) => entry.message?.content === COMPACT_NOTICE_TEXT), false);
+  });
+
+  test('/compact: the status shows the compaction, the init comes again, and the summary replaces the conversation',
+    async (t) => {
+      const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
+      channel.push(userPrompt('Tell me something about the project'));
+      await pullUntil(query, (m) => m.type === 'result');
+      const before = (await query.getContextUsage()).totalTokens;
+      channel.push(userPrompt('/compact'));
+      const messages = await pullUntil(query, (m) => m.type === 'result');
+      assert.deepEqual(compactionStatusesOf(messages), [['compacting', null], [null, 'success']]);
+      assert.equal(messages.filter((m) => m.type === 'system' && m.subtype === 'init').length, 1);
+      const [boundary] = messages.filter((m) => m.type === 'system' && m.subtype === 'compact_boundary');
+      assert.equal(boundary.compact_metadata.trigger, 'manual');
+      assert.equal(boundary.compact_metadata.post_tokens, 1960);
+      assert.ok(boundary.compact_metadata.pre_tokens > before, 'the compaction sees the context before it');
+      const after = await query.getContextUsage();
+      assert.equal(after.totalTokens, fixedOf(after) + 1960);
+    });
+
+  test('/compact streams the summary and the notice after the boundary, and the transcript keeps them', async (t) => {
+    const adapter = adapterAt(tempDir(t));
+    const cwd = projectDir(t);
+    const { query, channel } = await openOn(t, adapter, cwd);
+    channel.push(userPrompt('Tell me something about the project'));
+    await pullUntil(query, (m) => m.type === 'result');
+    channel.push(userPrompt('/compact'));
+    const messages = await pullUntil(query, (m) => m.type === 'result');
+    const at = messages.findIndex((m) => m.type === 'system' && m.subtype === 'compact_boundary');
+    const [summary, notice, result] = messages.slice(at + 1);
+    assert.deepEqual([summary.isSynthetic, summary.isReplay], [true, false]);
+    assert.ok(summary.message.content[0].text.startsWith(COMPACT_SUMMARY_START));
+    assert.deepEqual([notice.isReplay, notice.message.content], [true, COMPACT_NOTICE_TEXT]);
+    assert.equal(result.type, 'result');
+    // The transcript keeps the summary with the flags of a stored summary, then the notice of the command. Its chain
+    // starts at the boundary, as a bare record with its uuid: the SDK's record has no message, so no subtype either.
+    const sessionId = messages.find((m) => typeof m.session_id === 'string').session_id;
+    const stored = await adapter.getSessionMessages(sessionId, { dir: cwd, includeSystemMessages: true });
+    assert.equal(stored.length, 3, 'nothing before the boundary is returned');
+    const [boundary, kept, echo] = stored;
+    assert.deepEqual(boundary, {
+      type: 'system',
+      uuid: messages[at].uuid,
+      session_id: sessionId,
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+    });
+    assert.deepEqual([kept.type, kept.isCompactSummary, kept.is_meta], ['user', true, true]);
+    assert.equal('isSynthetic' in kept, false);
+    assert.equal(echo.message.content, COMPACT_NOTICE_TEXT);
+    assert.equal(stored.filter((entry) => entry.isCompactSummary === true).length, 1);
+  });
+
+  test('a compaction that fails ends with a failed status, writes no boundary, and the turn goes on', async (t) => {
+    const messages = await runSingle(adapterAt(tempDir(t)), projectDir(t), 'compact-fail please');
+    assertWellFormed(messages);
+    assert.deepEqual(compactionStatusesOf(messages), [['compacting', null], [null, 'failed']]);
+    const failed = messages.find((m) => m.type === 'system' && m.compact_result === 'failed');
+    assert.equal(failed.compact_error, 'The summary request was refused.');
+    assert.equal(messages.some((m) => m.type === 'system' && m.subtype === 'compact_boundary'), false);
+    assert.equal(messages.filter((m) => m.type === 'result').at(-1).subtype, 'success');
+  });
+
+  test('/clear starts the context over: the conversation leaves it and the fixed overhead remains', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
+    channel.push(userPrompt('Tell me something about the project'));
+    await pullUntil(query, (m) => m.type === 'result');
+    const talked = await query.getContextUsage();
+    channel.push(userPrompt('/clear'));
+    await pullUntil(query, (m) => m.type === 'result');
+    const cleared = await query.getContextUsage();
+    assert.ok(talked.totalTokens > cleared.totalTokens);
+    assert.equal(cleared.totalTokens, fixedOf(cleared));
+  });
+
+  test('a subagent call does not count toward apiUsage, which is the main thread\'s last call', async (t) => {
+    const { query, channel } = await openQuery(t, tempDir(t), projectDir(t));
+    channel.push(userPrompt('use an agent for this'));
+    const messages = await pullUntil(query, (m) => m.type === 'result');
+    assert.ok(messages.some((m) => typeof m.parent_tool_use_id === 'string'), 'the subagent ran');
+    const last = topLevelAssistants(messages).at(-1).message.usage;
+    const usage = (await query.getContextUsage()).apiUsage;
+    assert.equal(usage.input_tokens, last.input_tokens);
+    assert.equal(usage.cache_read_input_tokens, last.cache_read_input_tokens);
   });
 });

@@ -61,9 +61,11 @@ describe('sessions: lifecycle', { timeout: 120000 }, () => {
     assert.equal(res.status, 200);
     const live = res.json.live;
     assert.deepEqual(Object.keys(live).sort(), ['additionalDirectories', 'agent', 'backgroundTasks', 'browserTools',
-      'claudeCodeVersion', 'cwd', 'effort', 'error', 'fallbackModel', 'fastMode', 'fastModeDisabledReason',
+      'claudeCodeVersion', 'context', 'cwd', 'effort', 'error', 'fallbackModel', 'fastMode', 'fastModeDisabledReason',
       'fastModeState', 'lastActivity', 'lockedBy', 'model', 'pendingCount', 'permissionMode', 'sessionId', 'state',
       'title', 'trusted']);
+    assert.deepEqual(Object.keys(live.context).sort(),
+      ['autoCompact', 'autoCompactAt', 'compacting', 'lastCompaction', 'max', 'source', 'used']);
     assert.equal(live.backgroundTasks, 0);
     assert.equal(live.fastMode, null, 'the settings files decide until the host requests fast mode');
     assert.ok(isUuid(live.sessionId));
@@ -192,7 +194,8 @@ describe('sessions: lifecycle', { timeout: 120000 }, () => {
     try {
       await runTurn(api, events, sessionId, 'Snapshot please');
       const snapshot = (await api.get(`/api/sessions/${sessionId}`)).json;
-      assert.deepEqual(Object.keys(snapshot).sort(), ['info', 'init', 'live', 'liveEvents', 'pending', 'seq']);
+      assert.deepEqual(Object.keys(snapshot).sort(), ['info', 'init', 'live', 'liveEvents', 'now', 'pending', 'seq']);
+      assert.ok(snapshot.now > 0 && snapshot.now <= Date.now(), 'the gateway clock, in epoch milliseconds');
       assert.equal(snapshot.info.sessionId, sessionId);
       assert.equal(snapshot.info.cwd, server.proj);
       assert.equal(snapshot.live.sessionId, sessionId);

@@ -155,42 +155,85 @@ describe('refusal-prompt scenario through a query', () => {
   });
 });
 
-describe('slow scenario pacing', () => {
+/**
+ * A turn context for the scenario functions, with the pauses recorded instead of waited for.
+ * @param {{delayMs: number, pauses: number[], userText?: string}} options
+ */
+function fakeContext({ delayMs, pauses, userText = 'answer slowly' }) {
+  const sessionId = '0b6f6a52-2d2e-4f7a-9d8e-1a2b3c4d5e6f';
+  let sequence = 0;
+  /** @type {Record<string, number>} */
+  const counters = {};
+  return {
+    sessionId,
+    cwd: '/work',
+    model: 'claude-sonnet-mock',
+    userText,
+    userMessageUuid: '9d1f0e2a-3b4c-4d5e-8f60-718293a4b5c6',
+    userMessageUuids: ['9d1f0e2a-3b4c-4d5e-8f60-718293a4b5c6'],
+    delayMs,
+    streamPartials: true,
+    turnIndex: 0,
+    thinkingSummaries: false,
+    nextId: (/** @type {string} */ kind) => {
+      counters[kind] = (counters[kind] ?? 0) + 1;
+      return `${kind}_fake_${counters[kind]}`;
+    },
+    envelope: () => {
+      sequence += 1;
+      return { uuid: `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`, session_id: sessionId };
+    },
+    now: () => Date.now(),
+    contextTokens: () => ({ total: 39116, fresh: 0 }),
+    initialize: () => ({ type: 'system', subtype: 'init' }),
+    pause: function* pause(/** @type {number} */ ms) {
+      pauses.push(ms);
+    },
+  };
+}
+
+describe('compaction messages', () => {
+  const SUMMARY_START = 'This session is being continued from a previous conversation that ran out of context.';
+
   /**
-   * A turn context for the scenario functions, with the pauses recorded instead of waited for.
-   * @param {{delayMs: number, pauses: number[]}} options
+   * Runs the scenario of a prompt against a fake context and collects what it yields.
+   * @param {string} text
+   * @returns {Promise<any[]>}
    */
-  function fakeContext({ delayMs, pauses }) {
-    const sessionId = '0b6f6a52-2d2e-4f7a-9d8e-1a2b3c4d5e6f';
-    let sequence = 0;
-    /** @type {Record<string, number>} */
-    const counters = {};
-    return {
-      sessionId,
-      cwd: '/work',
-      model: 'claude-sonnet-mock',
-      userText: 'answer slowly',
-      userMessageUuid: '9d1f0e2a-3b4c-4d5e-8f60-718293a4b5c6',
-      userMessageUuids: ['9d1f0e2a-3b4c-4d5e-8f60-718293a4b5c6'],
-      delayMs,
-      streamPartials: true,
-      turnIndex: 0,
-      thinkingSummaries: false,
-      nextId: (/** @type {string} */ kind) => {
-        counters[kind] = (counters[kind] ?? 0) + 1;
-        return `${kind}_fake_${counters[kind]}`;
-      },
-      envelope: () => {
-        sequence += 1;
-        return { uuid: `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`, session_id: sessionId };
-      },
-      now: () => Date.now(),
-      pause: function* pause(/** @type {number} */ ms) {
-        pauses.push(ms);
-      },
-    };
+  async function streamOf(text) {
+    const messages = [];
+    const scenario = selectScenario(text);
+    for await (const message of scenario.run(fakeContext({ delayMs: 0, pauses: [], userText: text }))) {
+      messages.push(message);
+    }
+    return messages;
   }
 
+  test('/compact streams the boundary, the summary, then the notice of the command as a replay', async () => {
+    const messages = await streamOf('/compact');
+    assert.deepEqual(messages.map((m) => m.subtype ?? m.type),
+      ['status', 'status', 'init', 'compact_boundary', 'user', 'user']);
+    const [summary, notice] = messages.slice(-2);
+    assert.deepEqual([summary.isSynthetic, summary.isReplay, summary.parent_tool_use_id], [true, false, null]);
+    assert.ok(summary.message.content[0].text.startsWith(SUMMARY_START), 'the runtime opens the summary this way');
+    assert.deepEqual([notice.isReplay, notice.message.content],
+      [true, '<local-command-stdout>Compacted </local-command-stdout>']);
+    assert.notEqual(summary.uuid, notice.uuid);
+  });
+
+  test('an automatic compaction streams its summary right after the boundary, with no init and no notice', async () => {
+    const messages = await streamOf('autocompact the long logs');
+    const at = messages.findIndex((m) => m.type === 'system' && m.subtype === 'compact_boundary');
+    assert.equal(messages.some((m) => m.type === 'system' && m.subtype === 'init'), false);
+    assert.equal(messages.some((m) => m.isReplay === true), false);
+    const summary = messages[at + 1];
+    assert.deepEqual([summary.type, summary.isSynthetic, summary.isReplay], ['user', true, false]);
+    assert.ok(summary.message.content[0].text.startsWith(SUMMARY_START));
+    assert.equal(messages[at + 2].type, 'stream_event', 'the answer comes from the shorter context, after the summary');
+  });
+});
+
+describe('slow scenario pacing', () => {
   /** Runs the slow scenario against a fake context and collects what it yields. */
   async function runSlow(delayMs) {
     const pauses = [];

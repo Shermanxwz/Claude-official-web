@@ -1366,6 +1366,12 @@
   width: 100%;
 }
 
+/* A collapsed note that is the notice's whole body stays on the icon's line; opened, its text wraps inside it. */
+.notice-collapse.is-body {
+  flex: 1 1 0;
+  width: auto;
+}
+
 .notice-collapse > summary {
   display: inline-flex;
   align-items: center;
@@ -1440,6 +1446,57 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The compacting row keeps the divider's box (same height, same rhythm), so the boundary turns it into the divider
+   without moving the conversation. Its two rules become slim bars that sweep while the compaction runs. */
+.divider.is-compacting {
+  color: var(--fg-muted);
+}
+
+.divider.is-compacting::before,
+.divider.is-compacting::after {
+  height: 2px;
+  border-radius: 999px;
+  background-color: var(--accent-soft);
+  background-image: linear-gradient(90deg, transparent, var(--accent) 50%, transparent);
+  background-repeat: no-repeat;
+  background-size: 40% 100%;
+  animation: compacting-sweep 1400ms linear infinite;
+}
+
+@keyframes compacting-sweep {
+  from {
+    background-position: -67% 0;
+  }
+
+  to {
+    background-position: 167% 0;
+  }
+}
+
+.divider-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.divider-elapsed {
+  flex: 0 0 auto;
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The sweep stops: the two rules stay as static, half-strength bars. */
+  .divider.is-compacting::before,
+  .divider.is-compacting::after {
+    animation: none;
+    background-color: var(--accent);
+    background-image: none;
+    opacity: 0.5;
+  }
 }
 
 .withdrawn {

@@ -42,8 +42,9 @@ This is an overview. The complete map, with the SDK call or message behind each 
 - **Conversation:** streaming replies, collapsible thinking with its summary, Markdown and code, tool cards for every
   tool family (diffs for edits), subagents nested in their parent card, background tasks (including moving a running
   command or subagent to the background, like Ctrl+B), interrupts that leave background tasks running, queued messages
-  that you can cancel, a Stop menu that can also clear the queue, refusal-fallback notices, compaction and context
-  usage. Side questions (`/btw`) get an answer that stays out of the transcript.
+  that you can cancel, a Stop menu that can also clear the queue, refusal-fallback notices, a live context meter, and
+  compaction shown while it runs and afterwards as a divider with its sizes and time. Side questions (`/btw`) get an
+  answer that stays out of the transcript.
 - **Approvals:** permission cards (allow once, allow always, or deny with a reason), answers to AskUserQuestion, plan
   approval, MCP elicitation, permission modes, and model, effort and fast mode switching. Allow always saves the ticked
   suggestions: allow rules and session-only mode switches start ticked, directory grants and other changes only when you

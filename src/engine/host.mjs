@@ -22,6 +22,11 @@ import {
   interruptReceipt, isEditableMemoryFile, isPlainObject, isWebUrl, listedMemoryFiles, redactMcpServers, redactView,
   runtimeMethod, sameDirectory, viewArguments, withTimeout, writeMemoryFile,
 } from './runtime-views.mjs';
+import {
+  applyWindow, countAfterCompaction, emptyContextMeter, endCompaction, estimateAfterCompaction, fillUsed,
+  isCompactPrompt, isNewerCall, isSubagentMessage, observeUsage, postTokensOf, recordCompaction, snapshotContextMeter,
+  startCompaction, transcriptContextOf, usageTokens,
+} from './context-meter.mjs';
 
 /** @typedef {import('../contracts.mjs').EngineHostApi} EngineHostApi */
 /** @typedef {import('../contracts.mjs').EngineAdapter} EngineAdapter */
@@ -42,6 +47,8 @@ import {
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKMessage} SDKMessage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKUserMessage} SDKUserMessage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKSystemMessage} SDKSystemMessage */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKStatusMessage} SDKStatusMessage */
+/** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKCompactBoundaryMessage} SDKCompactBoundaryMessage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SDKSessionInfo} SDKSessionInfo */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').SessionMessage} SessionMessage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').PermissionMode} PermissionMode */
@@ -56,6 +63,8 @@ import {
 /** @typedef {import('../contracts.mjs').RuntimeTrust} RuntimeTrust */
 /** @typedef {import('../contracts.mjs').MemoryFile} MemoryFile */
 /** @typedef {import('../contracts.mjs').ContextUsage} ContextUsage */
+/** @typedef {import('../contracts.mjs').ContextMeter} ContextMeter */
+/** @typedef {import('./context-meter.mjs').CallUsage} CallUsage */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').McpServerConfig} McpServerConfig */
 /** @typedef {import('@anthropic-ai/claude-agent-sdk').OnUserDialog} OnUserDialog */
 /** @typedef {ReturnType<typeof sideAnswerOf>} SideAnswer */
@@ -151,6 +160,11 @@ const TRUST_NOTICE_MESSAGE = 'Claude Code did not record this folder as trusted,
  * @property {boolean} unattended           the unattended switch is applied to this query (docs/PROTOCOL.md)
  * @property {PermissionMode|null} modeBeforeUnattended   the mode the query runs in when the switch is off; while
  *   the switch is on, the mode the session chose. null means not known: the query returns to default
+ * @property {ContextMeter} context         the live context meter and compaction state (docs/PROTOCOL.md)
+ * @property {CallUsage|null} contextCall   the API call whose usage streams into the meter
+ * @property {number|null} contextFixed     the fixed part of the context (the summary's totalTokens) at the last read
+ * @property {boolean} compactPrompt        the prompt that started the running turn is a /compact command
+ * @property {boolean} resumed              the query resumes a session file, whose transcript may record usage
  */
 
 /** @param {string} message */
@@ -955,6 +969,8 @@ export class EngineHost {
   }
 
   /**
+   * The stored info and the live detail of a session. `now` is the gateway's clock when it answered, so a client can
+   * convert the gateway times it holds (such as the start of a compaction) to its own clock.
    * @param {string} sessionId
    * @returns {Promise<SessionDetail>}
    */
@@ -968,6 +984,7 @@ export class EngineHost {
       liveEvents: live ? live.events.snapshot() : [],
       seq: this.#getSeq(),
       init: live ? live.init : null,
+      now: this.#now(),
     };
   }
 
@@ -1141,6 +1158,7 @@ export class EngineHost {
       additionalDirectories: live.additionalDirectories,
       fallbackModel: live.fallbackModel,
       browserTools: live.browserTools,
+      context: snapshotContextMeter(live.context),
     };
   }
 
@@ -1403,6 +1421,11 @@ export class EngineHost {
       additionalDirectories: resolved.additionalDirectories,
       fallbackModel: resolved.fallbackModel,
       browserTools: resolved.browserTools,
+      context: emptyContextMeter(),
+      contextCall: null,
+      contextFixed: null,
+      compactPrompt: false,
+      resumed: mode === 'resume',
     };
     const options = this.#queryOptions(live, { mode, resumeSessionAt, summaries, startMode });
     try {
@@ -1426,8 +1449,8 @@ export class EngineHost {
    * Claude Code answers the SDK's initialize handshake as soon as its process is up, but sends system/init only with
    * the first prompt of a streaming session. A new or resumed session is therefore ready, and shown as idle, once the
    * handshake is answered (`initializationResult()`, which makes no model call); model, mode and version stay as they
-   * are until system/init reports them. A handshake that fails or never comes changes nothing: the pump reports the
-   * failure.
+   * are until system/init reports them. The context window is read then too (see #refreshContext). A handshake that
+   * fails or never comes changes nothing: the pump reports the failure.
    * @param {LiveRecord} live
    */
   async #awaitReady(live) {
@@ -1438,6 +1461,7 @@ export class EngineHost {
       return;
     }
     if (live.state === 'starting') this.#setState(live, 'idle');
+    void this.#refreshContext(live, { transcript: live.resumed });
   }
 
   /**
@@ -1835,6 +1859,8 @@ export class EngineHost {
         return;
       case 'result':
         if (!live.closing && this.#requests.count(live.sessionId) === 0) live.state = 'idle';
+        // The turn is over, so the next turn starts with a prompt of its own (see sendMessage).
+        live.compactPrompt = false;
         this.#applyFastModeReport(live, msg);
         // A finished turn changes the session file (first prompt, summary, modification time); let every client
         // refresh its session list, which is how a brand-new untitled session gets its summary in the sidebar.
@@ -1842,6 +1868,9 @@ export class EngineHost {
         return;
       case 'assistant':
       case 'stream_event':
+        live.contextCall = observeUsage(live.context, live.contextCall, msg);
+        live.lastActivity = this.#now();
+        return;
       case 'user':
         live.lastActivity = this.#now();
         return;
@@ -1918,6 +1947,10 @@ export class EngineHost {
           live.permissionMode = msg.permissionMode;
           this.#guardBypass(live);
         }
+        this.#applyCompactionStatus(live, msg);
+        return;
+      case 'compact_boundary':
+        this.#applyCompactBoundary(live, msg);
         return;
       case 'commands_changed':
         live.commands = msg.commands;
@@ -1927,6 +1960,161 @@ export class EngineHost {
         return;
       default:
         return;
+    }
+  }
+
+  /**
+   * Whether the query is still the open one of its session and not being closed.
+   * @param {LiveRecord} live
+   * @returns {boolean}
+   */
+  #isCurrent(live) {
+    return this.#live.get(live.sessionId) === live && !live.closing;
+  }
+
+  /**
+   * The compacting state of the meter. 'compacting' starts it, with the trigger the turn's prompt implies; the status
+   * that follows (null, with or without a result) ends it, and a failed compaction also refreshes the window, as a
+   * finished one does at its boundary. A subagent's status changes nothing.
+   * @param {LiveRecord} live
+   * @param {SDKStatusMessage} msg
+   */
+  #applyCompactionStatus(live, msg) {
+    if (isSubagentMessage(msg)) return;
+    if (msg.status === 'compacting') {
+      startCompaction(live.context, this.#now(), live.compactPrompt ? 'manual' : null);
+      return;
+    }
+    if (msg.status === 'requesting') return;
+    endCompaction(live.context);
+    if (msg.compact_result === 'failed') void this.#refreshContext(live, { transcript: false });
+  }
+
+  /**
+   * A finished compaction: the boundary records what it did. The size the stream reported before it no longer holds, so
+   * `used` takes the estimate of the context right after the compaction, and the context is then counted in full.
+   * @param {LiveRecord} live
+   * @param {SDKCompactBoundaryMessage} msg
+   */
+  #applyCompactBoundary(live, msg) {
+    if (isSubagentMessage(msg)) return;
+    recordCompaction(live.context, msg.compact_metadata, this.#now());
+    const postTokens = postTokensOf(msg.compact_metadata);
+    estimateAfterCompaction(live.context, live.contextFixed, postTokens);
+    void this.#countAfterCompaction(live, live.contextCall, postTokens);
+  }
+
+  /**
+   * After a compaction the context is counted in full (getContextUsage, full detail, 30 s). The count replaces `used`
+   * unless an API call has started since the boundary (its usage is newer), and the window and threshold are read from
+   * the same answer. When the count fails, the window comes from the summary, and the estimate stands unless a newer
+   * call has reported. Never fills from apiUsage, which describes a call from before the compaction. Never rejects.
+   * @param {LiveRecord} live
+   * @param {CallUsage|null} callAtBoundary the API call the stream reported last before the boundary
+   * @param {number|null} postTokens post_tokens of the boundary, for the estimate when the count fails
+   * @returns {Promise<void>}
+   */
+  async #countAfterCompaction(live, callAtBoundary, postTokens) {
+    /** @type {ContextUsage|null} */
+    let full = null;
+    try {
+      const query = /** @type {SdkQuery} */ (live.query);
+      const answer = await withTimeout(() => query.getContextUsage({ detail: 'full' }), CONTEXT_FULL_MS);
+      full = answer !== null && typeof answer === 'object' ? answer : null;
+    } catch (error) {
+      this.#log.debug('context not counted after a compaction', {
+        sessionId: live.sessionId,
+        reason: errorName(error),
+      });
+    }
+    if (!this.#isCurrent(live)) return;
+    if (full !== null) {
+      applyWindow(live.context, full);
+      countAfterCompaction(live.context, full.totalTokens, isNewerCall(live.contextCall, callAtBoundary));
+    } else {
+      const summary = await this.#contextSummary(live);
+      if (!this.#isCurrent(live)) return;
+      if (summary !== null) {
+        applyWindow(live.context, summary);
+        if (!isNewerCall(live.contextCall, callAtBoundary)) {
+          estimateAfterCompaction(live.context, summary.totalTokens, postTokens);
+        }
+      }
+    }
+    this.#sync(live);
+  }
+
+  /**
+   * Reads the window of a session from its runtime (getContextUsage, summary detail, 10 s): the maximum, the threshold
+   * and the auto-compact switch. Until the stream has reported an API call, `used` comes from the last call the runtime
+   * reports, else from the last call of the transcript (resumed sessions only), else from the fixed part of the
+   * context. After a compaction apiUsage describes a call from before it, so it is not used then, and until a call
+   * reports the estimate stays the fixed part plus what the compaction left. A transcript whose last compaction has no
+   * call after it counts the context in full instead (see #countAfterCompaction). Publishes when the meter changed. A
+   * failure keeps the values the meter had and is logged at debug level. Never rejects.
+   * @param {LiveRecord} live
+   * @param {{transcript: boolean}} options transcript: read the session file for the last call (a resumed session)
+   * @returns {Promise<void>}
+   */
+  async #refreshContext(live, { transcript }) {
+    const summary = await this.#contextSummary(live);
+    if (!this.#isCurrent(live)) return;
+    if (summary !== null) {
+      applyWindow(live.context, summary);
+      if (live.context.lastCompaction === null) fillUsed(live.context, usageTokens(summary.apiUsage), 'api-usage');
+    }
+    let compacted = false;
+    if (transcript && live.context.source === null) {
+      const found = await this.#transcriptContext(live);
+      if (!this.#isCurrent(live)) return;
+      fillUsed(live.context, found.tokens, 'transcript');
+      compacted = found.tokens === null && found.compacted;
+    }
+    if (summary !== null) {
+      const last = live.context.lastCompaction;
+      if (last !== null && live.context.source === 'estimate') {
+        estimateAfterCompaction(live.context, summary.totalTokens, last.postTokens);
+      } else {
+        fillUsed(live.context, summary.totalTokens, 'estimate');
+      }
+    }
+    this.#sync(live);
+    if (compacted) void this.#countAfterCompaction(live, live.contextCall, null);
+  }
+
+  /**
+   * The summary of the context usage, or null when the runtime does not answer in time or answers with no object. The
+   * summary leaves the conversation out, so its total is the fixed part of the context: it is kept as contextFixed.
+   * @param {LiveRecord} live
+   * @returns {Promise<ContextUsage|null>}
+   */
+  async #contextSummary(live) {
+    try {
+      const query = /** @type {SdkQuery} */ (live.query);
+      const answer = await withTimeout(() => query.getContextUsage({ detail: 'summary' }));
+      const summary = answer !== null && typeof answer === 'object' ? answer : null;
+      if (summary !== null) live.contextFixed = summary.totalTokens;
+      return summary;
+    } catch (error) {
+      this.#log.debug('context usage not read', { sessionId: live.sessionId, reason: errorName(error) });
+      return null;
+    }
+  }
+
+  /**
+   * What the session file says about the context of a resumed session (see transcriptContextOf), read through the
+   * transcript path the history uses (the cache of #transcript answers a second read). Nothing is known when the file
+   * is missing, unreadable or has neither a call nor a compaction.
+   * @param {LiveRecord} live
+   * @returns {Promise<{tokens: number|null, compacted: boolean}>}
+   */
+  async #transcriptContext(live) {
+    try {
+      const info = await this.#readInfoOrNull(live.sessionId);
+      return transcriptContextOf(await this.#transcript(live.sessionId, info));
+    } catch (error) {
+      this.#log.debug('transcript usage not read', { sessionId: live.sessionId, reason: errorName(error) });
+      return { tokens: null, compacted: false };
     }
   }
 
@@ -2422,6 +2610,9 @@ export class EngineHost {
       if (live.input.ended) {
         throw new AppError(409, 'SESSION_NOT_LIVE', 'The session stopped. Send the message again.');
       }
+      // A prompt that finds no turn running starts one, and a compaction in that turn is manual when the prompt is
+      // /compact. A prompt sent while a turn runs waits behind it and starts none.
+      if (live.state !== 'running' && live.state !== 'requires_action') live.compactPrompt = isCompactPrompt(text);
       live.input.push(buildUserMessage(live.sessionId, clientMessageId, text, images));
       if (this.#requests.count(live.sessionId) === 0) this.#setState(live, 'running');
     } catch (error) {
@@ -2530,6 +2721,8 @@ export class EngineHost {
       live.model = model;
       this.#remember(sessionId, { model });
       this.#sync(live);
+      // The window may belong to the new model, so it is read again.
+      void this.#refreshContext(live, { transcript: false });
     }
     if (parsed.permissionMode !== undefined) {
       const mode = parsed.permissionMode;

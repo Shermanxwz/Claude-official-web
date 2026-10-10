@@ -31,6 +31,7 @@ no `eval`, no `innerHTML` with untrusted data (use `h()`/`textContent`; Markdown
 | `public/js/ui/quick-switcher.js` | ⌘K / Ctrl+K quick switcher: sessions, panels, GUI commands |
 | `public/js/ui/side-question.js` | `/btw` side-question overlay above the composer |
 | `public/js/ui/activity.js` | running line (activity, elapsed time, output tokens) and the pinned todo bar above the composer |
+| `public/js/context.js` | context meter and compaction: ring, tooltip, divider texts, elapsed time (pure) |
 
 Owners in this round: **shell** (`app-shell.js`, `api.js`, `store.js`, `main.js`, `sidebar.js`, `panels.js`,
 `dialog.js`, `menu.js`, `toasts.js`, `login.js`, `runtime-panels.js`, `account.js`, `devtools.js`,
@@ -216,10 +217,16 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
 7. User messages: text and image blocks render as the user's bubble (images as thumbnails of the base64 data); the
    optimistic message (keyed `clientMessageId`) is replaced by the first live/transcript user message with the same
    uuid, or with identical text in the same session if no uuid match arrives. Messages with `isSynthetic` or
-   system-reminder-only content render as muted notes.
+   system-reminder-only content render as muted notes. A sent message's turn stays pending until the session reports
+   `running` (or `requires_action`): a session reopened by its first message reports `starting`, then `idle` once
+   Claude Code is ready, before it takes the message, and that `idle` must not end the turn, or the messages that name
+   no user message (a compaction's boundary and summary, notices) would land in a new turn after it.
 8. System / event messages:
-   - `system/init`: no row (header data). `system/compact_boundary`: divider "Context compacted".
-   - `system/status`: header status text (compacting / requesting). `system/api_retry`: muted inline notice.
+   - `system/init`: no row (header data). `system/compact_boundary`: the divider of the compaction (see
+     "Context meter and compaction").
+   - `system/status`: `compacting` starts the compacting row; a status with no value ends it (a success keeps the row
+     for its boundary); `compact_result: 'failed'` adds the error notice. The status is only recorded (`getRunState()`);
+     no header or running-line text shows it. `system/api_retry`: muted inline notice.
    - `system/local_command_output`: monospace "Command output" card.
    - `system/informational`: inline notice styled by `level`. `system/notification`: toast (shell) + nothing inline.
    - `system/permission_denied`: red inline row. `system/hook_*`: rows inside the work group (errors highlighted).
@@ -262,6 +269,58 @@ Input sources: transcript `SessionMessage[]` (with `index`), the snapshot `liveE
    composer receives the text of the user message that started the turn via `composer.setText`), "Cancel"
    (`cancelled`). When the request resolves, entries whose uuid is in `retractedMessageUuids` are evicted without a
    marker (as for `supersedes`). Keys 1/2/3 answer it like the permission card.
+
+## Context meter and compaction (`public/js/context.js`)
+
+Data flow: `LiveInfo.context` (`ContextMeter`, docs/PROTOCOL.md "Context meter and compaction") arrives in each
+`session_state` event and in the session snapshot. Nothing polls it. Four readers use it:
+
+- Header ring (`ui/header.js`, `button.ctx-meter`): `meterView` gives the fill, tone and tick; the tooltip and
+  `aria-label` come from `meterTooltip` (en and zh-CN; automatic, off, compacting and no-sentence variants). The fill
+  eases over 400 ms (`@property --ctx-pct`). `is-compacting` turns the ring into a sweep. Hidden while `used` or `max`
+  is null.
+- Tones (`meterTone`): `normal` below 85 % of the automatic point (of the window when automatic compaction is off),
+  `attention` from there, `danger` from 95 % of the window. The tick marks the automatic point.
+- Compacting row and divider (`timeline/model.js`, `timeline/view.js`). The runtime streams a compaction in this order
+  (verified on Claude Code 2.1.295): `system/status` `compacting`; `system/status` with no value and `compact_result:
+  'success'` (or `'failed'`); `system/init` (manual only); `system/compact_boundary` with the sizes; the summary as a
+  synthetic user message; for `/compact`, a "Compacted" command output. An automatic compaction in the middle of a turn
+  has the same order without `init` and the output. `compacting` adds one live row at the end of the turn (glyph, label,
+  elapsed, slim bar). A success keeps the row, and the boundary turns that same entry into the finished divider in
+  place. A status with no value that is not a success, or a failed one, removes the row; a failed one keeps the
+  failed-compaction notice. Closing the turn removes a row still waiting for its boundary. `compactionText` writes the
+  divider, dropping missing parts.
+- Summary (`addSummary`): a transcript marks the summary `isCompactSummary`; on the live stream it is the first
+  synthetic main-thread user message after a boundary (`summaryDue`). Any later main-thread user message ends that wait,
+  so a synthetic message after it stays a muted `user-meta` note. The summary is a collapsed `compact-summary` note
+  after its divider. A summary with no divider before it (a transcript starts at the last compaction) gets a plain
+  divider first, with null sizes. A compaction still waiting for its boundary turns its row into that divider.
+- Sizes after a reload (`lastCompactionDetails`, `timelineItems`): the transcript names no sizes, so the last compact
+  divider with null sizes takes `LiveInfo.context.lastCompaction`. Only the last compact divider is looked at; the
+  enriched one has the reconcile key `${key}|${lastCompaction.at}`, so it is rebuilt when the sizes arrive.
+- Replayed boundary (`transcriptUuids`): the uuid of every transcript record is kept, shown or not. The SDK's
+  transcript keeps a boundary as a system record without its subtype, which shows nothing, so the snapshot's copy of
+  that boundary (with its subtype) would add a second divider at the end of the turn. A replayed boundary whose uuid the
+  transcript holds therefore adds no divider; it ends the compaction row the replayed status started.
+- Snapshot replay (`replayedEvents`): the transcript of a compacted session starts at its last boundary, while the
+  snapshot holds the events of the whole query (up to 2 000). When the page is the start of the chain and its first
+  record is a system record, `load()` replays the snapshot from that record's copy on; the events before it belong to
+  the conversation the compaction replaced and would otherwise land after the transcript, out of order.
+- Reload in the middle of a compaction: the snapshot's live events carry no time, so their row has `since` null. The row
+  and the running line then count from the session's start, `LiveInfo.context.compacting.since`, which is on the
+  gateway's clock: `load()` keeps `clockOffset` (the snapshot's `now` minus this browser's clock) and
+  `sessionCompactingStart` subtracts it. While `context.compacting` is set and no row is shown, a compacting row is
+  drawn at the end of the conversation, and the running line shows the compaction even when the model knows no running
+  turn (`activityOf`).
+- Running line (`ui/activity.js`): "Compacting the conversation (N s)" while a compaction runs; the start is the row's,
+  or the session's (`compactingStart`).
+- Context panel (`ui/panels.js`): the live section above the breakdown reads `live.context`; the breakdown still comes
+  from `GET /api/sessions/:id/context?detail=full`.
+
+Reduced motion (`prefers-reduced-motion: reduce`): the ring fill is immediate and the sweep stops at a static 30 % arc;
+the compacting row's bars stop at half opacity; the running line and header spinners stop. The elapsed seconds keep
+counting. Locale keys: `header.context.tip.*`, `shell.context.*`, `cards.divider.*`, `cards.compacting.*`,
+`composer.activity.compacting`.
 
 ## Tool renderers (`public/js/timeline/tools/`)
 

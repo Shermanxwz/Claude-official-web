@@ -31,13 +31,16 @@ import {
 } from './answers.mjs';
 import {
   activeGoal,
+  AUTOCOMPACT_THRESHOLD_TOKENS,
   autocompactState,
   backgroundTasksChanged,
   BACKGROUND_RUN_MS,
   BACKGROUND_WAIT_MS,
   commandLifecycle,
+  COMPACT_NOTICE_TEXT,
   CONTEXT_MAX_TOKENS,
   interruptedMessage,
+  isCompactSummaryMessage,
   outputFileOf,
   permissionDenied,
   postTurnSummary,
@@ -397,6 +400,9 @@ async function* singlePrompt(text) {
  * @property {Record<string, number>} counters      id counters, persisted with the record
  * @property {number} turnIndex                     completed turns
  * @property {Record<string, ModelUsage>} modelUsage  cumulative per model, as the result reports it
+ * @property {{input_tokens: number, output_tokens: number, cache_creation_input_tokens: number,
+ *   cache_read_input_tokens: number}|null} lastApiUsage  usage of the last main-thread model call of this process, as
+ *   getContextUsage reports it; null before the first call
  * @property {number} fiveHourUtilization           percent of the five-hour window, from rate_limit_event
  * @property {Map<string, McpEntry>} mcp            every configured server, by name
  * @property {Map<string, {state: string}>} mcpFlows  sign-ins in progress, by server name
@@ -726,6 +732,7 @@ export function createCore({
     counters,
     turnIndex: countPrompts(record),
     modelUsage: {},
+    lastApiUsage: null,
     fiveHourUtilization: 0,
     runtime,
     mcp: configuredServersOf(options.mcpServers),
@@ -904,17 +911,22 @@ export class TurnObserver {
     const { id, content, stop_reason: announced, usage } = message.message;
     const topLevel = message.parent_tool_use_id === null;
     this.drafts.delete(id);
-    if (!this.responses.has(id)) {
+    const output = usage.output_tokens ?? 0;
+    const known = this.responses.get(id);
+    if (known === undefined) {
       this.responses.set(id, {
         model: message.message.model,
         input: usage.input_tokens ?? 0,
-        output: usage.output_tokens ?? 0,
+        output,
         cacheRead: usage.cache_read_input_tokens ?? 0,
         cacheCreate: usage.cache_creation_input_tokens ?? 0,
         webSearch: usage.server_tool_use?.web_search_requests ?? 0,
         webFetch: usage.server_tool_use?.web_fetch_requests ?? 0,
         topLevel,
       });
+    } else {
+      // Each block of a response reports the output known so far; the last block reports all of it.
+      known.output = Math.max(known.output, output);
     }
     for (const block of content) {
       if (block.type === 'tool_use') {
@@ -983,44 +995,178 @@ function userBlocks(message) {
  * @typedef {SDKUserMessage & {uuid: string}} LinkedPrompt
  */
 
-/** Context rows that do not change while a session runs, in tokens. */
+/** Context rows that do not change while a session runs, in tokens: the overhead a session starts with. */
 const FIXED_CONTEXT_ROWS = [
-  { name: 'System prompt', tokens: 2400 },
-  { name: 'System tools', tokens: 9200 },
+  { name: 'System prompt', tokens: 9400 },
+  { name: 'System tools', tokens: 27600 },
+  { name: 'Skills', tokens: 1476 },
   { name: 'Memory files', tokens: 640 },
 ];
 const GITHUB_TOOL_TOKENS = 1200;
+/** The fixed overhead of a session before any message, in tokens: about 39k, as the real runtime starts. */
+export const CONTEXT_BASE_TOKENS = FIXED_CONTEXT_ROWS.reduce((sum, row) => sum + row.tokens, 0);
+/** What the autocompact buffer keeps free of the window, in tokens. */
+const AUTOCOMPACT_BUFFER_TOKENS = CONTEXT_MAX_TOKENS - AUTOCOMPACT_THRESHOLD_TOKENS;
 
 /**
- * Estimated tokens of the messages since the last compaction (about four characters per token).
+ * The index of the last entry that starts the conversation over, a compact boundary or a conversation reset: the
+ * messages before it are no longer in the context. -1 when there is none.
+ * @param {MockSessionRecord} record
+ * @returns {number}
+ */
+function conversationStartOf(record) {
+  let start = -1;
+  record.transcript.forEach((entry, index) => {
+    if (entry.type !== 'system') return;
+    const message = entry.message ?? {};
+    if (message.subtype === 'compact_boundary' || message.type === 'conversation_reset') start = index;
+  });
+  return start;
+}
+
+/**
+ * The tokens a compaction leaves in the context in place of the messages before it: the size of its summary. A
+ * conversation reset leaves none.
+ * @param {MockEntry} entry the entry that starts the conversation
+ * @returns {number}
+ */
+function summaryTokensOf(entry) {
+  const metadata = entry.message?.compact_metadata;
+  return typeof metadata?.post_tokens === 'number' ? metadata.post_tokens : 0;
+}
+
+/**
+ * Whether a transcript entry is part of the context. System entries are not (local output among them), and neither is
+ * the summary of a compaction, whose size is the boundary's post_tokens, nor the notice of /compact, which is output
+ * of a local command too.
+ * @param {MockEntry} entry
+ * @returns {boolean}
+ */
+function isContextEntry(entry) {
+  if (entry.type === 'system' || entry.isCompactSummary === true) return false;
+  return entry.message?.content !== COMPACT_NOTICE_TEXT;
+}
+
+/**
+ * The entries after an index of the transcript that the context holds (see isContextEntry).
+ * @param {MockSessionRecord} record
+ * @param {number} index
+ * @returns {MockEntry[]}
+ */
+function messagesAfter(record, index) {
+  return record.transcript.slice(index + 1).filter(isContextEntry);
+}
+
+/**
+ * Estimated tokens of entries (about four characters per token).
+ * @param {MockEntry[]} entries
+ * @returns {number}
+ */
+function tokensOfEntries(entries) {
+  return entries.reduce((sum, entry) => sum + Math.ceil(JSON.stringify(entry.message).length / 4), 0);
+}
+
+/**
+ * Estimated tokens of the conversation: the summary the last compaction left, then the messages since it. A session
+ * that was never compacted or reset counts every message.
  * @param {MockSessionRecord} record
  * @returns {number}
  */
 export function messageTokensOf(record) {
-  let start = 0;
-  record.transcript.forEach((entry, index) => {
-    if (entry.type === 'system' && entry.message?.subtype === 'compact_boundary') start = index + 1;
-  });
-  return record.transcript
-    .slice(start)
-    .filter((entry) => entry.type !== 'system')
-    .reduce((sum, entry) => sum + Math.ceil(JSON.stringify(entry.message).length / 4), 0);
+  const start = conversationStartOf(record);
+  const summary = start === -1 ? 0 : summaryTokensOf(record.transcript[start]);
+  return summary + tokensOfEntries(messagesAfter(record, start));
 }
 
 /**
- * The /context and /usage view of the session: fixed rows, the messages since the last compaction, and totals.
+ * The tokens the last model response did not send: the messages after its message or, when a compaction or a reset came
+ * later, the summary and the messages after that.
+ * @param {MockSessionRecord} record
+ * @returns {number}
+ */
+function freshTokensOf(record) {
+  let response = -1;
+  record.transcript.forEach((entry, index) => {
+    if (entry.type === 'assistant') response = index;
+  });
+  const start = conversationStartOf(record);
+  if (start > response) {
+    const summary = start === -1 ? 0 : summaryTokensOf(record.transcript[start]);
+    return summary + tokensOfEntries(messagesAfter(record, start));
+  }
+  return tokensOfEntries(messagesAfter(record, response));
+}
+
+/**
+ * The context rows of a session, in the order /context shows them: the fixed rows, the MCP tools when GitHub is
+ * connected, and the messages when the view includes them.
+ * @param {SessionCore} core
+ * @param {boolean} withMessages
+ * @returns {Array<{name: string, tokens: number}>}
+ */
+function contextRowsOf(core, withMessages) {
+  const rows = [...FIXED_CONTEXT_ROWS];
+  if (statusNamed(core, 'github') === 'connected') rows.push({ name: 'MCP tools', tokens: GITHUB_TOOL_TOKENS });
+  if (withMessages) {
+    const record = core.store.read(core.sessionId);
+    rows.push({ name: 'Messages', tokens: record ? messageTokensOf(record) : 0 });
+  }
+  return rows;
+}
+
+/**
+ * @param {Array<{tokens: number}>} rows
+ * @returns {number}
+ */
+function sumRows(rows) {
+  return rows.reduce((sum, row) => sum + row.tokens, 0);
+}
+
+/**
+ * The free space of the window: what the used tokens leave above the autocompact buffer.
+ * @param {number} used
+ * @returns {number}
+ */
+function freeTokensOf(used) {
+  return Math.max(0, CONTEXT_MAX_TOKENS - AUTOCOMPACT_BUFFER_TOKENS - used);
+}
+
+/**
+ * What the next model call sends (TurnContext.contextTokens): the fixed rows and the messages. The part of the messages
+ * that the last model response did not send is fresh.
+ * @param {SessionCore} core
+ * @returns {{total: number, fresh: number}}
+ */
+export function contextTokensOf(core) {
+  const total = sumRows(contextRowsOf(core, true));
+  const record = core.store.read(core.sessionId);
+  return { total, fresh: record ? freshTokensOf(record) : 0 };
+}
+
+/**
+ * The usage of one model call in the shape getContextUsage reports as apiUsage.
+ * @param {{input_tokens: number, output_tokens: number, cache_creation_input_tokens: number|null,
+ *   cache_read_input_tokens: number|null}} usage
+ * @returns {{input_tokens: number, output_tokens: number, cache_creation_input_tokens: number,
+ *   cache_read_input_tokens: number}}
+ */
+export function apiUsageOf(usage) {
+  return {
+    input_tokens: usage.input_tokens ?? 0,
+    output_tokens: usage.output_tokens ?? 0,
+    cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+  };
+}
+
+/**
+ * The /context and /usage view of the session: fixed rows, the conversation, free space and totals.
  * @param {SessionCore} core
  * @returns {SessionSummary}
  */
 export function describeSessionOf(core) {
-  const record = core.store.read(core.sessionId);
-  const messageTokens = record ? messageTokensOf(record) : 0;
-  const rows = [
-    ...FIXED_CONTEXT_ROWS,
-    ...(statusNamed(core, 'github') === 'connected' ? [{ name: 'MCP tools', tokens: GITHUB_TOOL_TOKENS }] : []),
-    { name: 'Messages', tokens: messageTokens },
-  ];
-  const used = rows.reduce((sum, row) => sum + row.tokens, 0);
+  const rows = contextRowsOf(core, true);
+  const used = sumRows(rows);
   const models = Object.values(core.modelUsage);
   const total = (/** @type {(model: ModelUsage) => number} */ pick) =>
     models.reduce((sum, model) => sum + pick(model), 0);
@@ -1029,7 +1175,7 @@ export function describeSessionOf(core) {
     plan: 'Pro',
     contextTokens: used,
     contextMax: CONTEXT_MAX_TOKENS,
-    contextRows: [...rows, { name: 'Free space', tokens: Math.max(0, CONTEXT_MAX_TOKENS - used) }],
+    contextRows: [...rows, { name: 'Free space', tokens: freeTokensOf(used) }],
     inputTokens: total((model) => model.inputTokens),
     outputTokens: total((model) => model.outputTokens),
     costUsd: total((model) => model.costUSD),
@@ -1184,6 +1330,8 @@ export function turnContextOf({ core, turn, userText, streamPartials, observer }
     elicitation: (request) => elicitationOf(core, turn, request),
     mcpConnected: (serverName) => statusNamed(core, serverName) === 'connected',
     describeSession: () => describeSessionOf(core),
+    contextTokens: () => contextTokensOf(core),
+    initialize: () => initMessage(core),
     thinkingSummaries: core.thinkingDisplay === 'summarized',
     foregroundTask: (toolUseId, description, output) => foregroundTaskOf(core, toolUseId, description, output),
     awaitBackground: (task) => awaitBackgroundOf(core, turn, task),
@@ -1453,6 +1601,8 @@ export function persistIfNeeded(core, message) {
       message: message.message,
       parent_tool_use_id: message.parent_tool_use_id,
       parent_agent_id: null,
+      // The summary of a compaction is stored with the flags the runtime gives a stored summary, not as synthetic.
+      ...(isCompactSummaryMessage(message) ? { isCompactSummary: true, is_meta: true } : {}),
     };
   } else if (message.type === 'system' && PERSISTED_SYSTEM_SUBTYPES.has(message.subtype)) {
     entry = {
@@ -1650,6 +1800,9 @@ export async function* runTurn(core, options, prompts, streamPartials) {
   /** @param {SDKMessage} message */
   const seen = (message) => {
     observer.see(message);
+    if (message.type === 'assistant' && message.parent_tool_use_id === null) {
+      core.lastApiUsage = apiUsageOf(message.message.usage);
+    }
     if (message.type === 'rate_limit_event' && message.rate_limit_info.rateLimitType === 'five_hour' &&
       typeof message.rate_limit_info.utilization === 'number') {
       core.fiveHourUtilization = message.rate_limit_info.utilization * 100;
@@ -2049,24 +2202,25 @@ export function initializationOf(core, account) {
 }
 
 /**
- * The /context breakdown in the SDK's response shape. Rows come from describeSessionOf, so /context and the
- * control method always agree.
+ * The context breakdown in the SDK's response shape. A summary leaves the conversation out, so its total is the fixed
+ * overhead; the full breakdown counts the messages too. Rows come from contextRowsOf, so /context and the control
+ * method always agree.
  * @param {SessionCore} core
+ * @param {'summary'|'full'} [detail]
  * @returns {ContextUsageResponse}
  */
-export function contextUsageOf(core) {
-  const summary = describeSessionOf(core);
-  const percentage = Math.round((summary.contextTokens / summary.contextMax) * 1000) / 10;
+export function contextUsageOf(core, detail = 'full') {
+  const rows = contextRowsOf(core, detail === 'full');
+  const totalTokens = sumRows(rows);
+  const percentage = Math.round((totalTokens / CONTEXT_MAX_TOKENS) * 1000) / 10;
   const usedSquares = Math.round(percentage);
   const githubConnected = statusNamed(core, 'github') === 'connected';
   const categories = [
-    ...summary.contextRows
-      .filter((row) => row.name !== 'Free space')
-      .map((row) => category(row.name, row.tokens, 'blue', 'used')),
-    category('Free space', summary.contextRows.find((row) => row.name === 'Free space')?.tokens ?? 0, 'gray', 'free'),
-    category('Autocompact buffer', 33000, 'amber', 'buffer'),
+    ...rows.map((row) => category(row.name, row.tokens, 'blue', 'used')),
+    category('Free space', freeTokensOf(totalTokens), 'gray', 'free'),
+    category('Autocompact buffer', AUTOCOMPACT_BUFFER_TOKENS, 'amber', 'buffer'),
   ];
-  const squareTokens = Math.round(summary.contextMax / 100);
+  const squareTokens = Math.round(CONTEXT_MAX_TOKENS / 100);
   const gridRows = Array.from({ length: 10 }, (_, row) => Array.from({ length: 10 }, (_, column) => {
     const index = row * 10 + column;
     const filled = index < usedSquares;
@@ -2079,15 +2233,11 @@ export function contextUsageOf(core) {
       squareFullness: filled ? 1 : 0,
     };
   }));
-  const totals = Object.values(core.modelUsage);
-  const sumOf = (/** @type {(model: ModelUsage) => number} */ pick) =>
-    totals.reduce((sum, model) => sum + pick(model), 0);
-  const hasUsage = totals.length > 0;
   return {
     categories,
-    totalTokens: summary.contextTokens,
-    maxTokens: summary.contextMax,
-    rawMaxTokens: summary.contextMax,
+    totalTokens,
+    maxTokens: CONTEXT_MAX_TOKENS,
+    rawMaxTokens: CONTEXT_MAX_TOKENS,
     percentage,
     gridRows,
     model: core.model,
@@ -2096,16 +2246,9 @@ export function contextUsageOf(core) {
       ? [{ name: 'search_issues', serverName: 'github', tokens: GITHUB_TOOL_TOKENS, isLoaded: true }]
       : [],
     agents: AGENTS.map((agent) => ({ agentType: agent.name, source: 'built-in', tokens: 120 })),
-    autoCompactThreshold: summary.contextMax - 33000,
+    autoCompactThreshold: AUTOCOMPACT_THRESHOLD_TOKENS,
     isAutoCompactEnabled: true,
-    apiUsage: hasUsage
-      ? {
-        input_tokens: sumOf((model) => model.inputTokens),
-        output_tokens: sumOf((model) => model.outputTokens),
-        cache_creation_input_tokens: sumOf((model) => model.cacheCreationInputTokens),
-        cache_read_input_tokens: sumOf((model) => model.cacheReadInputTokens),
-      }
-      : null,
+    apiUsage: core.lastApiUsage === null ? null : { ...core.lastApiUsage },
   };
 }
 
@@ -2301,7 +2444,7 @@ export function createControls({ open, isClosed, close, queue, store, runtime, o
       return AGENTS.map((agent) => ({ ...agent }));
     },
     mcpServerStatus: async () => mcpStatusOf(live()),
-    getContextUsage: async () => contextUsageOf(live()),
+    getContextUsage: async (options) => contextUsageOf(live(), options?.detail === 'summary' ? 'summary' : 'full'),
     usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => usageResponseOf(live(), runtime.account()),
     accountInfo: async () => {
       live();

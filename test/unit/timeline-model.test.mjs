@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createModel } from '../../public/js/timeline/model.js';
+import { createModel, replayedEvents } from '../../public/js/timeline/model.js';
 import { isDefaultChecked, describeSuggestion, checkedIndexes, ruleText } from '../../public/js/timeline/suggestions.js';
 
 const uuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -146,6 +146,15 @@ test('structured tool_use_result is attached as structured output', () => {
   model.applyLiveEvent(live.assistant(2, 'm1', [{ type: 'tool_use', id: 'R1', name: 'Read', input: { file_path: '/x' } }]));
   model.applyLiveEvent(live.toolResult(3, 'R1', 'contents', { tool_use_result: { type: 'text', file: { numLines: 2 } } }));
   assert.deepEqual(toolsIn(find(model, 'work')[0])[0].structured, { type: 'text', file: { numLines: 2 } });
+});
+
+test('the summary a compaction leaves is a named note, not a message of the user', () => {
+  const model = createModel();
+  const summary = 'This session is being continued from a previous conversation that ran out of context.';
+  model.applyLiveEvent(live.user(1, [{ type: 'text', text: summary }], { isCompactSummary: true }));
+  assert.equal(find(model, 'user').length, 0);
+  const [note] = find(model, 'notice');
+  assert.deepEqual([note.code, note.text], ['compact-summary', summary]);
 });
 
 test('subagent messages nest inside the Agent card instead of the main flow', () => {
@@ -1663,4 +1672,416 @@ test('the dialog request entry carries the prompt of its turn for "Edit prompt"'
   const entry = model.getEntries().find((item) => item.kind === 'request');
   assert.equal(entry.request.dialog.fallbackModel, 'claude-backup');
   assert.equal(entry.prompt, 'write the exploit');
+});
+
+test('a compaction shows one live row at the end of the turn, and its boundary turns that row into the divider', () => {
+  let clock = 1000;
+  const model = createModel({ now: () => clock });
+  model.applyLiveEvent(live.user(1, 'refactor the module'));
+  model.applyLiveEvent(live.assistant(2, 'm1', [{ type: 'text', text: 'working on it' }]));
+  clock = 2000;
+  model.applyLiveEvent(live.system(3, 'status', { status: 'compacting' }));
+  const row = model.getEntries().at(-1);
+  assert.deepEqual([row.kind, row.variant, row.since], ['divider', 'compacting', 2000]);
+  assert.equal(model.getRunState().compactingSince, 2000);
+  assert.equal(model.getRunState().status, 'compacting');
+  assert.equal(model.getActivity().running, true, 'the turn stays running while it compacts');
+
+  clock = 12_500;
+  model.applyLiveEvent(live.system(4, 'compact_boundary', {
+    compact_metadata: { trigger: 'auto', pre_tokens: 103509, post_tokens: 2069, duration_ms: 10515 },
+  }));
+  const settled = model.getEntries().at(-1);
+  assert.equal(settled, row, 'the same entry becomes the divider, so the view keeps its place');
+  assert.equal(settled.key, row.key);
+  assert.deepEqual(
+    [settled.variant, settled.trigger, settled.preTokens, settled.postTokens, settled.durationMs],
+    ['compact', 'auto', 103509, 2069, 10515],
+  );
+  assert.equal(model.getRunState().compactingSince, null);
+
+  model.applyLiveEvent(live.system(5, 'status', { status: null, compact_result: 'success' }));
+  model.applyLiveEvent(live.assistant(6, 'm2', [{ type: 'text', text: 'and the rest' }]));
+  const kinds = model.getEntries().map((entry) => (entry.kind === 'divider' ? entry.variant : entry.kind));
+  assert.deepEqual(kinds.slice(-3), ['assistant', 'compact', 'assistant'], 'the divider stays where the row was');
+  assert.equal(kinds.filter((kind) => kind === 'compacting').length, 0);
+});
+
+test('a repeated compacting status shows one row; a compaction without a boundary removes it with a notice', () => {
+  const model = createModel({ now: () => 500 });
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }));
+  model.applyLiveEvent(live.system(3, 'status', { status: 'compacting' }));
+  const rows = () => model.getEntries().filter((entry) => entry.variant === 'compacting');
+  assert.equal(rows().length, 1);
+  model.applyLiveEvent(live.system(4, 'status', {
+    status: null, compact_result: 'failed', compact_error: 'the model refused',
+  }));
+  assert.equal(rows().length, 0, 'a failed compaction leaves no row behind');
+  const notice = model.getEntries().find((entry) => entry.code === 'compact-failed');
+  assert.equal(notice.text, 'the model refused');
+  assert.equal(model.getRunState().compactingSince, null);
+});
+
+test('closing the turn or going idle drops a compaction row that never got its boundary', () => {
+  const model = createModel({ now: () => 500 });
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }));
+  model.applyLiveEvent(live.result(3));
+  assert.equal(model.getEntries().filter((entry) => entry.variant === 'compacting').length, 0);
+  assert.equal(model.getRunState().compactingSince, null);
+
+  const idle = createModel({ now: () => 500 });
+  idle.applyLiveEvent(live.user(1, 'go'));
+  idle.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }));
+  idle.setSessionState('idle');
+  assert.equal(idle.getEntries().filter((entry) => entry.variant === 'compacting').length, 0);
+});
+
+test('a finished compaction keeps its divider when the status clears after the boundary', () => {
+  const model = createModel({ now: () => 500 });
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }));
+  model.applyLiveEvent(live.system(3, 'compact_boundary', {
+    compact_metadata: { trigger: 'manual', pre_tokens: 39200 },
+  }));
+  model.applyLiveEvent(live.system(4, 'status', { status: null, compact_result: 'success' }));
+  const dividers = model.getEntries().filter((entry) => entry.kind === 'divider');
+  assert.equal(dividers.length, 1);
+  assert.deepEqual([dividers[0].variant, dividers[0].trigger, dividers[0].postTokens], ['compact', 'manual', null]);
+});
+
+test('a transcript compaction keeps its sizes, in either metadata spelling, and shows no live row', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('user', 1, { role: 'user', content: 'start' }),
+    tx('system', 2, undefined, {
+      subtype: 'compact_boundary',
+      compactMetadata: { trigger: 'manual', preTokens: 39200, postTokens: 1960, durationMs: 6765 },
+    }),
+  ]);
+  model.applyLiveEvent(live.system(3, 'status', { status: 'requesting' }));
+  const dividers = model.getEntries().filter((entry) => entry.kind === 'divider');
+  assert.equal(dividers.length, 1);
+  assert.deepEqual(
+    [dividers[0].variant, dividers[0].trigger, dividers[0].preTokens, dividers[0].postTokens, dividers[0].durationMs],
+    ['compact', 'manual', 39200, 1960, 6765],
+  );
+  assert.equal(model.getRunState().compactingSince, null);
+});
+
+const SUMMARY = 'This session is being continued from a previous conversation that ran out of context.';
+/** The entry kinds of a list, with a compact divider named by its variant. */
+const shapeOf = (entries) => entries.map((entry) => (entry.kind === 'divider' ? entry.variant : entry.kind));
+
+test('a /compact in the runtime\'s order: the row becomes the divider, then the summary and the output', () => {
+  let clock = 1000;
+  const model = createModel({ now: () => clock });
+  model.applyLiveEvent(live.user(1, '<command-name>/compact</command-name><command-args></command-args>'));
+  clock = 2000;
+  model.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }));
+  const row = model.getEntries().at(-1);
+  model.applyLiveEvent(live.system(3, 'status', { status: null, compact_result: 'success' }));
+  assert.equal(model.getEntries().at(-1), row, 'a successful status keeps the row for the boundary that follows');
+  model.applyLiveEvent(live.system(4, 'init', { session_id: SESSION }));
+  clock = 5400;
+  model.applyLiveEvent(live.system(5, 'compact_boundary', {
+    compact_metadata: { trigger: 'manual', pre_tokens: 30789, post_tokens: 1872, duration_ms: 3401 },
+  }));
+  model.applyLiveEvent(live.user(6, [{ type: 'text', text: SUMMARY }], { isSynthetic: true, isReplay: false }));
+  model.applyLiveEvent(live.user(7, '<local-command-stdout>Compacted </local-command-stdout>', { isReplay: true }));
+  model.applyLiveEvent(live.result(8));
+
+  const entries = model.getEntries();
+  const dividers = find(model, 'divider');
+  assert.equal(dividers.length, 1, 'the boundary fills the row; it does not add a second divider');
+  assert.equal(dividers[0].key, row.key);
+  assert.deepEqual(
+    [dividers[0].variant, dividers[0].trigger, dividers[0].preTokens, dividers[0].postTokens, dividers[0].durationMs],
+    ['compact', 'manual', 30789, 1872, 3401],
+  );
+  const tail = entries.slice(entries.indexOf(dividers[0]));
+  assert.deepEqual(shapeOf(tail), ['compact', 'notice', 'command-output', 'result']);
+  assert.deepEqual([tail[1].code, tail[1].text], ['compact-summary', SUMMARY]);
+  assert.equal(tail[2].text, 'Compacted');
+  assert.equal(model.getRunState().compactingSince, null);
+});
+
+test('an automatic compaction mid-turn: the row becomes the divider, the summary follows, the turn goes on', () => {
+  let clock = 1000;
+  const model = createModel({ now: () => clock });
+  model.applyLiveEvent(live.user(1, 'read both log batches'));
+  model.applyLiveEvent(live.assistant(2, 'm1', [{ type: 'text', text: 'Reading the first batch.' }]));
+  clock = 3000;
+  model.applyLiveEvent(live.system(3, 'status', { status: 'compacting' }));
+  const row = model.getEntries().at(-1);
+  model.applyLiveEvent(live.system(4, 'status', { status: null, compact_result: 'success' }));
+  clock = 13_500;
+  model.applyLiveEvent(live.system(5, 'compact_boundary', {
+    compact_metadata: { trigger: 'auto', pre_tokens: 103509, post_tokens: 2069, duration_ms: 10515 },
+  }));
+  model.applyLiveEvent(live.user(6, [{ type: 'text', text: SUMMARY }], { isSynthetic: true, isReplay: false }));
+  model.applyLiveEvent(live.assistant(7, 'm2', [{ type: 'text', text: 'Both batches processed without errors.' }]));
+  model.applyLiveEvent(live.result(8));
+
+  const entries = model.getEntries();
+  assert.deepEqual(shapeOf(entries), ['user', 'assistant', 'compact', 'notice', 'assistant', 'result']);
+  assert.equal(entries[2].key, row.key);
+  assert.equal(entries[2].durationMs, 10515);
+  assert.equal(model.getActivity(), null, 'the turn has ended');
+});
+
+test('a failed compaction drops its row and leaves the error notice in its place', () => {
+  const model = createModel({ now: () => 500 });
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }));
+  model.applyLiveEvent(live.system(3, 'status', {
+    status: null, compact_result: 'failed', compact_error: 'Prompt is too long',
+  }));
+  assert.equal(find(model, 'divider').length, 0, 'no row and no divider');
+  assert.deepEqual(find(model, 'notice').map((entry) => [entry.code, entry.level, entry.text]),
+    [['compact-failed', 'error', 'Prompt is too long']]);
+  assert.equal(model.getRunState().compactResult, 'failed');
+  assert.equal(model.getRunState().compactingSince, null);
+});
+
+test('a transcript that starts at its last compaction shows a plain divider, then the summary note', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('system', 1, undefined),
+    tx('user', 2, { role: 'user', content: [{ type: 'text', text: SUMMARY }] }, {
+      isCompactSummary: true, is_meta: true,
+    }),
+    tx('user', 3, { role: 'user', content: 'and then?' }),
+    tx('assistant', 4, { id: 'm', role: 'assistant', content: [{ type: 'text', text: 'Sure.' }] }),
+  ]);
+  const entries = model.getEntries();
+  assert.deepEqual(shapeOf(entries), ['compact', 'notice', 'user', 'assistant']);
+  const [divider, note] = entries;
+  assert.deepEqual(
+    [divider.trigger, divider.preTokens, divider.postTokens, divider.durationMs], [null, null, null, null],
+    'the transcript names no sizes; the view takes them from the session',
+  );
+  assert.deepEqual([note.code, note.text], ['compact-summary', SUMMARY]);
+});
+
+test('a transcript boundary names the summary that follows it, and its divider keeps its sizes', () => {
+  const model = createModel();
+  model.loadTranscript([
+    tx('user', 1, { role: 'user', content: 'start' }),
+    tx('system', 2, undefined, {
+      subtype: 'compact_boundary', compactMetadata: { trigger: 'auto', preTokens: 103509, postTokens: 2069 },
+    }),
+    tx('user', 3, { role: 'user', content: [{ type: 'text', text: SUMMARY }] }, { isSynthetic: true }),
+  ]);
+  const entries = model.getEntries();
+  assert.deepEqual(shapeOf(entries), ['user', 'compact', 'notice']);
+  assert.deepEqual([entries[1].preTokens, entries[1].postTokens], [103509, 2069]);
+  assert.equal(entries[2].code, 'compact-summary', 'a synthetic message after the boundary is the summary');
+});
+
+test('a summary that arrives while its row still waits ends the compaction: the row becomes a plain divider', () => {
+  const model = createModel({ now: () => 500 });
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }));
+  model.applyLiveEvent(live.user(3, [{ type: 'text', text: SUMMARY }], { isCompactSummary: true }));
+  const entries = model.getEntries();
+  assert.deepEqual(shapeOf(entries).slice(-2), ['compact', 'notice']);
+  assert.equal(find(model, 'divider').length, 1, 'one divider for the compaction');
+  assert.equal(entries.at(-1).code, 'compact-summary');
+  assert.equal(model.getRunState().compactingSince, null);
+});
+
+test('a status replayed without a time gives a row with no start, which the view counts from the session', () => {
+  const model = createModel({ now: () => 9000 });
+  model.applyLiveEvent(live.user(1, 'go'));
+  model.applyLiveEvent(live.system(2, 'status', { status: 'compacting' }), null);
+  const row = model.getEntries().at(-1);
+  assert.deepEqual([row.kind, row.variant, row.since], ['divider', 'compacting', null]);
+  assert.equal(model.getRunState().compactingSince, null);
+  assert.equal(model.getActivity().running, true, 'the turn still runs while it compacts');
+});
+
+test('a synthetic user message is a summary only right after a boundary; otherwise it stays a user-meta note', () => {
+  const plain = createModel({ now: () => 500 });
+  plain.applyLiveEvent(live.user(1, [{ type: 'text', text: 'injected text' }], { isSynthetic: true }));
+  assert.deepEqual(find(plain, 'notice').map((entry) => entry.code), ['user-meta']);
+
+  const later = createModel({ now: () => 500 });
+  later.applyLiveEvent(live.system(2, 'compact_boundary', { compact_metadata: { trigger: 'auto', pre_tokens: 1000 } }));
+  later.applyLiveEvent(live.user(3, 'a question of my own'));
+  later.applyLiveEvent(live.user(4, [{ type: 'text', text: 'injected text' }], { isSynthetic: true }));
+  assert.deepEqual(find(later, 'notice').map((entry) => entry.code), ['user-meta']);
+});
+
+test('a subagent message does not use up the summary that a boundary of the main thread leaves', () => {
+  const model = createModel({ now: () => 500 });
+  model.applyLiveEvent(live.user(1, 'delegate'));
+  model.applyLiveEvent(live.assistant(2, 'm1', [
+    { type: 'tool_use', id: 'AG', name: 'Agent', input: { prompt: 'p' } },
+  ]));
+  model.applyLiveEvent(live.system(3, 'compact_boundary', { compact_metadata: { trigger: 'auto', pre_tokens: 1000 } }));
+  model.applyLiveEvent(live.user(4, 'an inner note', { parent_tool_use_id: 'AG' }));
+  model.applyLiveEvent(live.user(5, [{ type: 'text', text: SUMMARY }], { isSynthetic: true }));
+  assert.equal(find(model, 'notice').at(-1).code, 'compact-summary');
+});
+
+test('a reload after a compaction shows one divider: the snapshot\'s copy of the boundary adds none', () => {
+  const model = createModel({ now: () => 500 });
+  model.loadTranscript([
+    tx('user', 1, { role: 'user', content: 'read them' }),
+    tx('assistant', 2, { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'Reading.' }] }),
+    // The transcript keeps the boundary as a system record without a subtype, so it shows nothing of its own.
+    tx('system', 3, undefined),
+    tx('user', 4, { role: 'user', content: [{ type: 'text', text: SUMMARY }] }, {
+      isCompactSummary: true, is_meta: true,
+    }),
+    tx('assistant', 5, { id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'Both batches processed.' }] }),
+  ]);
+  // The snapshot's events hold the same records, then the compaction's status and its boundary.
+  model.applyLiveEvent(live.user(1, 'read them'), null);
+  model.applyLiveEvent(live.assistant(2, 'm1', [{ type: 'text', text: 'Reading.' }]), null);
+  model.applyLiveEvent(live.system(6, 'status', { status: 'compacting' }), null);
+  model.applyLiveEvent(live.system(7, 'status', { status: null, compact_result: 'success' }), null);
+  model.applyLiveEvent(live.system(8, 'init', { session_id: SESSION }), null);
+  model.applyLiveEvent(live.system(3, 'compact_boundary', {
+    compact_metadata: { trigger: 'auto', pre_tokens: 103509, post_tokens: 2069, duration_ms: 10515 },
+  }), null);
+  model.applyLiveEvent(live.user(4, [{ type: 'text', text: SUMMARY }], { isSynthetic: true, isReplay: false }), null);
+  model.applyLiveEvent(live.assistant(5, 'm2', [{ type: 'text', text: 'Both batches processed.' }]), null);
+  model.applyLiveEvent(live.result(9), null);
+
+  assert.deepEqual(shapeOf(model.getEntries()), ['user', 'assistant', 'compact', 'notice', 'assistant', 'result']);
+  assert.equal(model.getRunState().compactingSince, null);
+});
+
+test('a reload after a compaction that the turn went on from drops the row the replay started', () => {
+  const model = createModel({ now: () => 500 });
+  model.loadTranscript([
+    tx('user', 1, { role: 'user', content: 'read them' }),
+    tx('system', 3, undefined),
+    tx('user', 4, { role: 'user', content: [{ type: 'text', text: SUMMARY }] }, {
+      isCompactSummary: true, is_meta: true,
+    }),
+  ]);
+  model.applyLiveEvent(live.user(1, 'read them'), null);
+  model.applyLiveEvent(live.system(6, 'status', { status: 'compacting' }), null);
+  model.applyLiveEvent(live.system(7, 'status', { status: null, compact_result: 'success' }), null);
+  model.applyLiveEvent(live.system(3, 'compact_boundary', {
+    compact_metadata: { trigger: 'auto', pre_tokens: 103509 },
+  }), null);
+  model.applyLiveEvent(live.user(4, [{ type: 'text', text: SUMMARY }], { isSynthetic: true, isReplay: false }), null);
+  model.applyLiveEvent(live.assistant(10, 'm3', [{ type: 'text', text: 'Going on.' }]));
+
+  assert.deepEqual(shapeOf(model.getEntries()), ['user', 'compact', 'notice', 'assistant']);
+  assert.equal(model.getRunState().compactingSince, null, 'no compaction runs');
+});
+
+test('a reload while a compaction runs keeps its row, and the boundary that comes later settles it', () => {
+  const model = createModel({ now: () => 9000 });
+  model.loadTranscript([
+    tx('user', 1, { role: 'user', content: 'read them' }),
+    tx('assistant', 2, { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'Reading.' }] }),
+  ]);
+  model.applyLiveEvent(live.user(1, 'read them'), null);
+  model.applyLiveEvent(live.assistant(2, 'm1', [{ type: 'text', text: 'Reading.' }]), null);
+  model.applyLiveEvent(live.system(6, 'status', { status: 'compacting' }), null);
+  const row = model.getEntries().at(-1);
+  assert.deepEqual([row.variant, row.since], ['compacting', null], 'the replayed status has no start');
+
+  model.applyLiveEvent(live.system(3, 'compact_boundary', {
+    compact_metadata: { trigger: 'auto', pre_tokens: 103509, post_tokens: 2069, duration_ms: 10515 },
+  }));
+  const settled = model.getEntries().at(-1);
+  assert.equal(settled.key, row.key, 'the boundary turns the same row into the divider');
+  assert.deepEqual([settled.variant, settled.preTokens], ['compact', 103509]);
+});
+
+test('a load replays the snapshot from the boundary the transcript of a compacted session starts at', () => {
+  const event = (msg) => ({ seq: 0, msg });
+  const boundary = live.system(3, 'compact_boundary', { compact_metadata: { trigger: 'manual', pre_tokens: 32576 } });
+  const events = [
+    event(live.user(1, 'Reply with OK.')),
+    event(live.assistant(2, 'm1', [{ type: 'text', text: 'OK' }])),
+    event(live.system(5, 'status', { status: 'compacting' })),
+    event(boundary),
+    event(live.user(4, [{ type: 'text', text: SUMMARY }], { isSynthetic: true, isReplay: false })),
+  ];
+  // getSessionMessages returns the chain from the last boundary, which is a system record without its subtype.
+  const page = { start: 0, messages: [tx('system', 3, undefined), tx('user', 4, { role: 'user', content: SUMMARY })] };
+  assert.deepEqual(replayedEvents(events, page), events.slice(3));
+  assert.deepEqual(replayedEvents(events, { ...page, start: 4 }), events, 'a page that is not the chain start');
+  assert.deepEqual(replayedEvents(events, { start: 0, messages: [tx('user', 1, { role: 'user', content: 'x' })] }),
+    events, 'a transcript that starts with a user message');
+  assert.deepEqual(replayedEvents(events, { start: 0, messages: [tx('system', 9, undefined)] }), events,
+    'a compaction from an earlier query is not in the snapshot');
+  assert.deepEqual(replayedEvents(null, page), []);
+  assert.deepEqual(replayedEvents(events, null), events);
+});
+
+test('a reload after a compaction shows the transcript from it and none of the conversation it replaced', () => {
+  const model = createModel({ now: () => 500 });
+  const page = {
+    start: 0,
+    messages: [
+      tx('system', 13, undefined),
+      tx('user', 14, { role: 'user', content: [{ type: 'text', text: SUMMARY }] }, {
+        isCompactSummary: true, is_meta: true,
+      }),
+      tx('user', 15, { role: 'user', content: '<local-command-stdout>Compacted </local-command-stdout>' }),
+    ],
+  };
+  const events = [
+    live.user(1, 'Reply with OK.'),
+    live.assistant(2, 'm1', [{ type: 'text', text: 'OK' }]),
+    live.result(3),
+    live.user(10, '<command-name>/compact</command-name><command-args></command-args>'),
+    live.system(11, 'status', { status: 'compacting' }),
+    live.system(12, 'status', { status: null, compact_result: 'success' }),
+    live.system(13, 'compact_boundary', {
+      compact_metadata: { trigger: 'manual', pre_tokens: 32576, post_tokens: 2069, duration_ms: 7300 },
+    }),
+    live.user(14, [{ type: 'text', text: SUMMARY }], { isSynthetic: true, isReplay: false }),
+    live.user(15, '<local-command-stdout>Compacted </local-command-stdout>', { isReplay: true }),
+    live.result(16),
+  ].map((msg, seq) => ({ seq, msg }));
+  model.loadTranscript(page.messages);
+  for (const event of replayedEvents(events, page)) model.applyLiveEvent(event.msg, null);
+
+  assert.deepEqual(shapeOf(model.getEntries()), ['compact', 'notice', 'command-output', 'result']);
+  assert.equal(model.getEntries()[0].preTokens, null, 'the view gives the divider its sizes from lastCompaction');
+  assert.equal(model.getRunState().compactingSince, null);
+});
+
+test('the first message of a reopened session keeps its turn through the ready idle, so a compaction stays in it', () => {
+  const model = createModel({ now: () => 1000 });
+  model.loadTranscript([
+    tx('system', 1, undefined),
+    tx('user', 2, { role: 'user', content: [{ type: 'text', text: SUMMARY }] }, {
+      isCompactSummary: true, is_meta: true,
+    }),
+    tx('assistant', 3, { id: 'm0', role: 'assistant', content: [{ type: 'text', text: 'Done before.' }] }),
+  ]);
+  model.setSessionState('closed');
+  model.addOptimistic({ clientMessageId: uuid(80), text: 'read the logs' });
+  // The message starts the query: Claude Code starts, reports ready (idle) before it takes the message, then runs it.
+  model.setSessionState('starting');
+  model.setSessionState('idle');
+  model.markAccepted(uuid(80));
+  assert.equal(model.getRunState().running, false, 'the message waits: the ready idle neither runs nor ends its turn');
+  model.setSessionState('running');
+  assert.equal(model.getRunState().running, true);
+  model.applyLiveEvent(live.assistant(4, 'm1', [{ type: 'text', text: 'Reading.' }]));
+  model.applyLiveEvent(live.system(5, 'status', { status: 'compacting' }));
+  model.applyLiveEvent(live.system(6, 'status', { status: null, compact_result: 'success' }));
+  model.applyLiveEvent(live.system(7, 'compact_boundary', {
+    compact_metadata: { trigger: 'auto', pre_tokens: 78200, post_tokens: 2100, duration_ms: 1400 },
+  }));
+  model.applyLiveEvent(live.user(8, [{ type: 'text', text: SUMMARY }], { isSynthetic: true, isReplay: false }));
+  model.applyLiveEvent(live.assistant(9, 'm2', [{ type: 'text', text: 'Both processed.' }]));
+  model.applyLiveEvent(live.result(10));
+
+  assert.deepEqual(shapeOf(model.getEntries()),
+    ['compact', 'notice', 'assistant', 'user', 'assistant', 'compact', 'notice', 'assistant', 'result']);
+  assert.equal(model.getEntries()[5].preTokens, 78200, 'one divider for the live compaction, with its sizes');
 });

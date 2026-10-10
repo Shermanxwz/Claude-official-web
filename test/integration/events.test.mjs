@@ -117,7 +117,8 @@ describe('events: stream', { timeout: 120000 }, () => {
 
       const replay = await api.events({ watch: live.sessionId, after: cut });
       try {
-        await replay.next((frame) => frame.id === lastId, 5000);
+        // The hello frame carries the head id too, so the wait skips it and ends on the last replayed frame.
+        await replay.next((frame) => frame.id === lastId && frame.event !== 'hello', 5000);
         const replayed = eventIds(replay.all());
         const wanted = expected.filter((frame) => seqOf(frame.id) > cut).map((frame) => frame.id);
         assert.deepEqual(replayed, wanted);
@@ -140,7 +141,7 @@ describe('events: stream', { timeout: 120000 }, () => {
       const lastId = expected.at(-1).id;
       const resumed = await api.events({ watch: live.sessionId, lastEventId: `${bootId}:${cut}` });
       try {
-        await resumed.next((frame) => frame.id === lastId, 5000);
+        await resumed.next((frame) => frame.id === lastId && frame.event !== 'hello', 5000);
         assert.deepEqual(eventIds(resumed.all()), expected.filter((frame) => seqOf(frame.id) > cut)
           .map((frame) => frame.id));
       } finally {

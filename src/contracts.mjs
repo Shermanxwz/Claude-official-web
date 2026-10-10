@@ -125,6 +125,20 @@ export const SESSION_COOKIE = 'caw_session';
  */
 
 /**
+ * The live context meter of a session (docs/PROTOCOL.md "Context meter and compaction").
+ * @typedef {Object} ContextMeter
+ * @property {number|null} used          tokens of the latest main-thread API call (input + cache + output so far)
+ * @property {number|null} max           the context window (getContextUsage().maxTokens)
+ * @property {number|null} autoCompactAt getContextUsage().autoCompactThreshold while auto-compact is on, else null
+ * @property {boolean|null} autoCompact  getContextUsage().isAutoCompactEnabled; null until known
+ * @property {'stream'|'count'|'api-usage'|'transcript'|'estimate'|null} source   where `used` came from
+ * @property {null|{since: number, trigger: 'auto'|'manual'|null}} compacting   while the runtime compacts
+ * @property {null|{trigger: 'auto'|'manual', preTokens: number, postTokens: number|null, durationMs: number|null,
+ *   at: number}} lastCompaction   the latest compaction since the session was opened (the meter starts empty with each
+ *   query)
+ */
+
+/**
  * The gateway-wide unattended switch (docs/PROTOCOL.md "Unattended mode").
  * @typedef {Object} UnattendedState
  * @property {boolean} available     bypass is allowed on this gateway (meta.features.bypass)
@@ -157,6 +171,7 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {FastModeState|null} fastModeState   what the runtime last reported (init or result); null = unknown
  * @property {string|null} fastModeDisabledReason   FastModeDisabledReason from the same report; null = nothing blocks
  * @property {number} backgroundTasks       live non-ambient background tasks (system/background_tasks_changed)
+ * @property {ContextMeter} context        the live context meter and compaction state
  */
 
 /**
@@ -245,6 +260,7 @@ export const SESSION_COOKIE = 'caw_session';
  * @property {LiveEvent[]} liveEvents
  * @property {number} seq
  * @property {SDKSystemMessage|null} init
+ * @property {number} now        the gateway's clock in epoch milliseconds when it answered
  */
 
 /**

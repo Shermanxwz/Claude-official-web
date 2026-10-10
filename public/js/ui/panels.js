@@ -14,6 +14,8 @@ import { mountRuntimePanel } from './runtime-panels.js';
 import { mountDeveloperPanel } from './devtools.js';
 import { mountAccountSection, planLabel, providerLabel } from './account.js';
 import { newerUnattended, normalizeUnattended, unattendedSwitch } from '../unattended.js';
+import { compactionText, meterView } from '../context.js';
+import { relativeTime } from '../timeline/format.js';
 
 const PANEL_NAMES = ['session', 'capabilities', 'context', 'tasks', 'settings', 'runtime', 'developer'];
 /** Task states that can still produce output. */
@@ -1553,15 +1555,72 @@ function contextPanel({ body, api, store, t, actions, reload }) {
   let loading = true;
   /** @type {{code?: string, message: string} | null} */
   let failure = null;
+  // The live figures come from the store (LiveInfo.context) and move with every API call and compaction. The breakdown
+  // is the gateway's own count (detail=full), which takes a few seconds, so it is fetched once per open.
+  const live = h('div', { class: 'context-live' });
   const content = h('div', { class: 'context' });
-  body.appendChild(content);
+  body.append(live, content);
+
+  /** The live section: the figures of LiveInfo.context, or why they are not there. */
+  function renderLive() {
+    clear(live);
+    const info = store.get().live?.[sessionId] ?? null;
+    if (!info) return;
+    const meter = meterView(info.context);
+    if (!meter) {
+      live.append(note(t('shell.context.unknown')));
+      return;
+    }
+    // autoCompactNote has no line to show for some sessions; Element.append would write its null as the text "null".
+    live.append(...[
+      h('div', { class: 'context-summary' },
+        h('div', { class: 'context-figure' },
+          h('span', { class: 'context-number', text: number.format(meter.used) }),
+          h('span', { class: 'context-of', text: t('shell.context.of', { max: number.format(meter.max) }) })),
+        h('span', {
+          class: 'context-percent',
+          text: t('shell.context.percent', { percent: Math.round(meter.percent) }),
+        })),
+      h('div', {
+        class: ['progress', meter.tone === 'normal' ? '' : `is-${meter.tone}`],
+        attrs: {
+          role: 'progressbar',
+          'aria-label': t('shell.context.title'),
+          'aria-valuemin': 0,
+          'aria-valuemax': 100,
+          'aria-valuenow': Math.round(meter.fill),
+        },
+      }, h('div', { class: 'progress-bar', style: { width: `${meter.fill}%` } })),
+      autoCompactNote(meter),
+      lastCompactionLine(info.context.lastCompaction),
+    ].filter(Boolean));
+  }
+
+  /** @param {ReturnType<typeof meterView>} meter */
+  function autoCompactNote(meter) {
+    if (meter.compacting) return note(t('shell.context.compactingNow'));
+    if (meter.autoCompactAt !== null) {
+      return note(t('shell.context.autoOn', { tokens: number.format(meter.autoCompactAt) }));
+    }
+    return meter.autoCompact === false ? note(t('shell.context.autoOff')) : null;
+  }
+
+  /** @param {Record<string, any>|null} last the session's last compaction, LiveInfo.context.lastCompaction */
+  function lastCompactionLine(last) {
+    if (!last) return note(t('shell.context.noCompaction'));
+    const locale = getLocale();
+    return h('div', { class: 'context-last' },
+      h('span', { class: 'sheet-section-title', text: t('shell.context.lastLabel') }),
+      h('span', { text: compactionText(last, t, locale) }),
+      h('span', { class: 'context-last-time', text: relativeTime(last.at, locale) }));
+  }
 
   async function load() {
     loading = true;
     failure = null;
     render();
     try {
-      usage = await api.get(`/api/sessions/${encodeURIComponent(sessionId)}/context`);
+      usage = await api.get(`/api/sessions/${encodeURIComponent(sessionId)}/context?detail=full`);
     } catch (err) {
       usage = null;
       failure = { code: err?.code, message: errorText(err, t) };
@@ -1598,35 +1657,10 @@ function contextPanel({ body, api, store, t, actions, reload }) {
       return;
     }
     if (!usage) return;
-    const total = Number(usage.totalTokens) || 0;
     const max = Number(usage.maxTokens) || 0;
-    const percent = max > 0 ? (total / max) * 100 : Number(usage.percentage) || 0;
-    const clamped = Math.min(100, Math.max(0, percent));
     const categories = Array.isArray(usage.categories) ? usage.categories : [];
-    const threshold = typeof usage.autoCompactThreshold === 'number' ? usage.autoCompactThreshold : null;
 
     content.append(...[
-      h('div', { class: 'context-summary' },
-        h('div', { class: 'context-figure' },
-          h('span', { class: 'context-number', text: `${number.format(total)}` }),
-          h('span', { class: 'context-of', text: t('shell.context.of', { max: number.format(max) }) })),
-        h('span', { class: 'context-percent', text: t('shell.context.percent', { percent: Math.round(percent) }) })),
-      h('div', {
-        class: 'progress',
-        attrs: {
-          role: 'progressbar',
-          'aria-label': t('shell.context.title'),
-          'aria-valuemin': 0,
-          'aria-valuemax': 100,
-          'aria-valuenow': Math.round(clamped),
-        },
-      }, h('div', { class: 'progress-bar', style: { width: `${clamped}%` } })),
-      threshold !== null
-        ? note(t('shell.context.autoCompact', {
-          tokens: number.format(threshold),
-          state: usage.isAutoCompactEnabled ? t('common.enabled') : t('common.disabled'),
-        }))
-        : null,
       section(t('shell.context.categories'),
         categories.length === 0 ? note(t('shell.context.noCategories')) : h('ul', { class: 'bar-list' },
           categories.map((category) => {
@@ -1652,8 +1686,13 @@ function contextPanel({ body, api, store, t, actions, reload }) {
   }
 
   const unsubscribe = store.subscribe((state, prev) => {
-    if (state.currentSessionId !== prev.currentSessionId) reload();
+    if (state.currentSessionId !== prev.currentSessionId) {
+      reload();
+      return;
+    }
+    if (state.live?.[sessionId] !== prev.live?.[sessionId]) renderLive();
   });
+  renderLive();
   load();
   return unsubscribe;
 }

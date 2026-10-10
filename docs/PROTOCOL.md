@@ -177,7 +177,8 @@ type LiveInfo = { sessionId: string, cwd: string, state: LiveState, model: strin
   fastMode: boolean|null,                  // fast mode the gateway requested for this session; null = follow settings
   fastModeState: 'off'|'on'|'cooldown'|null,     // what the runtime last reported (init or result); null = unknown
   fastModeDisabledReason: string|null,     // FastModeDisabledReason from the same report; null when nothing blocks it
-  backgroundTasks: number };               // live background tasks, ambient ones excluded (background_tasks_changed)
+  backgroundTasks: number,                 // live background tasks, ambient ones excluded (background_tasks_changed)
+  context: ContextMeter };                 // the live context meter and compaction state (see Context meter)
 type SessionSummary = SDKSessionInfo & { live: LiveInfo | null };
 type PendingRequest = {
   id: string, sessionId: string, kind: 'permission'|'question'|'plan'|'elicitation'|'dialog', createdAt: number,
@@ -192,6 +193,76 @@ type RefusalFallbackDialog = { dialogKind: 'refusal_fallback_prompt', originalMo
   apiRefusalCategory: string|null, guidanceText: string|null, retractedMessageUuids: string[] };
 type LiveEvent = { seq: number, msg: SDKMessage };
 ```
+
+### Context meter and compaction
+
+Verified on Claude Code 2.1.295: `getContextUsage({detail: 'summary'})` counts only the fixed part of the context
+(system prompt, tools, skills, memory). Its `totalTokens` leaves the conversation out (there is no `Messages`
+category), so it does not move from turn to turn. `detail: 'full'` adds `Messages` and comes close to what the model
+saw, but it calls the token-count API and is slow. `maxTokens`, `autoCompactThreshold` and `isAutoCompactEnabled` are
+the same in both, and `apiUsage` is the usage of the last API call (null before the first one). What the model really
+saw is the usage of each main-thread API call, which the runtime streams. The gateway therefore keeps the meter itself,
+in `LiveInfo.context`:
+
+```ts
+type ContextMeter = {
+  used: number|null,           // tokens of the latest main-thread API call: input + cache creation + cache read, plus
+                               // the output tokens reported so far, or an estimate or count (see below)
+  max: number|null,            // the context window: getContextUsage().maxTokens
+  autoCompactAt: number|null,  // getContextUsage().autoCompactThreshold while isAutoCompactEnabled, else null
+  autoCompact: boolean|null,   // getContextUsage().isAutoCompactEnabled; null until known
+  source: 'stream'|'count'|'api-usage'|'transcript'|'estimate'|null,   // where `used` came from (see below)
+  compacting: null | { since: number, trigger: 'auto'|'manual'|null },  // while system/status says 'compacting'
+  lastCompaction: null | { trigger: 'auto'|'manual', preTokens: number, postTokens: number|null,
+                           durationMs: number|null, at: number } }  // the latest since the live query opened
+```
+
+- `used`, in order of preference: the main-thread `stream_event` `message_start` usage (input + cache creation +
+  cache read) at the start of each API call, then the output tokens of that call's `message_delta` and of the
+  `assistant` message (`source: 'stream'`); before the first call of the current process and before any compaction,
+  `apiUsage` from getContextUsage (input + cache + output, `'api-usage'`); else the usage of the last main-thread
+  assistant message of
+  the transcript of a resumed session (`'transcript'`, see below); else the summary `totalTokens`, which is only the
+  fixed part (`'estimate'`; after a compaction, the fixed part plus `post_tokens`, see below). Messages with a
+  `parent_tool_use_id` (subagents) never count.
+- `max`, `autoCompactAt` and `autoCompact` come from `getContextUsage`. The summary (`detail: 'summary'`, 10 s) is read
+  when the session becomes ready, after a model change and after a failed compaction. After a finished compaction the
+  full count (`detail: 'full'`, 30 s, see below) gives them, or the summary when that count fails. A failure keeps the
+  previous values and is logged at debug level.
+- Compaction is Claude Code's own: it compacts automatically when the context passes its threshold (also in the middle
+  of a turn), and `/compact` compacts on request. For `/compact` the stream carries, in this order (verified on
+  2.1.295): `system/status` `{status: 'compacting'}`; `system/status` `{status: null, compact_result:
+  'success'|'failed', compact_error?}`; `system/init`; `system/compact_boundary` with `compact_metadata:
+  {trigger: 'auto'|'manual', pre_tokens, post_tokens?, duration_ms?}`; the summary as a user message
+  (`isSynthetic: true`, not a replay, with no `isCompactSummary` flag); the replayed user message
+  `<local-command-stdout>Compacted </local-command-stdout>` (`isReplay: true`); then `result`. An automatic compaction,
+  mid-turn too, has the same messages without `init` and the notice. `pre_tokens` is the whole context before the
+  compaction; `post_tokens` is the runtime's estimate of the messages that replace the conversation (the boundary, the
+  summary, re-attached files and hook results). The system prompt and the tools are not in it, so it is not the new
+  context size. (Verified: an automatic compaction mid-turn, 103 509 → 2 069 in 10.5 s; `/compact`, 30 789 → 1 872 in
+  3.4 s.)
+- `compacting` is set from the first status and cleared by the second; `trigger` is `'manual'` when the prompt that
+  started the turn is `/compact`, else null until the boundary says. The boundary fills `lastCompaction`, and the size
+  the stream reported before it no longer holds: `used` becomes the estimate of the context right after the compaction,
+  the fixed part (the summary's `totalTokens` at its last read) plus `post_tokens` (`'estimate'`). The estimate does not
+  use the last call's usage or `apiUsage`, which describe a call from before the compaction. Then the context is counted
+  in full (`getContextUsage`, full detail, 30 s): the count replaces `used` (`'count'`) unless an API call has started
+  since the boundary, whose usage is newer. When the count fails, the summary is read instead and the estimate is taken
+  again from it, unless a newer call has reported. Later summary reads (a model change, a failed compaction) keep the
+  estimate in that form and never take `apiUsage` until a call reports. A failed compaction clears `compacting` and
+  leaves `lastCompaction` unchanged.
+- Before its first call, a resumed session takes its last call from the transcript (`'transcript'`), read from the end.
+  The chain `getSessionMessages` returns from a compacted session starts at the last boundary, which carries no
+  metadata, then comes the summary (a user message with `isCompactSummary` and `is_meta`) and the later messages; the
+  summary marks the compaction. When a compaction comes after the last call, the transcript holds no size for the
+  compacted context: `used` is the fixed part (`'estimate'`) until the full count answers (`'count'`). The chain has no
+  `post_tokens`, so a resumed session makes no boundary estimate.
+- `lastCompaction` covers the compactions since the live query was opened: the meter starts empty with each live query,
+  so a reopened session shows none until it compacts again. `since` and `at` are epoch ms on the gateway's clock, the
+  one that `now` of `GET /api/sessions/:id` reports.
+- `used` can exceed `max` for a moment (a large tool result before an automatic compaction); clients clamp the
+  percentage to 100.
+- `LiveInfo` is published (`session_state`) when any of these change; `used` changes at most a few times per API call.
 
 ### Session states and the ready state
 
@@ -274,7 +345,8 @@ type SessionSettings = {
 { info: SDKSessionInfo | null, live: LiveInfo | null, pending: PendingRequest[],
   liveEvents: LiveEvent[],   // SDK messages of the current live query (bounded), oldest first
   seq: number,               // EventHub high-water mark at snapshot time
-  init: SDKSystemMessage | null }  // last system/init message of the live query
+  init: SDKSystemMessage | null,   // last system/init message of the live query
+  now: number }                    // the gateway's clock in epoch ms when it answered (the clock of the meter's times)
 ```
 `404 SESSION_NOT_FOUND` when neither a file nor a live session exists.
 
@@ -372,10 +444,10 @@ question → allow with `updatedInput: {...input, answers, response?}`, decline 
 `setPermissionMode(nextMode)` when given, reject → deny with the feedback message.
 
 ### `GET /api/sessions/:id/context?detail=summary|full` → `SDKControlGetContextUsageResponse` (`409 SESSION_NOT_LIVE` if not live)
-`detail` defaults to `summary` (the last response's usage plus local estimates; used by the header meter). `full`
-counts each category with the token-count API, as the terminal's `/context` does (the context panel asks for it; its
-timeout is 30 s). Control calls to the runtime time out after 10 s unless stated otherwise (`502 ENGINE_ERROR`;
-capabilities fall back to `stale: true`).
+`detail` defaults to `summary`, which counts only the fixed part of the context (see Context meter); the header meter
+uses `LiveInfo.context` instead. `full` counts each category, the conversation included, with the token-count API, as
+the terminal's `/context` does (the context panel asks for it; its timeout is 30 s). Control calls to the runtime time
+out after 10 s unless stated otherwise (`502 ENGINE_ERROR`; capabilities fall back to `stale: true`).
 When the runtime reports rejected credentials (`system/api_retry` or an assistant `error` of an authentication class)
 the gateway publishes a `notice` with code `ENGINE_UNAVAILABLE` and sets `LiveInfo.error`.
 

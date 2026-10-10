@@ -30,7 +30,8 @@ import { isUuid } from '../../contracts.mjs';
 export const RECORD_VERSION = 1;
 
 /**
- * One transcript or subagent entry. `message` is the Messages API payload for user and assistant entries.
+ * One transcript or subagent entry. `message` is the Messages API payload for user and assistant entries. The summary
+ * of a compaction carries `isCompactSummary` and `is_meta`, the flags the runtime gives a stored summary.
  * @typedef {Object} MockEntry
  * @property {'user'|'assistant'|'system'} type
  * @property {string} uuid
@@ -38,6 +39,8 @@ export const RECORD_VERSION = 1;
  * @property {any} message
  * @property {string|null} parent_tool_use_id
  * @property {string|null} parent_agent_id
+ * @property {boolean} [isCompactSummary]
+ * @property {boolean} [is_meta]
  */
 
 /**
@@ -286,6 +289,50 @@ export function sliceRecord(record, upToMessageId) {
 }
 
 /**
+ * The bare record of a compact boundary, as getSessionMessages returns it. The SDK builds each entry from the stored
+ * record's `message`, and a boundary record has none, so the entry keeps the envelope alone: no `message`, no subtype.
+ * @typedef {Pick<MockEntry, 'type'|'uuid'|'session_id'|'parent_tool_use_id'|'parent_agent_id'>} BoundaryRecord
+ */
+
+/**
+ * Whether an entry is a compact boundary of the main thread. A subagent's entry never is.
+ * @param {MockEntry} entry
+ * @returns {boolean}
+ */
+function isCompactBoundary(entry) {
+  return entry.type === 'system' && entry.parent_tool_use_id === null && entry.message?.subtype === 'compact_boundary';
+}
+
+/**
+ * The entries that getSessionMessages returns for a transcript: its conversation chain. That is the entries from the
+ * last compaction boundary of the main thread on, the boundary first as its bare record, then the summary and the later
+ * entries. Nothing before the boundary is returned, because the compaction replaced the conversation before it. A
+ * transcript without a compaction is returned as it is.
+ *
+ * This is what the real SDK (0.3.295) answers, as verified on the runtime. For a compacted session, getSessionMessages
+ * with includeSystemMessages starts with a system record that has no `message` and no subtype, then comes the summary
+ * (a user message with `isCompactSummary` and `is_meta`), then the later messages. Without includeSystemMessages the
+ * boundary is left out with the other system entries, and the chain still starts after it. The host, the resume rule
+ * and the timeline are written against that shape, so the mock answers with it too. The mock keeps the whole transcript
+ * on disk because the context is counted from it (query.mjs), so the cut is made here, when the transcript is read.
+ * @param {MockEntry[]} transcript
+ * @returns {Array<MockEntry|BoundaryRecord>}
+ */
+function chainOf(transcript) {
+  const start = transcript.findLastIndex(isCompactBoundary);
+  if (start === -1) return transcript;
+  const boundary = transcript[start];
+  const bare = {
+    type: boundary.type,
+    uuid: boundary.uuid,
+    session_id: boundary.session_id,
+    parent_tool_use_id: boundary.parent_tool_use_id,
+    parent_agent_id: boundary.parent_agent_id,
+  };
+  return [bare, ...transcript.slice(start + 1)];
+}
+
+/**
  * Creates the file-backed session store.
  * @param {string} dir directory for the session files; created with mode 0700 when missing
  */
@@ -445,16 +492,18 @@ export function createMockStore(dir) {
   }
 
   /**
-   * SDK getSessionMessages. Resolves an empty list for unknown sessions.
+   * SDK getSessionMessages. Resolves an empty list for unknown sessions. The entries are the session's conversation
+   * chain (see chainOf). System entries among them are listed only with `includeSystemMessages`, as in the SDK, and
+   * `limit` and `offset` page within the entries that are left.
    * @param {string} sessionId
    * @param {{dir?: string, limit?: number, offset?: number, includeSystemMessages?: boolean}} [options]
-   * @returns {Promise<MockEntry[]>}
+   * @returns {Promise<Array<MockEntry|BoundaryRecord>>}
    */
   async function getSessionMessages(sessionId, options = {}) {
     const { limit, offset } = pageOf(options);
     const entry = load(sessionId);
     if (!entry || (options.dir !== undefined && entry.record.cwd !== options.dir)) return [];
-    const messages = entry.record.transcript.filter((message) =>
+    const messages = chainOf(entry.record.transcript).filter((message) =>
       options.includeSystemMessages === true || message.type !== 'system');
     const end = limit === undefined ? undefined : offset + limit;
     return messages.slice(offset, end);

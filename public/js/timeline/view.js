@@ -4,12 +4,15 @@
  */
 import { h, clear, icon } from '../dom.js';
 import { errorText } from '../api.js';
-import { createModel } from './model.js';
+import { createModel, replayedEvents } from './model.js';
 import { renderTool } from './tools/index.js';
 import { describeActivity, toolTarget } from './tools/summaries.js';
 import { renderRequest } from './requests.js';
 import { renderMarkdown } from '../markdown.js';
-import { formatDuration, formatTokens, truncateMiddle, pluralKey } from './format.js';
+import { formatDuration, truncateMiddle, pluralKey } from './format.js';
+import {
+  compactingStart, compactionText, elapsedSeconds, lastCompactionDetails, sessionCompactingStart,
+} from '../context.js';
 import { getLocale } from '../i18n.js';
 import { createAttentionTracker } from '../unattended.js';
 
@@ -20,6 +23,8 @@ const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'imag
 const BASE64_PATTERN = /^[A-Za-z0-9+/=\s]+$/;
 const NOTE_COLLAPSE_CHARS = 160;
 const GENERIC_JSON_LIMIT = 20000;
+/** How often the elapsed seconds of a compacting row are redrawn. */
+const COMPACT_TICK_MS = 1000;
 /** Event types that wait in the queue while the session's history loads, then replay in order. */
 const QUEUED_WHILE_LOADING = new Set(['sdk', 'request', 'request_resolved', 'notice', 'message_cancelled']);
 /** The line an automatic answer (unattended mode) leaves, by request kind. */
@@ -81,7 +86,22 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     /** the last todos and activity sent to the composer, as JSON (undefined until the first render) */
     publishedTodos: /** @type {string|undefined} */ (undefined),
     publishedActivity: /** @type {string|undefined} */ (undefined),
+    /** LiveInfo.context of the session (null while it is not live): the compaction it reports */
+    context: /** @type {Record<string, any>|null} */ (null),
+    /** The gateway's clock minus this browser's, epoch ms, from the snapshot's `now` (0 when the snapshot has none) */
+    clockOffset: 0,
   };
+  /** Keeps the elapsed seconds of a compacting row current while one is shown. */
+  let compactTimer = /** @type {ReturnType<typeof setInterval>|null} */ (null);
+  /**
+   * When the compaction in progress started, in this browser's clock: the row's own start, else the session's. A reload
+   * has no row with a start, so the session's start (converted with clockOffset) names the compaction then.
+   * @param {number|null} rowSince
+   * @returns {number|null}
+   */
+  const compactStart = (rowSince) => compactingStart(
+    rowSince, sessionCompactingStart(state.context, state.clockOffset),
+  );
   const listStore = new Map();
   /** The open or closed state the user chose per details element (tool, work group, thinking), kept across renders. */
   const openState = new Map();
@@ -116,6 +136,7 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     sessionId: () => state.sessionId,
     renderChildren: (entries) => renderPlainEntries(ui, entries),
     background: backgroundTool,
+    compactStart,
   };
 
   const scheduleRender = () => {
@@ -158,16 +179,33 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     refs.root.style.setProperty('--tl-dock', `${slot ? slot.offsetHeight : 0}px`);
   };
 
+  /** Starts or stops the once-a-second update of the compacting row's elapsed time. */
+  const syncCompactTimer = (running) => {
+    if (running && compactTimer === null) {
+      compactTimer = setInterval(() => tickCompacting(refs.list, t, compactStart), COMPACT_TICK_MS);
+    } else if (!running && compactTimer !== null) {
+      clearInterval(compactTimer);
+      compactTimer = null;
+    }
+  };
+
   const render = () => {
     if (state.destroyed) return;
     const stick = state.forceStick || isNearBottom(refs.scroller);
     state.runtimeShown = runtimeEventsShown(env);
     const entries = state.model.getEntries().filter((entry) => state.runtimeShown || !isDiagnostic(entry));
-    const items = entries.map((entry) => ({ key: entry.key, version: entry.version ?? 0, value: entry }));
+    const items = timelineItems(entries, state.context);
+    // A compaction the session reports while the timeline holds no row for it (after a reload) belongs at the end.
+    const rowShown = entries.some((entry) => entry.variant === 'compacting');
+    const sessionRow = !rowShown && Boolean(state.context?.compacting);
+    if (sessionRow) {
+      items.push({ key: 'cmp:session', version: 0, value: { kind: 'divider', variant: 'compacting', since: null } });
+    }
     reconcile(refs.list, items, listStore, (entry, previous) => buildEntry(ui, entry, previous));
+    syncCompactTimer(rowShown || sessionRow);
     markLatestRequest(refs.list);
     syncDock();
-    renderSlots(refs, state, ui, entries.length);
+    renderSlots(refs, state, ui, items.length);
     publishSummary();
     if (stick) {
       scrollToBottom(refs.scroller);
@@ -187,7 +225,7 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
       state.publishedTodos = todosKey;
       if (onTodos) onTodos(todos);
     }
-    const activity = activityOf(state.model, t);
+    const activity = activityOf(state.model, compactStart);
     const activityKey = JSON.stringify(activity);
     if (activityKey !== state.publishedActivity) {
       state.publishedActivity = activityKey;
@@ -214,6 +252,7 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     state.publishedTodos = undefined;
     state.publishedActivity = undefined;
     state.liveState = null;
+    state.context = null;
     state.loading = true;
     state.loadError = null;
     state.queue = [];
@@ -233,12 +272,15 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
       state.model.loadTranscript(Array.isArray(page?.messages) ? page.messages : []);
       state.hasMore = Boolean(page?.hasMore);
       state.oldestIndex = Number.isFinite(page?.start) ? page.start : 0;
-      for (const event of Array.isArray(detail?.liveEvents) ? detail.liveEvents : []) {
-        state.model.applyLiveEvent(event?.msg);
+      // The snapshot's events carry no time of their own, so a compaction they start counts from the session's start.
+      for (const event of replayedEvents(detail?.liveEvents, page)) {
+        state.model.applyLiveEvent(event?.msg, null);
       }
       // Requests the snapshot holds have waited already, so they show at once.
       state.model.setPending(Array.isArray(detail?.pending) ? detail.pending : []);
       state.liveState = detail?.live ? detail.live.state : 'closed';
+      state.context = detail?.live?.context ?? null;
+      state.clockOffset = Number.isFinite(detail?.now) ? detail.now - Date.now() : 0;
       state.model.setSessionState(state.liveState);
       for (const entry of carried) restoreOptimistic(state.model, entry);
       state.loading = false;
@@ -314,6 +356,7 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
         const sid = eventSession ?? state.sessionId;
         if (sid !== state.sessionId) return;
         state.liveState = data.live ? data.live.state : 'closed';
+        state.context = data.live?.context ?? null;
         state.model.setSessionState(state.liveState);
         break;
       }
@@ -428,6 +471,7 @@ export function createTimeline({ container, api, store, t, actions, onTodos = nu
     state.controller?.abort();
     attention.reset();
     if (state.frame) cancelAnimationFrame(state.frame);
+    syncCompactTimer(false);
     refs.scroller.removeEventListener('scroll', onScroll);
     refs.jump.removeEventListener('click', onJump);
     window.removeEventListener(TIMELINE_RELOAD_EVENT, onReload);
@@ -534,15 +578,37 @@ function renderSlots(refs, state, ui, entryCount) {
 }
 
 /**
- * The running turn as the composer's activity line shows it. A compaction says so instead of naming the last tool.
+ * The reconcile items of the timeline's entries. The divider that the session's last compaction gives its sizes (see
+ * lastCompactionDetails) gets a key that holds them, so its element is rebuilt when they change.
+ * @param {Array<Record<string, any>>} entries
+ * @param {Record<string, any>|null} context LiveInfo.context of the session, or null
+ * @returns {Array<{key: string, version: number, value: Record<string, any>}>}
+ */
+function timelineItems(entries, context) {
+  const sized = lastCompactionDetails(context, entries);
+  return entries.map((entry) => {
+    const version = entry.version ?? 0;
+    if (!sized || sized.key !== entry.key) return { key: entry.key, version, value: entry };
+    return { key: `${entry.key}|${context.lastCompaction.at}`, version, value: { ...entry, ...sized.details } };
+  });
+}
+
+/**
+ * The running turn as the composer's activity line shows it. A compaction in progress carries its start, so the line
+ * can name it and count its seconds (instead of the last tool). A compaction shows even when the model knows no running
+ * turn (after a reload the session may be compacting before the turn's own events arrive), as a line of its own.
  * @param {ReturnType<typeof createModel>} model
- * @param {(key: string) => string} t
+ * @param {(rowSince: number|null) => number|null} startOf the compaction's start in this browser's clock (compactStart)
  * @returns {Record<string, any>|null}
  */
-function activityOf(model, t) {
+function activityOf(model, startOf) {
+  const since = startOf(model.getRunState().compactingSince);
   const activity = model.getActivity();
-  if (!activity) return null;
-  return model.getRunState().status === 'compacting' ? { ...activity, text: t('cards.running.compacting') } : activity;
+  if (activity) return { ...activity, compactingSince: since };
+  if (since === null) return null;
+  return {
+    running: true, startedAt: since, text: null, outputTokens: 0, queued: 0, waiting: false, compactingSince: since,
+  };
 }
 
 /**
@@ -1093,9 +1159,12 @@ function noticeEl(ui, entry) {
   const level = entry.level || 'info';
   const text = noticeText(ui, entry);
   const iconName = level === 'error' ? 'alert' : level === 'warning' ? 'alert' : level === 'muted' ? 'info' : 'info';
-  const body = (entry.code === 'user-meta' || entry.code === 'agent-message') && text.length > NOTE_COLLAPSE_CHARS
-    ? h('details', { class: 'notice-collapse' },
-      h('summary', { text: t('cards.notice.note') }),
+  // A long note, and always a compaction's summary, opens on demand; its summary line sits beside the icon.
+  const collapsed = entry.code === 'compact-summary'
+    || ((entry.code === 'user-meta' || entry.code === 'agent-message') && text.length > NOTE_COLLAPSE_CHARS);
+  const body = collapsed
+    ? h('details', { class: ['notice-collapse', 'is-body'] },
+      h('summary', { text: t(entry.code === 'compact-summary' ? 'cards.notice.compactSummary' : 'cards.notice.note') }),
       h('div', { class: 'notice-text', text }))
     : h('div', { class: 'notice-text', text });
   // A refused prompt can be edited and sent again: the rewind dialog opens on that message.
@@ -1186,19 +1255,64 @@ function noticeText(ui, entry) {
   }
 }
 
-/** @param {any} ui @param {Record<string, any>} entry */
+/**
+ * A divider: the cleared conversation, a finished compaction, or the compaction in progress. The compacting row has the
+ * divider's box and rules (CSS draws them as a sweeping bar), so the boundary turns it into the divider in place.
+ * @param {any} ui
+ * @param {Record<string, any>} entry
+ */
 function dividerEl(ui, entry) {
   const { t } = ui.env;
-  let label;
-  if (entry.variant === 'clear') label = t('cards.divider.cleared');
-  else if (Number.isFinite(entry.preTokens))
-      label = t('cards.divider.compacted', { tokens: formatTokens(entry.preTokens) });
-  else label = t('cards.divider.compactedPlain');
+  if (entry.variant === 'compacting') return compactingEl(ui, entry);
+  const label = entry.variant === 'clear' ? t('cards.divider.cleared') : compactionText(entry, t, getLocale());
   return h('div', {
     class: ['divider', `is-${entry.variant}`], dataset: { kind: 'divider' },
     attrs: { role: 'separator', 'aria-label': label },
   },
     h('span', { class: 'divider-label', text: label }));
+}
+
+/**
+ * The live row of a compaction: the running glyph, its name and the elapsed seconds, which tickCompacting keeps
+ * current. A row counts from its own start, or from the session's when it has none (a replayed status). The elapsed
+ * time is hidden from assistive technology, so the row is announced once, not every second.
+ * @param {any} ui
+ * @param {Record<string, any>} entry
+ */
+function compactingEl(ui, entry) {
+  const { t } = ui.env;
+  const since = Number.isFinite(entry.since) ? entry.since : null;
+  return h('div', {
+    class: ['divider', 'is-compacting'],
+    dataset: { kind: 'divider', since: since === null ? null : String(since) },
+    attrs: { role: 'status' },
+  },
+    h('span', { class: 'divider-label divider-live' },
+      h('span', { class: 'activity-glyph', attrs: { 'aria-hidden': 'true' } }, h('span', { class: 'activity-arc' })),
+      h('span', { text: t('cards.compacting.label') }),
+      h('span', {
+        class: 'divider-elapsed',
+        attrs: { 'aria-hidden': 'true' },
+        text: t('cards.compacting.elapsed', { seconds: elapsedSeconds(ui.compactStart(since), Date.now()) }),
+      })));
+}
+
+/**
+ * Keeps the elapsed seconds of the compacting rows current. Called once a second while a row is shown. Each row counts
+ * from its own start, else from the session's, which is read again on every tick.
+ * @param {HTMLElement} list
+ * @param {(key: string, vars?: Record<string, unknown>) => string} t
+ * @param {(rowSince: number|null) => number|null} startOf the compaction's start in this browser's clock
+ */
+function tickCompacting(list, t, startOf) {
+  const now = Date.now();
+  for (const row of list.querySelectorAll('.divider.is-compacting')) {
+    const elapsed = row.querySelector('.divider-elapsed');
+    if (elapsed) {
+      const own = row.dataset.since ? Number(row.dataset.since) : null;
+      elapsed.textContent = t('cards.compacting.elapsed', { seconds: elapsedSeconds(startOf(own), now) });
+    }
+  }
 }
 
 /** @param {any} ui @param {Record<string, any>} entry */

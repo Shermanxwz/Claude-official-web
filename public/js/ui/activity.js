@@ -5,6 +5,7 @@
  */
 import { h, clear, icon } from '../dom.js';
 import { formatTokens } from '../timeline/format.js';
+import { elapsedSeconds } from '../context.js';
 
 const TICK_MS = 1000;
 const SECOND_MS = 1000;
@@ -15,7 +16,8 @@ const HOUR_S = 3600;
  * @typedef {(key: string, vars?: Record<string, string | number>) => string} Translate
  * @typedef {{content: string, activeForm: string, status: 'pending'|'in_progress'|'completed'}} Todo
  * @typedef {{
- *   running: boolean, startedAt: number, text: string|null, outputTokens: number, queued: number, waiting: boolean
+ *   running: boolean, startedAt: number, text: string|null, outputTokens: number, queued: number, waiting: boolean,
+ *   compactingSince?: number|null
  * }} Activity
  */
 
@@ -80,11 +82,17 @@ export function createRunningLine({ t, coarse }) {
     if (!current) return;
     // A request that waits for the user replaces the runtime's activity: the glyph becomes the waiting dot (DESIGN).
     const waiting = current.waiting === true;
+    // A compaction names itself and counts its own seconds, so the turn's clock is left out while it runs.
+    const compacting = !waiting && typeof current.compactingSince === 'number';
     element.classList.toggle('is-waiting', waiting);
     let text = current.text && current.text.trim() ? current.text.trim() : t('composer.activity.working');
+    if (compacting) {
+      text = t('composer.activity.compacting', { seconds: elapsedSeconds(current.compactingSince, Date.now()) });
+    }
     if (waiting) text = t('composer.activity.waiting');
     textEl.textContent = text;
     textEl.title = text;
+    timeEl.hidden = compacting;
     timeEl.textContent = current.startedAt > 0 ? formatElapsed(Date.now() - current.startedAt) : '';
     tokensEl.textContent = current.outputTokens > 0
       ? t('composer.activity.tokens', { count: formatTokens(current.outputTokens) })

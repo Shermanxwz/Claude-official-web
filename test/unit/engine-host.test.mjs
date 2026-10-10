@@ -646,14 +646,15 @@ describe('EngineHost stream state and events', () => {
     const info = await h.host.createSession({ cwd: CWD, model: 'sonnet', effort: 'low' });
     const query = h.engine.queries[0];
     await flush();
-    assert.deepEqual(query.calls.map((call) => call[0]), ['initializationResult']);
+    // The ready refresh reads the context window once the handshake is answered (see #refreshContext).
+    assert.deepEqual(query.calls.map((call) => call[0]), ['initializationResult', 'getContextUsage']);
     const live = h.host.liveInfo(info.sessionId);
     assert.equal(live.state, 'idle');
     assert.equal(live.model, 'sonnet');
     assert.equal(live.permissionMode, null);
     assert.equal(live.effort, 'low');
     assert.equal(live.claudeCodeVersion, null);
-    assert.deepEqual(ofType(h.events, 'session_state').map((e) => e.data.live.state), ['starting', 'idle']);
+    assert.deepEqual(ofType(h.events, 'session_state').map((e) => e.data.live.state), ['starting', 'idle', 'idle']);
     assert.equal(query.closed, false);
   });
 
@@ -674,22 +675,23 @@ describe('EngineHost stream state and events', () => {
     assert.equal(live.claudeCodeVersion, '2.1.295');
     const detail = await h.host.getSession(info.sessionId);
     assert.equal(detail.init.model, 'claude-x');
-    assert.deepEqual(ofType(h.events, 'session_state').map((e) => e.data.live.state), ['starting', 'idle', 'idle']);
+    assert.deepEqual(ofType(h.events, 'session_state').map((e) => e.data.live.state),
+      ['starting', 'idle', 'idle', 'idle']);
     assert.equal(query.closed, false);
   });
 
-  test('a stream that never sends init still becomes idle once the handshake is answered, with one publish for it', async () => {
+  test('a stream that never sends init still becomes idle, publishing the idle state once', async () => {
     const h = harness();
     const info = await h.host.createSession({ cwd: CWD });
     const query = h.engine.queries[0];
     await flush();
     assert.equal(h.host.liveInfo(info.sessionId).state, 'idle');
     assert.equal((await h.host.getSession(info.sessionId)).init, null, 'no system/init has arrived');
-    assert.deepEqual(query.calls.map((call) => call[0]), ['initializationResult']);
-    assert.equal(ofType(h.events, 'session_state').filter((event) => event.data.live?.state === 'idle').length, 1);
+    assert.deepEqual(query.calls.map((call) => call[0]), ['initializationResult', 'getContextUsage']);
     await flush();
     assert.equal(h.host.liveInfo(info.sessionId).state, 'idle');
-    assert.equal(ofType(h.events, 'session_state').filter((event) => event.data.live?.state === 'idle').length, 1);
+    // The idle state is published once; the context window the ready refresh read is published with it.
+    assert.equal(ofType(h.events, 'session_state').filter((event) => event.data.live?.state === 'idle').length, 2);
     assert.equal(query.closed, false);
   });
 
@@ -790,6 +792,8 @@ describe('EngineHost stream state and events', () => {
   test('session_state is published on changes only, not for every streamed message', async () => {
     const h = harness();
     const { sessionId, query } = await startLive(h);
+    // The ready refresh publishes the context window it reads once the call settles, which is after startLive.
+    await flush();
     const before = ofType(h.events, 'session_state').length;
     for (let i = 0; i < 50; i += 1) query.emit({ type: 'stream_event', uuid: randomUUID(), session_id: sessionId });
     await flush();
@@ -1082,6 +1086,7 @@ describe('EngineHost closing, interrupting and settings', () => {
       { model: 'opus', permissionMode: 'plan', effort: null });
     assert.deepEqual(query.calls.filter((c) => c[0] !== 'close'), [
       ['setModel', 'opus'],
+      ['getContextUsage', { detail: 'summary' }],
       ['setPermissionMode', 'plan'],
       ['applyFlagSettings', { effortLevel: null }],
     ]);
@@ -1095,7 +1100,9 @@ describe('EngineHost closing, interrupting and settings', () => {
     const h = harness();
     const { sessionId, query } = await startLive(h);
     const { live } = await h.host.updateSettings(sessionId, { model: null });
-    assert.deepEqual(query.calls.at(-1), ['setModel', undefined]);
+    assert.deepEqual(query.calls.at(-2), ['setModel', undefined]);
+    // The window may belong to the new model, so the meter reads it again once the model is set.
+    assert.deepEqual(query.calls.at(-1), ['getContextUsage', { detail: 'summary' }]);
     assert.equal(live.model, null);
   });
 
@@ -1588,8 +1595,14 @@ describe('EngineHost rewind', () => {
     await h.host.rewind(S1, { userMessageId: 'u-2', mode: 'code' });
     assert.equal(h.engine.queries.length, 1);
     assert.equal(h.engine.queries[0].options.resume, S1);
-    // The query answers its handshake when it starts; the rewind is its only other call.
-    assert.deepEqual(h.engine.queries[0].calls, [['initializationResult'], ['rewindFiles', 'u-2', { dryRun: false }]]);
+    // The query answers its handshake when it starts; the rewind and the ready refresh are its only other calls.
+    const calls = h.engine.queries[0].calls;
+    assert.deepEqual(calls.filter((call) => call[0] !== 'getContextUsage'), [
+      ['initializationResult'],
+      ['rewindFiles', 'u-2', { dryRun: false }],
+    ]);
+    assert.deepEqual(calls.filter((call) => call[0] === 'getContextUsage'),
+      [['getContextUsage', { detail: 'summary' }]]);
   });
 
   test('a refused file rewind is 422 CANNOT_REWIND with its first line, and nothing restarts', async () => {
@@ -1643,7 +1656,7 @@ describe('EngineHost rewind', () => {
     assert.equal(second.options.resume, S1);
     assert.equal(second.options.resumeSessionAt, 'a-1');
     // The restarted query has answered its handshake, so the session is idle again before any prompt reaches it.
-    assert.deepEqual(second.calls, [['initializationResult']]);
+    assert.deepEqual(second.calls, [['initializationResult'], ['getContextUsage', { detail: 'summary' }]]);
     assert.equal(h.host.liveInfo(S1).state, 'idle');
     assert.equal(ofType(h.events, 'notice').length, 0);
     assert.equal(h.events.some((event) => event.type === 'session_state' && event.data.live === null), false);
@@ -2092,6 +2105,16 @@ describe('EngineHost session listing and detail', () => {
     h.engine.infoError = new Error('disk gone');
     await expectError(h.host.getSession(S1), 404, 'SESSION_NOT_FOUND');
     assert.equal(h.logs.some((entry) => entry.msg === 'reading a session failed'), true);
+  });
+
+  test('getSession answers with the gateway clock, so a client can convert the times the meter holds', async () => {
+    const h = harness();
+    addSession(h.engine, S1);
+    h.time.now = 77_000;
+    assert.equal((await h.host.getSession(S1)).now, 77_000);
+    const { sessionId } = await startLive(h);
+    h.time.now = 78_500;
+    assert.equal((await h.host.getSession(sessionId)).now, 78_500);
   });
 });
 
@@ -4333,4 +4356,417 @@ describe('EngineHost unattended mode (docs/PROTOCOL.md "Unattended mode")', () =
       assert.deepEqual(modeCalls(query), []);
       assert.equal(h.host.liveInfo(sessionId).permissionMode, 'acceptEdits');
     });
+});
+
+describe('EngineHost context meter', () => {
+  /**
+   * A getContextUsage answer for a window: the summary's total, the window and the auto-compact settings.
+   * @param {{totalTokens?: number, maxTokens?: number, threshold?: number|null, enabled?: boolean}} [over]
+   */
+  function windowAnswer({
+    totalTokens = 39116, maxTokens = 100000, threshold = 67000, enabled = true, apiUsage = null,
+  } = {}) {
+    const answer = {
+      ...structuredClone(DEFAULT_CONTEXT),
+      totalTokens,
+      maxTokens,
+      rawMaxTokens: maxTokens,
+      isAutoCompactEnabled: enabled,
+      apiUsage,
+    };
+    if (threshold !== null) answer.autoCompactThreshold = threshold;
+    return answer;
+  }
+
+  /**
+   * Makes every query the engine starts answer getContextUsage with `answer`, before the query is made.
+   * @param {ReturnType<typeof harness>} h
+   * @param {Record<string, unknown>} answer
+   */
+  function windowOf(h, answer) {
+    const makeQuery = h.engine.query;
+    h.engine.query = (args) => {
+      const query = makeQuery(args);
+      query.values.getContextUsage = structuredClone(answer);
+      return query;
+    };
+  }
+
+  /**
+   * A stream_event that opens a call: its message id and the usage it reports when it starts.
+   * @param {string} sessionId
+   * @param {string} id
+   * @param {{input: number, cacheRead?: number, cacheCreate?: number, output?: number}} usage
+   * @param {string|null} [parent] the tool call of a subagent
+   */
+  function callStart(sessionId, id, { input, cacheRead = 0, cacheCreate = 0, output = 1 }, parent = null) {
+    return {
+      type: 'stream_event',
+      uuid: randomUUID(),
+      session_id: sessionId,
+      parent_tool_use_id: parent,
+      event: {
+        type: 'message_start',
+        message: {
+          id,
+          usage: {
+            input_tokens: input,
+            cache_creation_input_tokens: cacheCreate,
+            cache_read_input_tokens: cacheRead,
+            output_tokens: output,
+          },
+        },
+      },
+    };
+  }
+
+  /**
+   * The stream_event that reports the output a call has so far.
+   * @param {string} sessionId
+   * @param {number} output
+   * @param {string|null} [parent]
+   */
+  function callOutput(sessionId, output, parent = null) {
+    return {
+      type: 'stream_event',
+      uuid: randomUUID(),
+      session_id: sessionId,
+      parent_tool_use_id: parent,
+      event: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: output } },
+    };
+  }
+
+  /**
+   * The assistant message of a call, with the usage it ends with.
+   * @param {string} sessionId
+   * @param {string} id
+   * @param {{input: number, cacheRead?: number, cacheCreate?: number, output: number}} usage
+   * @param {string|null} [parent]
+   */
+  function callEnd(sessionId, id, { input, cacheRead = 0, cacheCreate = 0, output }, parent = null) {
+    return {
+      type: 'assistant',
+      uuid: randomUUID(),
+      session_id: sessionId,
+      parent_tool_use_id: parent,
+      message: {
+        id,
+        role: 'assistant',
+        model: 'sonnet',
+        content: [{ type: 'text', text: 'answer' }],
+        usage: {
+          input_tokens: input,
+          cache_creation_input_tokens: cacheCreate,
+          cache_read_input_tokens: cacheRead,
+          output_tokens: output,
+        },
+      },
+    };
+  }
+
+  /**
+   * The system/status of a compaction.
+   * @param {string} sessionId
+   * @param {string|null} status
+   * @param {object} [extra]
+   */
+  function compactionStatus(sessionId, status, extra = {}) {
+    return { type: 'system', subtype: 'status', status, uuid: randomUUID(), session_id: sessionId, ...extra };
+  }
+
+  /** The system/compact_boundary of a finished compaction. @param {string} sessionId @param {object} metadata */
+  function boundaryOf(sessionId, metadata) {
+    return { type: 'system', subtype: 'compact_boundary', compact_metadata: metadata, uuid: randomUUID(),
+      session_id: sessionId };
+  }
+
+  /** @param {ReturnType<typeof harness>} h @param {string} sessionId */
+  const meterOf = (h, sessionId) => h.host.liveInfo(sessionId).context;
+
+  /**
+   * Holds the full count of a query (getContextUsage at full detail) until the test answers it: `release` answers it
+   * with a value and `fail` rejects it. The summary is answered as usual.
+   * @param {FakeQuery} query
+   */
+  function holdFullCount(query) {
+    const answer = query.getContextUsage.bind(query);
+    /** @type {{resolve: (value: unknown) => void, reject: (error: Error) => void}|null} */
+    let held = null;
+    query.getContextUsage = (options) => {
+      if (options?.detail !== 'full') return answer(options);
+      query.calls.push(['getContextUsage', options]);
+      return new Promise((resolve, reject) => {
+        held = { resolve, reject };
+      });
+    };
+    return {
+      release: (value) => held?.resolve(value),
+      fail: (error) => held?.reject(error),
+    };
+  }
+
+  /** Lets the reads the host starts after an event finish: each one takes a few macrotasks. */
+  async function settle() {
+    for (let turns = 0; turns < 20; turns += 1) await flush();
+  }
+
+  test('the meter reads the window once the handshake answers, and estimates the fixed overhead', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const info = await h.host.createSession({ cwd: CWD });
+    const query = h.engine.queries[0];
+    await flush();
+    assert.deepEqual(meterOf(h, info.sessionId), {
+      used: 39116, max: 100000, autoCompactAt: 67000, autoCompact: true, source: 'estimate',
+      compacting: null, lastCompaction: null,
+    });
+    assert.deepEqual(query.calls.filter((call) => call[0] === 'getContextUsage'),
+      [['getContextUsage', { detail: 'summary' }]]);
+  });
+
+  test('a call shows its prompt as it starts and its output as it streams, and the next call replaces it', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    query.emit(callStart(sessionId, 'msg_1', { input: 3, cacheRead: 40000 }));
+    await flush();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [40004, 'stream']);
+    query.emit(callOutput(sessionId, 300));
+    await flush();
+    assert.equal(meterOf(h, sessionId).used, 40303);
+    query.emit(callEnd(sessionId, 'msg_1', { input: 3, cacheRead: 40000, output: 300 }));
+    await flush();
+    assert.equal(meterOf(h, sessionId).used, 40303, 'the final message of the call adds nothing');
+    query.emit(callStart(sessionId, 'msg_2', { input: 3, cacheRead: 41000 }));
+    await flush();
+    assert.equal(meterOf(h, sessionId).used, 41004);
+  });
+
+  test('a subagent call leaves the meter alone', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    query.emit(callStart(sessionId, 'msg_1', { input: 3, cacheRead: 40000 }));
+    await flush();
+    const before = meterOf(h, sessionId);
+    query.emit(callStart(sessionId, 'sub_1', { input: 6000 }, 'toolu_agent'));
+    query.emit(callOutput(sessionId, 800, 'toolu_agent'));
+    query.emit(callEnd(sessionId, 'sub_1', { input: 6000, output: 800 }, 'toolu_agent'));
+    await flush();
+    assert.deepEqual(meterOf(h, sessionId), before);
+  });
+
+  test('a model change reads the window again, so the threshold follows the new model', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    query.values.getContextUsage = windowAnswer({ maxTokens: 200000, threshold: 167000 });
+    await h.host.updateSettings(sessionId, { model: 'opus' });
+    await flush();
+    assert.deepEqual([meterOf(h, sessionId).max, meterOf(h, sessionId).autoCompactAt], [200000, 167000]);
+    assert.deepEqual(query.calls.slice(-2), [['setModel', 'opus'], ['getContextUsage', { detail: 'summary' }]]);
+  });
+
+  test('a compaction shows as compacting, then its boundary is recorded and the window is read again', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    h.time.now = 5000;
+    query.emit(compactionStatus(sessionId, 'compacting'));
+    await flush();
+    assert.deepEqual(meterOf(h, sessionId).compacting, { since: 5000, trigger: null });
+    query.emit(compactionStatus(sessionId, null, { compact_result: 'success' }));
+    await flush();
+    assert.equal(meterOf(h, sessionId).compacting, null);
+    h.time.now = 6200;
+    query.emit(boundaryOf(sessionId, { trigger: 'auto', pre_tokens: 75000, post_tokens: 2069, duration_ms: 1200 }));
+    await flush();
+    assert.deepEqual(meterOf(h, sessionId).lastCompaction, {
+      trigger: 'auto', preTokens: 75000, postTokens: 2069, durationMs: 1200, at: 6200,
+    });
+    // The size the stream reported before the compaction no longer holds: the context is counted in full.
+    assert.deepEqual(query.calls.at(-1), ['getContextUsage', { detail: 'full' }]);
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [39116, 'count']);
+  });
+
+  test('after a compaction, an API call that starts before the full count answers keeps its newer usage', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer({ totalTokens: 41000 }));
+    const { sessionId, query } = await startLive(h);
+    query.emit(callStart(sessionId, 'msg_before', { input: 2, cacheRead: 70000, cacheCreate: 4000 }));
+    await flush();
+    /** @type {(value: unknown) => void} */
+    let answerCount = () => {};
+    const counted = new Promise((resolve) => { answerCount = resolve; });
+    const original = query.getContextUsage.bind(query);
+    query.getContextUsage = async (options) => {
+      if (options?.detail === 'full') {
+        query.calls.push(['getContextUsage', options]);
+        await counted;
+        return { ...windowAnswer({ totalTokens: 41000 }) };
+      }
+      return original(options);
+    };
+    query.emit(boundaryOf(sessionId, { trigger: 'auto', pre_tokens: 74003, post_tokens: 2069 }));
+    query.emit(callStart(sessionId, 'msg_after', { input: 2, cacheRead: 30000, cacheCreate: 2029 }));
+    await flush();
+    answerCount(null);
+    await flush();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [32032, 'stream']);
+  });
+
+  test('a /compact prompt marks the compaction it starts as manual', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    await h.host.sendMessage(sessionId, { clientMessageId: randomUUID(), text: '/compact' });
+    query.emit(compactionStatus(sessionId, 'compacting'));
+    await flush();
+    assert.equal(meterOf(h, sessionId).compacting.trigger, 'manual');
+    query.emit(boundaryOf(sessionId, { pre_tokens: 40000, post_tokens: 1960 }));
+    await flush();
+    assert.equal(meterOf(h, sessionId).lastCompaction.trigger, 'manual');
+  });
+
+  test('a failed compaction reads the window again, and a read that fails keeps the values the meter had', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    query.emit(compactionStatus(sessionId, 'compacting'));
+    query.emit(compactionStatus(sessionId, null, { compact_result: 'failed', compact_error: 'refused' }));
+    await flush();
+    assert.equal(query.calls.at(-1)[0], 'getContextUsage');
+    const before = structuredClone(meterOf(h, sessionId));
+    query.failures.set('getContextUsage', new Error('control channel closed'));
+    query.emit(compactionStatus(sessionId, 'compacting'));
+    query.emit(compactionStatus(sessionId, null, { compact_result: 'failed', compact_error: 'refused' }));
+    await flush();
+    assert.deepEqual(meterOf(h, sessionId), before);
+    assert.ok(h.logs.some((entry) => entry.level === 'debug' && entry.msg === 'context usage not read'));
+  });
+
+  test('a resumed session reads its last call from the transcript until the runtime reports one', async () => {
+    const h = harness();
+    const usage = {
+      input_tokens: 3, cache_creation_input_tokens: 1000, cache_read_input_tokens: 38000, output_tokens: 250,
+    };
+    addSession(h.engine, S1, {
+      messages: [
+        userEntry(S1, 'u-1', 'question'),
+        { ...assistantMessage(S1, 'a-1', 'answer'), message: { id: 'msg_a1', role: 'assistant', model: 'sonnet',
+          content: [{ type: 'text', text: 'answer' }], usage } },
+      ],
+    });
+    windowOf(h, windowAnswer());
+    const { query } = await openLive(h, S1);
+    await flush();
+    assert.deepEqual([meterOf(h, S1).used, meterOf(h, S1).source], [39253, 'transcript']);
+    query.emit(callStart(S1, 'msg_2', { input: 3, cacheRead: 40000 }));
+    await flush();
+    assert.deepEqual([meterOf(h, S1).used, meterOf(h, S1).source], [40004, 'stream']);
+  });
+
+  test('the meter is published when it changes, not for every message of a call', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    const before = ofType(h.events, 'session_state').length;
+    query.emit(callStart(sessionId, 'msg_1', { input: 3, cacheRead: 40000 }));
+    await flush();
+    const started = ofType(h.events, 'session_state').length;
+    assert.equal(started, before + 1);
+    query.emit(callOutput(sessionId, 1));
+    query.emit(callEnd(sessionId, 'msg_1', { input: 3, cacheRead: 40000, output: 1 }));
+    await flush();
+    assert.equal(ofType(h.events, 'session_state').length, started);
+    query.emit(callOutput(sessionId, 200));
+    await flush();
+    const events = ofType(h.events, 'session_state');
+    assert.equal(events.length, started + 1);
+    assert.equal(events.at(-1).data.live.context.used, 40203);
+  });
+
+  test('right after a boundary the meter estimates the context, until the full count answers', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    query.emit(callStart(sessionId, 'msg_1', { input: 3, cacheRead: 40000 }));
+    await flush();
+    const count = holdFullCount(query);
+    query.emit(boundaryOf(sessionId, { trigger: 'auto', pre_tokens: 40004, post_tokens: 2069 }));
+    await flush();
+    // The fixed part (the summary's total) and what the compaction leaves; the size the stream reported no longer holds.
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [41185, 'estimate']);
+    count.release(windowAnswer({ totalTokens: 41190 }));
+    await settle();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [41190, 'count']);
+  });
+
+  test('a failed full count falls back to the fixed part plus the compaction size, never to apiUsage', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer({
+      apiUsage: { input_tokens: 9, output_tokens: 9, cache_creation_input_tokens: 0, cache_read_input_tokens: 50000 },
+    }));
+    const { sessionId, query } = await startLive(h);
+    await settle();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [50018, 'api-usage']);
+    query.emit(callStart(sessionId, 'msg_1', { input: 3, cacheRead: 40000 }));
+    await flush();
+    const count = holdFullCount(query);
+    query.emit(boundaryOf(sessionId, { trigger: 'auto', pre_tokens: 40004, post_tokens: 2069 }));
+    await flush();
+    count.fail(new Error('control channel closed'));
+    await settle();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [41185, 'estimate']);
+    const debugged = h.logs.filter((entry) => entry.level === 'debug').map((entry) => entry.msg);
+    assert.ok(debugged.includes('context not counted after a compaction'));
+    // A later refresh (here the one a failed compaction makes) still never takes apiUsage from before the compaction.
+    query.emit(compactionStatus(sessionId, 'compacting'));
+    query.emit(compactionStatus(sessionId, null, { compact_result: 'failed', compact_error: 'refused' }));
+    await settle();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [41185, 'estimate']);
+  });
+
+  test('a call that streams while the full count is pending keeps its usage when the count fails', async () => {
+    const h = harness();
+    windowOf(h, windowAnswer());
+    const { sessionId, query } = await startLive(h);
+    // The window the summary reports after the compaction differs from the one the session started with.
+    query.values.getContextUsage = windowAnswer({ maxTokens: 200000, threshold: 167000 });
+    query.emit(callStart(sessionId, 'msg_1', { input: 3, cacheRead: 40000 }));
+    await flush();
+    const count = holdFullCount(query);
+    query.emit(boundaryOf(sessionId, { trigger: 'auto', pre_tokens: 40004, post_tokens: 2069 }));
+    await flush();
+    query.emit(callStart(sessionId, 'msg_2', { input: 3, cacheRead: 42000 }));
+    await flush();
+    count.fail(new Error('control channel closed'));
+    await settle();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [42004, 'stream']);
+    assert.deepEqual([meterOf(h, sessionId).max, meterOf(h, sessionId).autoCompactAt], [200000, 167000],
+      'the window comes from the summary read after the failure');
+  });
+
+  test('a resumed session whose last compaction has no call after it counts its context in full', async () => {
+    const h = harness();
+    // What getSessionMessages returns after a compaction (PROTOCOL.md): a boundary without subtype, then the summary.
+    addSession(h.engine, S1, {
+      messages: [
+        { type: 'system', uuid: 'boundary-1', session_id: S1, parent_tool_use_id: null, parent_agent_id: null },
+        { type: 'user', uuid: 'summary-1', session_id: S1, parent_tool_use_id: null, parent_agent_id: null,
+          isCompactSummary: true, is_meta: true, message: { role: 'user', content: 'Summary' } },
+      ],
+    });
+    const makeQuery = h.engine.query;
+    h.engine.query = (args) => {
+      const query = makeQuery(args);
+      query.values.getContextUsage = (options) => windowAnswer({
+        totalTokens: options?.detail === 'full' ? 41190 : 39116,
+      });
+      return query;
+    };
+    const { sessionId } = await openLive(h, S1);
+    await settle();
+    assert.deepEqual([meterOf(h, sessionId).used, meterOf(h, sessionId).source], [41190, 'count']);
+  });
 });
