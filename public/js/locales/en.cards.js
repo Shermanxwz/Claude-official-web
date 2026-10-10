@@ -47,6 +47,7 @@ registerMessages('en', {
   'cards.notice.assistantError': 'The assistant returned an error: {error}',
   'cards.notice.compactFailed': 'Context compaction failed',
   'cards.notice.errorDetail': 'Error details',
+  'cards.notice.agentMessage': 'Message to the agent: {text}',
   'cards.notice.interrupted': 'Interrupted by you',
   'cards.notice.interruptedTool': 'Interrupted by you during a tool call',
   'cards.notice.memory.one': 'Recalled {count} memory entry',

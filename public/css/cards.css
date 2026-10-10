@@ -808,6 +808,21 @@
   overflow-wrap: anywhere;
 }
 
+/* A summary rendered as Markdown keeps the row's small, muted text: no paragraph margins, inline code stays compact. */
+.work-row-text > .md {
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+
+.work-row-text > .md > :first-child {
+  margin-top: 0;
+}
+
+.work-row-text > .md > :last-child {
+  margin-bottom: 0;
+}
+
 .work-row-text.is-error {
   color: var(--danger);
 }

@@ -47,6 +47,7 @@ registerMessages('zh-CN', {
   'cards.notice.assistantError': '助手返回错误：{error}',
   'cards.notice.compactFailed': '上下文压缩失败',
   'cards.notice.errorDetail': '错误详情',
+  'cards.notice.agentMessage': '发给子代理的消息：{text}',
   'cards.notice.interrupted': '已由你中断',
   'cards.notice.interruptedTool': '工具调用时已由你中断',
   'cards.notice.memory.one': '已调用 {count} 条记忆',

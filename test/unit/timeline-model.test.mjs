@@ -164,6 +164,36 @@ test('subagent messages nest inside the Agent card instead of the main flow', ()
   assert.equal(agent.children[1].blocks[0].text, 'inner answer');
 });
 
+test('a subagent prompt (a user message under the Agent call) stays out of the main conversation', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, [{ type: 'text', text: 'delegate it' }]));
+  model.applyLiveEvent(live.assistant(2, 'm1', [
+    { type: 'tool_use', id: 'AG', name: 'Agent', input: { description: 'd', prompt: 'List the files in src' } },
+  ]));
+  // Claude Code 2.1.295 streams the subagent's first user turn with parent_tool_use_id set to the Agent call.
+  model.applyLiveEvent(live.user(3, [{ type: 'text', text: 'List the files in src' }], { parent_tool_use_id: 'AG' }));
+  model.applyLiveEvent(live.user(4, [{ type: 'text', text: 'Also read package.json' }], { parent_tool_use_id: 'AG' }));
+  const users = find(model, 'user');
+  assert.deepEqual(users.map((entry) => entry.text), ['delegate it'], 'only the person\'s own prompt is a user message');
+  const agent = toolsIn(find(model, 'work')[0])[0];
+  const notes = agent.children.filter((entry) => entry.kind === 'notice');
+  assert.deepEqual(notes.map((entry) => [entry.code, entry.text]), [['agent-message', 'Also read package.json']],
+    'the repeated prompt adds nothing; a later message to the agent is a note in its card');
+});
+
+test('a subagent user message that arrives before its card waits for the card', () => {
+  const model = createModel();
+  model.applyLiveEvent(live.user(1, [{ type: 'text', text: 'go' }]));
+  model.applyLiveEvent(live.user(2, [{ type: 'text', text: 'Check the tests too' }], { parent_tool_use_id: 'AG3' }));
+  assert.deepEqual(find(model, 'user').map((entry) => entry.text), ['go']);
+  model.applyLiveEvent(live.assistant(3, 'm1', [
+    { type: 'tool_use', id: 'AG3', name: 'Agent', input: { description: 'd', prompt: 'Review the code' } },
+  ]));
+  const agent = toolsIn(find(model, 'work')[0])[0];
+  assert.deepEqual(agent.children.filter((entry) => entry.kind === 'notice').map((entry) => entry.text),
+    ['Check the tests too']);
+});
+
 test('subagent messages that arrive before their card are buffered and replayed', () => {
   const model = createModel();
   model.applyLiveEvent(live.user(1, 'x'));

@@ -662,6 +662,7 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
       deliverResult(String(block.tool_use_id ?? ''), toolResultFrom(block), structured, uuid);
     }
     if (toolResults.length > 0 && rest.length === 0) return current ?? null;
+    if (typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id) return onSubagentUser(raw, live, rest);
 
     const rawText = rest
       .filter((block) => block.type === 'text' && typeof block.text === 'string')
@@ -736,6 +737,29 @@ export function createModel({ now = Date.now, describeTool = null } = {}) {
     if (uuid) userEntries.set(uuid, entry);
     placeUser(turn, entry);
     return turn;
+  };
+
+  /**
+   * A user turn inside a subagent (its prompt, or a message sent to it while it runs). It belongs to the agent's card,
+   * never to the main conversation. The first one repeats the Agent call's prompt, which the card already shows, so it
+   * adds nothing; any other becomes a muted note in the card. A message whose card has not arrived yet waits for it.
+   * @param {Record<string, any>} raw
+   * @param {boolean} live
+   * @param {Array<Record<string, any>>} blocks  the message's blocks other than tool results
+   * @returns {Flow|null}
+   */
+  const onSubagentUser = (raw, live, blocks) => {
+    const text = stripReminders(blocks
+      .filter((block) => block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n')).trim();
+    if (text === '') return null;
+    const owner = toolIndex.get(String(raw.parent_tool_use_id));
+    if (owner && typeof owner.input.prompt === 'string' && owner.input.prompt.trim() === text) return null;
+    const flow = resolveFlow(raw, live);
+    if (!flow) return null;
+    const uuid = typeof raw.uuid === 'string' ? raw.uuid : null;
+    return addNotice(flow, 'muted', 'agent-message', {}, text, nextKey('n', uuid));
   };
 
   /**

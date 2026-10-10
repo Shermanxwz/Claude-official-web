@@ -963,14 +963,16 @@ describe('subagent transcripts', () => {
 
     assert.deepEqual(await adapter.listSubagents(sessionId), [agentId]);
     const nested = await adapter.getSubagentMessages(sessionId, agentId);
-    assert.deepEqual(nested.map((entry) => entry.type), ['assistant', 'assistant', 'user', 'assistant']);
+    // Like a Claude Code subagent transcript, it starts with the prompt the Agent call gave the subagent.
+    assert.deepEqual(nested.map((entry) => entry.type), ['user', 'assistant', 'assistant', 'user', 'assistant']);
     assert.ok(nested.every((entry) => entry.parent_tool_use_id === parentId));
-    assert.equal(nested[0].message.content[0].text, 'Searching the source tree for route definitions.');
+    assert.equal(nested[0].message.content[0].text, 'Find where routes are defined');
+    assert.equal(nested[1].message.content[0].text, 'Searching the source tree for route definitions.');
     assert.deepEqual(await adapter.getSubagentMessages(sessionId, 'agent_mock_99'), []);
     assert.deepEqual(await adapter.listSubagents(randomUUID()), []);
     const store = createMockStore(join(stateDir, 'mock-sessions'));
     assert.deepEqual(await store.listSubagents(sessionId, { dir: join(cwd, 'elsewhere') }), []);
-    assert.equal((await store.getSubagentMessages(sessionId, agentId, { dir: cwd })).length, 4);
+    assert.equal((await store.getSubagentMessages(sessionId, agentId, { dir: cwd })).length, 5);
     assert.deepEqual(await store.getSubagentMessages(sessionId, agentId, { dir: join(cwd, 'elsewhere') }), []);
     const top = await adapter.getSessionMessages(sessionId, { dir: cwd });
     assert.ok(top.every((entry) => entry.parent_tool_use_id === null),

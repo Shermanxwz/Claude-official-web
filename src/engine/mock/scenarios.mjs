@@ -484,6 +484,23 @@ export function toolResult(ctx, {
 }
 
 /**
+ * The first user turn of a subagent: the prompt the Agent call gave it, as Claude Code 2.1.295 streams it (a user
+ * message whose `parent_tool_use_id` is the Agent call).
+ * @param {TurnContext} ctx
+ * @param {{text: string, parentToolUseId: string, agentId: string}} args
+ * @returns {SDKUserMessage}
+ */
+export function subagentPrompt(ctx, { text, parentToolUseId, agentId }) {
+  return {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text }] },
+    parent_tool_use_id: parentToolUseId,
+    agent_id: agentId,
+    ...ctx.envelope(),
+  };
+}
+
+/**
  * @param {TurnContext} ctx
  * @param {string} toolUseId
  * @param {string} toolName
@@ -1470,6 +1487,7 @@ async function* agentScenario(ctx) {
   ], { stopReason: 'tool_use' });
   yield taskSummary(ctx, 'Running the Explore agent');
   yield taskStarted(ctx, { taskId: agentId, toolUseId, description, subagentType: 'Explore' });
+  yield subagentPrompt(ctx, { text: prompt, parentToolUseId: toolUseId, agentId });
 
   const nested = { parentToolUseId: toolUseId, agentId };
   yield* modelResponse(ctx, [{ type: 'text', text: 'Searching the source tree for route definitions.' }], {

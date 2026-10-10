@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning.
 
+## [1.2.1] - 2026-10-10
+
+Fixes found by running Claude Code 2.1.295 subagents through the web interface.
+
+### Fixed
+
+- A subagent's prompt no longer appears as a message of yours. Claude Code streams the subagent's first user turn under
+  the Agent call (`parent_tool_use_id`); it now stays in the agent's card, where a later message sent to the agent
+  shows as a note. The mock engine streams that prompt too, and its subagent transcripts start with it.
+- An agent's finished summary in its card is rendered as Markdown instead of showing the raw markup.
+- The Account panel waits for a Claude Code process that is still starting (up to 60 seconds for the initialize
+  handshake) instead of answering `502` after 10 seconds.
+- A fresh clone passes the seal when the optional `node-pty` could not be built: the terminal imports it by a computed
+  name, so the type check no longer needs it installed.
+
 ## [1.2.0] - 2026-10-10
 
 The rest of Claude Code's terminal screens move into the browser through the runtime's own controls, the interface

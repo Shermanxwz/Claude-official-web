@@ -1063,7 +1063,8 @@ function rowEl(ui, row) {
       h('div', { class: 'work-row-body' },
         h('div', { class: 'work-row-title', text: row.description || row.summary || t('cards.task.untitled') }),
         h('div', { class: 'work-row-hint', text: [stateText, ...details].join(' · ') }),
-        row.summary && row.description ? h('div', { class: 'work-row-text', text: row.summary }) : null,
+        // A finished agent's summary is its own report, written in Markdown like any reply.
+        row.summary && row.description ? h('div', { class: 'work-row-text' }, renderMarkdown(row.summary)) : null,
         row.error ? h('div', { class: 'work-row-text is-error', text: row.error }) : null));
   }
   return genericEl(row.rowKind ?? 'row', row, ui);
@@ -1075,7 +1076,7 @@ function noticeEl(ui, entry) {
   const level = entry.level || 'info';
   const text = noticeText(ui, entry);
   const iconName = level === 'error' ? 'alert' : level === 'warning' ? 'alert' : level === 'muted' ? 'info' : 'info';
-  const body = entry.code === 'user-meta' && text.length > NOTE_COLLAPSE_CHARS
+  const body = (entry.code === 'user-meta' || entry.code === 'agent-message') && text.length > NOTE_COLLAPSE_CHARS
     ? h('details', { class: 'notice-collapse' },
       h('summary', { text: t('cards.notice.note') }),
       h('div', { class: 'notice-text', text }))
@@ -1134,6 +1135,7 @@ function noticeText(ui, entry) {
       return t('cards.notice.assistantError', { error: String(vars.error ?? '') });
     case 'compact-failed':
       return entry.text ? `${t('cards.notice.compactFailed')}: ${entry.text}` : t('cards.notice.compactFailed');
+    case 'agent-message': return t('cards.notice.agentMessage', { text: entry.text || '' });
     case 'interrupted': return t('cards.notice.interrupted');
     case 'interrupted-tool': return t('cards.notice.interruptedTool');
     default:

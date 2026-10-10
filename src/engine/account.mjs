@@ -24,6 +24,8 @@ import {
 
 export const ACCOUNT_IDLE_MS = 5 * 60_000;
 const START_TIMEOUT_MS = 10_000;
+/** A query that has just been started answers once its process is up and its initialize handshake is done. */
+const READY_TIMEOUT_MS = 60_000;
 const COMPLETE_TIMEOUT_MS = 120_000;
 const CODE_MAX = 2048;
 const URL_MAX = 4096;
@@ -138,6 +140,10 @@ export class Account {
    */
   async #read(query) {
     try {
+      // A cold account query (or a session that is still starting) first has to start Claude Code, which can take
+      // longer than a control call on a slow host; the handshake answer is cached, so a warm query passes at once.
+      const ready = runtimeMethod(query, 'initializationResult');
+      if (ready) await withTimeout(() => ready(), READY_TIMEOUT_MS);
       return await withTimeout(() => query.accountInfo(), START_TIMEOUT_MS);
     } catch (error) {
       this.#options.log.warn('reading the account failed', { reason: errorName(error) });

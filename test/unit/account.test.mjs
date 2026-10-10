@@ -107,6 +107,32 @@ describe('account read', () => {
     await account.close();
   });
 
+  test('a query that is still starting is asked for the account only after its initialize handshake', async () => {
+    const engine = fakeEngine();
+    const { account } = service(engine);
+    /** @type {string[]} */
+    const order = [];
+    const original = engine.query.bind(engine);
+    engine.query = (/** @type {any} */ args) => {
+      const query = original(args);
+      const accountInfo = query.accountInfo;
+      // A cold Claude Code process answers the handshake late; the read must wait for it, not time out.
+      query.initializationResult = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        order.push('handshake');
+        return { commands: [], models: [], agents: [], account: {} };
+      };
+      query.accountInfo = async () => {
+        order.push('accountInfo');
+        return accountInfo();
+      };
+      return query;
+    };
+    assert.deepEqual((await account.status()).account, { subscriptionType: 'Claude Max' });
+    assert.deepEqual(order, ['handshake', 'accountInfo']);
+    await account.close();
+  });
+
   test('an account with no field set is reported as no account', async () => {
     const engine = fakeEngine({ accountInfo: { email: null, organization: '' } });
     const { account } = service(engine);
