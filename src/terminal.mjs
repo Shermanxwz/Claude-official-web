@@ -635,10 +635,16 @@ async function selectPty(config, injected) {
   return { pty, disabledReason: null };
 }
 
+/**
+ * node-pty is an optional dependency that compiles on install and may be absent, so it is imported by a computed name:
+ * the type checker then does not need it installed, and PtyModule describes the part this module uses.
+ */
+const NODE_PTY = String('node-pty');
+
 /** @returns {Promise<PtyModule|null>} */
 async function loadNodePty() {
   try {
-    const mod = await import('node-pty');
+    const mod = await import(NODE_PTY);
     return { spawn: mod.spawn };
   } catch {
     return null;
